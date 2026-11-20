@@ -291,6 +291,36 @@ the whole flow works. Each step is then cut into its own PR from that branch.
 This section records where the build differs from the design above. Where the two disagree, this
 section wins.
 
+### Naming and why the launcher has its own page
+- The page and the feature are called **Cloud files**; the form's heading is **Connect to your
+  Nextcloud server**. The Apps | Cloud switch keeps the short label "Cloud". No other company's
+  product or feature name is used for it (rule 22).
+- The launcher does not reuse `craft_ui::cloud` from craft-libs. That module is an Open and Save
+  page inside an app: the app turns the bytes into its own document and back, and the page is done
+  once a read or a write returns. The launcher never holds the document. It hands a file path to
+  another process (the Craft app) and then has to follow that file for as long as it is open:
+  watch it for saves, upload them with `If-Match`, keep the lock, settle conflicts, and close it
+  with Done or Stop tracking. Those are check-out and sync states that `craft_ui::cloud` has no
+  place for, so the launcher keeps its own page and shares only the protocol crates
+  (craft-nextcloud, craft-dav, craft-cloud).
+
+### Protocol as built
+- `Event::CloudFileStatus` carries a typed `closed` flag: the file is no longer open from the
+  cloud nor watched. It replaced the `"Closed"` prefix the detail text used to carry.
+- `Event::CloudConnectFailed(String)` ends a sign-in. Only it clears the page's "waiting for the
+  browser" state; `Event::CloudError` is for every other cloud action. A sign-in that was
+  cancelled or replaced by a newer one emits nothing at all.
+- `Event::CloudListed` carries `folder_only`: the server could not search, so the results come
+  from the folder listed last. The page then says "Results in this folder only".
+- `Command::CloudRevealKept` shows the kept folder in the file manager (**Show kept files**, in the
+  account bar and in the Disconnect prompt). The web backend answers it, like every cloud command,
+  with an error saying cloud files need the desktop launcher.
+- `Capabilities::open_cloud_files` says whether a file can be given to its app on this system
+  (macOS only for now). Without it the page browses but Open is off, with the reason as its
+  description, and the native backend refuses `CloudOpen` before anything is locked or downloaded.
+- `CloudEntry::writable` comes from `oc:permissions`. A file that is not writable for the user is
+  marked Read-only in the list and opens read-only.
+
 ### Account storage
 - The app password is stored in the OS keychain through craft-suite-account's `TokenStore`, under
   the handle `artcraft-launcher-nextcloud:<handle>`.
@@ -311,13 +341,16 @@ section wins.
 
 ### Browsing
 - Search falls back to filtering the current folder only on a non-auth error. A 401 is shown as an
-  error. The page does not yet say that results came from the folder only.
+  error. Results from the fallback are labelled "Results in this folder only", and the label
+  names the query as it was submitted.
 - **Shared with me** uses the OCS shares API (`shared_with_me=true`). Search (WebDAV `SEARCH`) and
   shared-with-me were both added to craft-nextcloud, in the craft-libs fork, because it had neither
   (rule 9).
 - The lock holder is shown in the listing. A lock held by an app is worded separately from one held
   by a person. A 423 on open names the holder from the last folder listing.
-- Files that are not W-writable still open as editable. Saves then fail with 403.
+- Files that are not W-writable open read-only, from the UI and in the native open (which checks
+  the last listings). A save the server still refuses with 403 turns the file Read-only: uploads
+  stop, the edits stay on this computer and Stop tracking is offered.
 
 ### Local backups
 - All local backups go under `cloud/kept/<account>/…`, with a label in the file name:
@@ -329,6 +362,10 @@ section wins.
 - Before it removes anything, it sweeps leftover cache files into `kept/` (label "left in
   cache"). If a file cannot be kept, Disconnect refuses.
 - Only then are the app password, the cache and `account.json` removed.
+- An entry in the cache that can't be read also makes Disconnect refuse, so it is never removed
+  with the cache.
+- With `account.json` missing or unreadable, Disconnect still signs the session out (the watcher
+  stops) and removes the saved sign-in of the account that was signed in.
 
 ### Done (check-in)
 - Done renames the working copy to a private name, verifies it is unchanged and uploaded, and
@@ -336,6 +373,20 @@ section wins.
 - A save that lands during Done is kept (label "saved after closing"). If it cannot be moved
   aside, the file goes back on the open list as Waiting to upload, and the save is uploaded.
 - A missing working copy no longer counts as clean. Done waits instead.
+- A crash while Done had the copy under its private name (`.~name.closingN`) is repaired at the
+  next start: the copy goes back to its real name and is watched again. A Disconnect sweep keeps
+  such a leftover under its real name.
+- The last status of a read-only file is not called "saved to the cloud".
+
+### Opening
+- The app is launched before the check-out is recorded. If anything fails after `Opening` (the
+  download, writing the copy, or the app launch), the lock is released, the copy is removed (or
+  kept, if it changed), nothing is recorded, and a closing status says why. No "Opening…" row is
+  left behind, and Disconnect is not blocked.
+- Open, Done, Stop tracking and the conflict choices check the account again once they hold the
+  list of open files: an account disconnected or replaced while they waited makes them do nothing.
+  A sign-in checks its attempt and the other-account rule, and records the account, while holding
+  that list too.
 
 ### Case-twin guard
 - Two server paths that differ only by case (or that point at the same file on disk) cannot take
@@ -346,24 +397,28 @@ section wins.
 - A new command, `CloudForget { path }`, shown as **Stop tracking (keep a local copy)**. It moves
   the working copy to `kept/`, unlocks, drops the check-out, and names the kept path. It never
   deletes data.
-- `Event::CloudFileStatus` gained a `forgettable` flag. It is true only for read-only copies with
-  local changes and for waits where the copy is missing. The UI offers the action only then,
-  behind a confirmation. If the changes are not in Nextcloud, the text says so.
-- Its reason: without it, a read-only copy with edits, or a deleted copy, would block Done and
-  Disconnect for good.
+- `Event::CloudFileStatus` gained a `forgettable` flag. It is true for read-only copies with local
+  changes, for waits where the copy is missing, for saves the server refuses for good (403, and
+  404/409 when the file or its folder is gone), for every Conflict, Reconnect needed and "close it
+  in the app first" status, and for a conflict choice the server refused. The UI offers the action
+  only then, behind a confirmation that says the changes are not in Nextcloud and that Show kept
+  files opens the kept folder. A status that is no longer forgettable closes an open confirm.
+- Its reason: without it, a read-only copy with edits, a deleted copy, a refused save or a
+  conflict the server won't settle would block Done and Disconnect for good.
 
 ### Not built yet
 - File id and rename-following. Check-outs are tracked by path only.
 - **Open with** for files that map to several apps.
 - Desktop notification on conflict. Only the status event is sent.
 - Quit-time flush. Open files are resumed on the next start instead.
-- A label for search results that came from the folder fallback.
 
 ### Not tested
 - The macOS app launch code (`install::open_file`, `process::open_with`) has not been compiled or
   run. It is the owner's Task 8 step, on a Mac.
 
 ### Fork-only dependency
-- The launcher pins craft-libs at the fork-only rev `63ac40b`. It carries the craft-nextcloud
-  adapter, search, shared-with-me and the lock holder. This deviates from rule 10 (move the rev in
+- The launcher pins craft-libs at the fork-only rev `4d43879`. It carries the craft-nextcloud
+  adapter, search, shared-with-me, the lock holder, per-request body limits (which the launcher's
+  transport now honours while reading) and the server-granted lock timeout (locks are refreshed
+  at half of it). This deviates from rule 10 (move the rev in
   its own PR). It must be upstreamed and the rev moved before any upstream PR.
