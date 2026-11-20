@@ -7,9 +7,10 @@ use std::io::Read;
 
 use craft_nextcloud::http::{Http as DavHttp, Method, Request, Response};
 
-/// Largest answer body read: a little over what `craft-nextcloud` will parse (32 MiB), so a
-/// server can't make the launcher buffer an endless one.
-const MAX_BODY: u64 = 33 * 1024 * 1024;
+/// Largest answer body read when a request names no limit of its own (`Request::max_body`), so a
+/// server can't make the launcher buffer an endless one. `craft-nextcloud` sets a limit on every
+/// request it sends; this only guards one that doesn't.
+const DEFAULT_MAX_BODY: u64 = 64 * 1024 * 1024;
 
 /// Largest cloud file opened. Files are held in memory while they move.
 pub const MAX_FILE: usize = 256 * 1024 * 1024;
@@ -43,11 +44,30 @@ fn is_transfer(req: &Request) -> bool {
     matches!(req.method, Method::Get | Method::Put) && req.url.contains("/remote.php/dav/files/")
 }
 
+/// How many body bytes `req` may bring back: the limit the request carries, else the default for
+/// its kind. Never more than [`MAX_FILE`].
+fn read_limit(req: &Request) -> u64 {
+    let fallback = if is_transfer(req) { MAX_FILE as u64 } else { DEFAULT_MAX_BODY };
+    req.max_body.map_or(fallback, |m| m as u64).min(MAX_FILE as u64)
+}
+
+/// Reads `body` to its end, but stops one byte past `limit`: an answer over it is refused without
+/// reading the rest.
+fn read_capped(body: impl Read, limit: u64) -> Result<Vec<u8>, TransportError> {
+    let mut out = Vec::new();
+    body.take(limit.saturating_add(1)).read_to_end(&mut out).map_err(|e| TransportError(format!("unreadable answer ({e})")))?;
+    if out.len() as u64 > limit {
+        return Err(TransportError("the answer is too large".to_string()));
+    }
+    Ok(out)
+}
+
 impl DavHttp for Transport {
     type Error = TransportError;
 
     fn send(&self, req: Request) -> Result<Response, TransportError> {
-        let (agent, max_body) = if is_transfer(&req) { (&self.transfer, MAX_FILE as u64) } else { (&self.agent, MAX_BODY) };
+        let agent = if is_transfer(&req) { &self.transfer } else { &self.agent };
+        let limit = read_limit(&req);
         let mut builder = ureq::http::Request::builder().method(req.method.as_str()).uri(req.url.as_str());
         for (name, value) in &req.headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -57,16 +77,37 @@ impl DavHttp for Transport {
         let status = resp.status().as_u16();
         let headers: BTreeMap<String, String> =
             resp.headers().iter().filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_owned()))).collect();
-        let mut body = Vec::new();
-        resp.body_mut()
-            .with_config()
-            .reader()
-            .take(max_body.saturating_add(1))
-            .read_to_end(&mut body)
-            .map_err(|e| TransportError(format!("unreadable answer ({e})")))?;
-        if body.len() as u64 > max_body {
-            return Err(TransportError("the answer is too large".to_string()));
-        }
+        let body = read_capped(resp.body_mut().with_config().reader(), limit)?;
         Ok(Response { status, headers, body })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_listing_larger_than_the_old_cap_is_read_when_the_request_allows_it() {
+        let req = Request::new(Method::Propfind, "https://cloud.example.com/remote.php/dav/files/a/").max_body(64 << 20);
+        assert!(read_limit(&req) > 33 << 20, "the request's own limit applies");
+        let small = Request::new(Method::Get, "https://cloud.example.com/ocs/v1.php/cloud/capabilities").max_body(1 << 20);
+        assert!(read_limit(&small) < read_limit(&req));
+    }
+
+    #[test]
+    fn a_request_without_a_limit_still_has_one() {
+        let req = Request::new(Method::Propfind, "https://cloud.example.com/remote.php/dav/files/a/");
+        assert!(req.max_body.is_none());
+        assert!(read_limit(&req) <= MAX_FILE as u64);
+        let huge = Request::new(Method::Get, "https://cloud.example.com/remote.php/dav/files/a/x").max_body(usize::MAX);
+        assert!(read_limit(&huge) <= MAX_FILE as u64, "never above the file limit");
+    }
+
+    #[test]
+    fn reading_stops_just_past_the_limit() {
+        // An endless body: reading it all would never finish.
+        let endless = std::io::repeat(b'x');
+        assert!(read_capped(endless, 1024).is_err());
+        assert_eq!(read_capped(&b"short"[..], 1024).ok().as_deref(), Some(&b"short"[..]));
     }
 }
