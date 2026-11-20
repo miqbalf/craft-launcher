@@ -30,7 +30,7 @@ notify-rust = "4"
 # Cargo.lock through eframe's "persistence" feature.
 ron = "0.12.2"
 serde = { workspace = true }
-craft-quit = { version = "0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "4a03ca77b72686a4488289b221c1abdeb0df660e", features = ["egui"] }
+craft-quit = { version = "0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849", features = ["egui"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
