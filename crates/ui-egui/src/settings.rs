@@ -140,6 +140,8 @@ pub struct Settings {
     /// Extra command-line flags each app is opened with (catalog id → the text as typed, split
     /// by [`args::split`](artcraft_launcher_core::args::split) at launch).
     pub launch_flags: BTreeMap<String, String>,
+    /// The cloud folder last shown on the Cloud page (`/…`; empty: the top folder).
+    pub cloud_folder: String,
 }
 
 impl Settings {
@@ -286,6 +288,7 @@ impl Default for Settings {
             launches: BTreeMap::new(),
             pinned: Vec::new(),
             launch_flags: BTreeMap::new(),
+            cloud_folder: String::new(),
         }
     }
 }

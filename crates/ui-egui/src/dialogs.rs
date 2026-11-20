@@ -47,6 +47,11 @@ impl LauncherUi {
             Dialog::LauncherUpdate(r) => modal.show(ctx, |ui| close = self.launcher_update_dialog(ui, r)),
             Dialog::Versions(id) => modal.show(ctx, |ui| close = self.version_dialog(ui, id)),
             Dialog::LaunchFlags { app, flags } => modal.show(ctx, |ui| close = self.launch_flags_dialog(ui, app, flags)),
+            Dialog::CloudConflict(path) => modal.show(ctx, |ui| close = self.cloud_conflict_dialog(ui, path)),
+            Dialog::CloudUseMine(path) => modal.show(ctx, |ui| close = self.cloud_use_mine_dialog(ui, path)),
+            Dialog::CloudCloseInApp(path) => modal.show(ctx, |ui| close = self.cloud_close_in_app_dialog(ui, path)),
+            Dialog::CloudLocked { path, by } => modal.show(ctx, |ui| close = self.cloud_locked_dialog(ui, path, by)),
+            Dialog::CloudDisconnect => modal.show(ctx, |ui| close = self.cloud_disconnect_dialog(ui)),
         };
         if self.dialog.as_ref().is_some_and(|active| active.key() != dialog.key()) {
             // A control inside a dialog opened a different one; don't restore the old dialog.

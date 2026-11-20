@@ -118,6 +118,14 @@ pub(crate) enum Dialog {
     LauncherUpdate(artcraft_launcher_core::Release),
     Versions(String),
     LaunchFlags { app: String, flags: String },
+    // The Cloud page's prompts (`cloud.rs`), each about one cloud file's path: which version to
+    // keep after a conflict, the confirmation "Use mine" needs, closing the document after
+    // "Use theirs", someone else's lock (`by` may be empty: not known), and Disconnect.
+    CloudConflict(String),
+    CloudUseMine(String),
+    CloudCloseInApp(String),
+    CloudLocked { path: String, by: String },
+    CloudDisconnect,
 }
 
 impl Dialog {
@@ -134,6 +142,27 @@ impl Dialog {
             Dialog::LauncherUpdate(r) => ("launcher-update", &r.tag),
             Dialog::Versions(id) => ("versions", id),
             Dialog::LaunchFlags { app, .. } => ("launch-flags", app),
+            Dialog::CloudConflict(path) => ("cloud-conflict", path),
+            Dialog::CloudUseMine(path) => ("cloud-use-mine", path),
+            Dialog::CloudCloseInApp(path) => ("cloud-close-in-app", path),
+            Dialog::CloudLocked { path, .. } => ("cloud-locked", path),
+            Dialog::CloudDisconnect => ("cloud-disconnect", ""),
+        }
+    }
+
+    /// One of the Cloud page's prompts.
+    pub(crate) fn is_cloud(&self) -> bool {
+        matches!(
+            self,
+            Dialog::CloudConflict(_) | Dialog::CloudUseMine(_) | Dialog::CloudCloseInApp(_) | Dialog::CloudLocked { .. } | Dialog::CloudDisconnect
+        )
+    }
+
+    /// The cloud file a cloud prompt is about.
+    pub(crate) fn cloud_path(&self) -> Option<&str> {
+        match self {
+            Dialog::CloudConflict(path) | Dialog::CloudUseMine(path) | Dialog::CloudCloseInApp(path) | Dialog::CloudLocked { path, .. } => Some(path),
+            _ => None,
         }
     }
 }
@@ -221,6 +250,10 @@ pub struct LauncherUi {
     /// While the user drags a pin handle: dragged catalog id and the pinned order at drag start
     /// (so Escape can restore it after live mid-drag reorders).
     pub(crate) pin_dragging: Option<(String, Vec<String>)>,
+    /// Apps or Cloud.
+    pub(crate) page: crate::cloud::Page,
+    /// The Cloud page: the connection, the listing and the files open from the cloud.
+    pub(crate) cloud: crate::cloud::CloudState,
 }
 
 /// The language to draw in: the preference, or English where it needs a CJK font the system
@@ -319,6 +352,8 @@ impl LauncherUi {
             flushed: Vec::new(),
             pending_toasts: Vec::new(),
             pin_dragging: None,
+            page: crate::cloud::Page::default(),
+            cloud: crate::cloud::CloudState::default(),
         }
     }
 
@@ -680,15 +715,17 @@ impl LauncherUi {
                 self.toast(message, true);
                 false
             }
-            // The Cloud page (a later task) handles these; nothing shows them yet.
-            Event::CloudLoginUrl(_)
+            event @ (Event::CloudLoginUrl(_)
             | Event::CloudConnected(_)
             | Event::CloudDisconnected
             | Event::CloudListed { .. }
             | Event::CloudFileStatus { .. }
             | Event::CloudLockedBy { .. }
             | Event::CloudError(_)
-            | Event::CloudRecentListed(_) => false,
+            | Event::CloudRecentListed(_)) => {
+                self.on_cloud(event);
+                false
+            }
         }
     }
 
@@ -936,6 +973,10 @@ impl LauncherUi {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(tokens.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 18, bottom: 0 }))
             .show(ui, |ui| {
+                if self.page == crate::cloud::Page::Cloud && self.cloud_available() {
+                    self.cloud_page(ui);
+                    return;
+                }
                 self.toolbar(ui);
                 ui.add_space(18.0);
                 let ids = self.visible_ids();

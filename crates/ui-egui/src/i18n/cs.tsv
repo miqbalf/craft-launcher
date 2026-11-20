@@ -448,3 +448,90 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Added	Přidáno
 	Remove	Odebrat
 	Add	Přidat
+# Cloud page (English until translated in storytold/craft-i18n).
+	Opening…	Opening…
+	Saved to cloud	Saved to cloud
+	Uploading…	Uploading…
+	Waiting to upload	Waiting to upload
+	Reconnect needed	Reconnect needed
+	Conflict	Conflict
+	Read-only	Read-only
+	Close it in the app first	Close it in the app first
+	Approve the sign-in in your browser to finish connecting.	Approve the sign-in in your browser to finish connecting.
+	Connected to {server} as {name}	Connected to {server} as {name}
+	Disconnected from your cloud.	Disconnected from your cloud.
+	Someone else is editing {name}.	Someone else is editing {name}.
+	{by} is editing {name}.	{by} is editing {name}.
+	{name} is saved to the cloud and closed.	{name} is saved to the cloud and closed.
+	Connect to cloud	Connect to cloud
+	Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.	Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.
+	Waiting for you to approve the sign-in in your browser…	Waiting for you to approve the sign-in in your browser…
+	If the browser didn't open, go to this address:	If the browser didn't open, go to this address:
+	Server address	Server address
+	Connect	Connect
+	Signs in through your browser	Signs in through your browser
+	The launcher keeps a sign-in you can revoke in Nextcloud, never your password.	The launcher keeps a sign-in you can revoke in Nextcloud, never your password.
+	Disconnect	Disconnect
+	Files	Files
+	Your folders	Your folders
+	Shared with me	Shared with me
+	Files others shared with you	Files others shared with you
+	Recent	Recent
+	Files you opened from the launcher	Files you opened from the launcher
+	Refresh the list	Refresh the list
+	Clear search	Clear search
+	Search files	Search files
+	Opened from the launcher, newest first	Opened from the launcher, newest first
+	Results for “{query}”	Results for “{query}”
+	Top folder	Top folder
+	Loading…	Loading…
+	Try again	Try again
+	This folder is empty.	This folder is empty.
+	Nobody has shared anything with you yet.	Nobody has shared anything with you yet.
+	Files you open from the cloud show here.	Files you open from the cloud show here.
+	No files match.	No files match.
+	Folder	Folder
+	Not supported yet	Not supported yet
+	Opened {date}	Opened {date}
+	Shared	Shared
+	Locked	Locked
+	Locked by {name}	Locked by {name}
+	Opening from the cloud isn't supported for this app yet.	Opening from the cloud isn't supported for this app yet.
+	{app} isn't installed. Install it to open this file.	{app} isn't installed. Install it to open this file.
+	Install {app}	Install {app}
+	Open from cloud	Open from cloud
+	Choose a version	Choose a version
+	I've closed it	I've closed it
+	Their version replaces yours, which is kept as a backup	Their version replaces yours, which is kept as a backup
+	Reconnect	Reconnect
+	Uploads what is left, then closes the file here	Uploads what is left, then closes the file here
+	Stop tracking (keep a local copy)	Stop tracking (keep a local copy)
+	Stops saving this file to the cloud; your copy moves to the kept folder on this computer	Stops saving this file to the cloud; your copy moves to the kept folder on this computer
+	{name} was changed in the cloud too	{name} was changed in the cloud too
+	Someone changed this file in the cloud while you were editing it. Choose which version to keep.	Someone changed this file in the cloud while you were editing it. Choose which version to keep.
+	Keep both: your version goes up as a copy beside theirs. Nothing is lost.	Keep both: your version goes up as a copy beside theirs. Nothing is lost.
+	Use mine: your version replaces theirs in the cloud.	Use mine: your version replaces theirs in the cloud.
+	Use theirs: their version opens here; yours is kept as a backup on this computer.	Use theirs: their version opens here; yours is kept as a backup on this computer.
+	Keep both	Keep both
+	Use mine…	Use mine…
+	Use theirs	Use theirs
+	Decide later	Decide later
+	Overwrite the version in Nextcloud?	Overwrite the version in Nextcloud?
+	Your version of {name} replaces the one in the cloud, and the other person's changes there are lost.	Your version of {name} replaces the one in the cloud, and the other person's changes there are lost.
+	Overwrite	Overwrite
+	its app	its app
+	Close {name} in {app}	Close {name} in {app}
+	Close the document in its app, then confirm. Your version is kept as a backup on this computer, and their version opens.	Close the document in its app, then confirm. Your version is kept as a backup on this computer, and their version opens.
+	Not yet	Not yet
+	Someone else is editing this file	Someone else is editing this file
+	{name} is editing this file	{name} is editing this file
+	You can open {file} read-only. Changes you make to it aren't saved to the cloud.	You can open {file} read-only. Changes you make to it aren't saved to the cloud.
+	Open read-only	Open read-only
+	Disconnect from {server}?	Disconnect from {server}?
+	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first; nothing in the cloud changes.	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first; nothing in the cloud changes.
+	These files are still open from the cloud. Choose Done on each one (or Stop tracking) first:	These files are still open from the cloud. Choose Done on each one (or Stop tracking) first:
+	Finish or close your open cloud files first.	Finish or close your open cloud files first.
+	Apps	Apps
+	Install, update and open the Craft apps	Install, update and open the Craft apps
+	Cloud	Cloud
+	Open and save your files in the cloud	Open and save your files in the cloud

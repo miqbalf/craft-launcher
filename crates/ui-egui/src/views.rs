@@ -193,6 +193,24 @@ impl LauncherUi {
                 }
                 // The controls reserve their actual widths before the secondary text gets space.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Apps | Cloud beside the logo. Drawn after the window's own buttons, so Tab
+                    // reaches those first, as before.
+                    if self.cloud_available() {
+                        widgets::rule(ui, h);
+                        ui.add_space(12.0);
+                        let options = [
+                            (
+                                crate::cloud::Page::Apps,
+                                widgets::Cell { label: tl!("Apps"), tip: tl!("Install, update and open the Craft apps"), count: None },
+                            ),
+                            (
+                                crate::cloud::Page::Cloud,
+                                widgets::Cell { label: tl!("Cloud"), tip: tl!("Open and save your files in the cloud"), count: None },
+                            ),
+                        ];
+                        widgets::cells(ui, &mut self.page, &options);
+                        ui.add_space(12.0);
+                    }
                     if ui.available_width() >= 17.0 + widgets::hud_galley(ui, tl!("Craft App Suite"), t.muted).size().x {
                         widgets::rule(ui, h);
                         ui.add_space(16.0);
