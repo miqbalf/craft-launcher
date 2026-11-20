@@ -15,6 +15,7 @@ use artcraft_launcher_core::protocol::{
 use artcraft_launcher_core::release::{Asset, Release};
 use artcraft_launcher_core::{CraftApp, Installed, PackageKind, version};
 
+use crate::cloud::{CloudService, transport::Transport};
 use crate::feed_throttle::{self, FeedThrottle, Outcome};
 use crate::http::{self, Http, Stop};
 use crate::install::{self, Job};
@@ -246,7 +247,11 @@ pub struct NativeBackend {
     /// Runs a job's worker. Each worker gets its own thread; a test swaps this to see what is in
     /// the download line at the moment each one would start.
     spawn: Spawn,
+    /// The cloud connection; `None` when HTTPS is unavailable.
+    cloud: Option<Arc<Cloud>>,
 }
+
+type Cloud = CloudService<craft_suite_account::Keychain, Transport>;
 
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
@@ -302,10 +307,23 @@ impl NativeBackend {
         let spawn: Spawn = Arc::new(|work| {
             std::thread::spawn(work);
         });
-        let backend = Self { shared, paths, http, source, platform: native_platform(), pins, spawn };
+        let cloud = http.as_ref().map(|h| {
+            let sink = shared.clone();
+            Arc::new(CloudService::new(&paths, craft_suite_account::Store::open(), Transport::new(h), move |event| sink.emit(event)))
+        });
+        let backend = Self { shared, paths, http, source, platform: native_platform(), pins, spawn, cloud };
         backend.replay_cache();
         backend.detect_all();
         backend
+    }
+
+    /// Runs `work` on its own thread: cloud calls wait on the network or the keychain.
+    fn cloud_job(&self, work: impl FnOnce(&Cloud) + Send + 'static) {
+        let Some(cloud) = self.cloud.clone() else {
+            self.shared.emit(Event::CloudError("Cloud files aren't available: secure connections can't be set up on this computer.".to_string()));
+            return;
+        };
+        std::thread::spawn(move || work(&cloud));
     }
 
     /// Shows the saved answers from the last run straight away, before any network request: the
@@ -1707,16 +1725,20 @@ impl Backend for NativeBackend {
                 let shared = self.shared.clone();
                 std::thread::spawn(move || run_mcp(&shared, cmd));
             }
-            Command::CloudConnect { .. }
-            | Command::CloudCancelConnect
-            | Command::CloudDisconnect
-            | Command::CloudList { .. }
-            | Command::CloudShared
-            | Command::CloudSearch { .. }
-            | Command::CloudRecent
-            | Command::CloudOpen { .. }
-            | Command::CloudDone { .. }
-            | Command::CloudResolve { .. } => self.shared.emit(Event::CloudError("Cloud files aren't available yet".to_string())),
+            Command::CloudConnect { server } => self.cloud_job(move |cloud| cloud.connect(&server)),
+            Command::CloudCancelConnect => {
+                if let Some(cloud) = &self.cloud {
+                    cloud.cancel_connect();
+                }
+            }
+            Command::CloudDisconnect => self.cloud_job(|cloud| cloud.disconnect()),
+            Command::CloudList { path } => self.cloud_job(move |cloud| cloud.list(&path)),
+            Command::CloudShared => self.cloud_job(|cloud| cloud.shared()),
+            Command::CloudSearch { query } => self.cloud_job(move |cloud| cloud.search(&query)),
+            // Recent files and opening, saving and resolving a file come with the check-out work.
+            Command::CloudRecent | Command::CloudOpen { .. } | Command::CloudDone { .. } | Command::CloudResolve { .. } => {
+                self.shared.emit(Event::CloudError("Cloud files aren't available yet".to_string()));
+            }
         }
     }
 
@@ -2383,6 +2405,7 @@ mod tests {
             spawn: Arc::new(|work| {
                 std::thread::spawn(work);
             }),
+            cloud: None,
         }
     }
 

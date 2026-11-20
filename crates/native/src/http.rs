@@ -39,6 +39,8 @@ pub struct Http {
     download: ureq::Agent,
     direct: ureq::Agent,
     direct_download: ureq::Agent,
+    /// Cloud (WebDAV) calls: follows no redirect, since the protocol client reads each status itself.
+    dav: ureq::Agent,
     token: Option<String>,
 }
 
@@ -126,10 +128,26 @@ impl Http {
             .user_agent(USER_AGENT)
             .build()
             .new_agent();
+        let dav = ureq::Agent::config_builder()
+            .tls_config(tls())
+            .proxy(proxy.clone())
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(60)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .user_agent(USER_AGENT)
+            .build()
+            .new_agent();
         // An optional token raises GitHub's limit from 60 to 5000 requests an hour. Only ever sent
         // to api.github.com.
         let token = std::env::var("ARTCRAFT_LAUNCHER_GITHUB_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        Ok(Self { small, feed, no_redirect, download, direct, direct_download, token })
+        Ok(Self { small, feed, no_redirect, download, direct, direct_download, dav, token })
+    }
+
+    /// The agent for cloud (WebDAV) calls: the launcher's TLS and proxy settings, no redirects.
+    pub(crate) fn dav_agent(&self) -> ureq::Agent {
+        self.dav.clone()
     }
 
     /// GET a GitHub API resource, revalidating with `etag` when given.

@@ -53,6 +53,11 @@ impl Paths {
         self.cache.join("screenshots").join(artcraft_launcher_core::details::SCREENSHOTS_REV).join(app).join(format!("{key}.jpg"))
     }
 
+    /// Working copies of cloud files, one folder per connected account: `<data>/cloud/<account>`.
+    pub fn cloud_root(&self) -> PathBuf {
+        self.data.join("cloud")
+    }
+
     pub fn manifest(&self) -> PathBuf {
         self.data.join("installed.json")
     }
