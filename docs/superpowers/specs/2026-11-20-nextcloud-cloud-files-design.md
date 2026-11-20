@@ -82,7 +82,7 @@ parts C needs later, so the work carries over.
 
 - A **Connect to cloud** button on a new **Cloud** page. The first provider is Nextcloud.
 - The user types the server address (for example `https://cloud.example.com`). The launcher
-  normalises it (adds `https://`, strips trailing paths) and checks `status.php`.
+  normalises it: adds `https://`, drops a pasted `/index.php/...` or `/apps/...` tail, and keeps a sub-path install such as `https://host/nextcloud`. Then it checks `<base>/status.php`.
 - The launcher starts Nextcloud Login Flow v2 (`POST /index.php/login/v2`). It opens the returned
   login URL in the system browser and polls the returned endpoint until the user approves.
   The result is the server, the login name and an **app password** that the user can revoke in
