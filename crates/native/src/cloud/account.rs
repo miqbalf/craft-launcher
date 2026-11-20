@@ -9,9 +9,24 @@ use artcraft_launcher_core::protocol::Event;
 use craft_nextcloud::http::Http;
 use craft_nextcloud::login::LoginFlow;
 use craft_nextcloud::{Account as DavAccount, Error as DavError};
-use craft_suite_account::{NewAccount, Secret, Shared, TokenStore};
+use craft_suite_account::{Secret, TokenStore, accounts::handle};
+use serde::{Deserialize, Serialize};
 
 use super::{CloudService, Session};
+
+/// What is kept on disk about the connected account: nothing secret.
+#[derive(Serialize, Deserialize)]
+struct Record {
+    server: String,
+    login: String,
+    display: String,
+}
+
+/// The keychain entry of an account's app password. Its own namespace: the suite account list
+/// is never involved.
+fn token_handle(server: &str, login: &str) -> String {
+    format!("artcraft-launcher-nextcloud:{}", handle(server, login))
+}
 
 /// Polls that may fail in a row (network blips) before the sign-in is abandoned.
 const POLL_FAILURES: u32 = 3;
@@ -27,15 +42,33 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self.session.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|s| s.dav.clone())
     }
 
-    /// Finds the signed-in cloud account the suite account list holds, with its token.
+    fn record_path(&self) -> std::path::PathBuf {
+        self.paths.cloud_root().join("account.json")
+    }
+
+    fn read_record(&self) -> Option<Record> {
+        serde_json::from_slice(&std::fs::read(self.record_path()).ok()?).ok()
+    }
+
+    /// Finds the connected account: the record on disk and its app password in the keychain.
+    /// Either one missing means not connected.
     fn load(&self) -> Option<CloudAccount> {
-        let Shared::Session { account, token } = self.store.shared() else { return None };
-        if !account.linked || !(account.service.starts_with("https://") || account.service.starts_with("http://")) {
-            return None;
-        }
-        let cloud =
-            CloudAccount { id: account.id.clone(), server: account.service.clone(), login: account.user.clone(), display: account.display.clone() };
-        let dav = DavAccount::new(account.service, account.user, token.expose());
+        let record = self.read_record()?;
+        let token = match self.tokens.get(&token_handle(&record.server, &record.login)) {
+            Ok(Some(token)) => token,
+            Ok(None) => return None,
+            Err(e) => {
+                log::warn!("couldn't read the cloud sign-in from the keychain: {e}");
+                return None;
+            }
+        };
+        let cloud = CloudAccount {
+            id: handle(&record.server, &record.login),
+            server: record.server.clone(),
+            login: record.login.clone(),
+            display: record.display,
+        };
+        let dav = DavAccount::new(record.server, record.login, token.expose());
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: cloud.clone(), dav });
         Some(cloud)
     }
@@ -50,6 +83,9 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         };
         let mine = self.attempt.fetch_add(1, Ordering::SeqCst) + 1;
         let http = self.http();
+        if let Err(message) = check_server(&http, &base) {
+            return self.emit(Event::CloudError(message));
+        }
         let flow = match LoginFlow::start(&http, &base) {
             Ok(f) => f,
             Err(e) => return self.emit(Event::CloudError(start_message(&e))),
@@ -119,35 +155,42 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
     }
 
-    /// Saves the sign-in (token to the keychain, account to the list) and makes it current.
+    /// Saves the sign-in: the app password to the keychain, the account (no secret) beside the
+    /// working copies. The suite account list is not touched.
     fn record(&self, base: &str, login: &str, password: &str) -> Result<CloudAccount, String> {
-        let new = NewAccount { service: base.to_string(), user: login.to_string(), display: login.to_string(), email: None, linked: true };
-        let saved = self
-            .store
-            .sign_in(&new, &Secret::new(password), jiff::Timestamp::now().as_second())
-            .map_err(|e| format!("Couldn't save your sign-in on this computer ({e})."))?;
-        let account = CloudAccount { id: saved.id, server: base.to_string(), login: login.to_string(), display: login.to_string() };
+        let token = token_handle(base, login);
+        let saved = |e: &dyn std::fmt::Display| format!("Couldn't save your sign-in on this computer ({e}).");
+        self.tokens.put(&token, &Secret::new(password)).map_err(|e| saved(&e))?;
+        let record = Record { server: base.to_string(), login: login.to_string(), display: login.to_string() };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| saved(&e))?;
+        if let Err(e) = crate::paths::write_atomic(&self.record_path(), &bytes) {
+            let _ = self.tokens.remove(&token);
+            return Err(saved(&e));
+        }
+        let account = CloudAccount { id: handle(base, login), server: base.to_string(), login: login.to_string(), display: login.to_string() };
         let dav = DavAccount::new(base, login, password);
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: account.clone(), dav });
         *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
         Ok(account)
     }
 
-    /// Forgets the account: its keychain token, its record, and its folder under the cloud root
+    /// Forgets the account: its app password, its record, and its folder under the cloud root
     /// (nothing outside it). Emits [`Event::CloudDisconnected`], or an error if a step failed.
     pub fn disconnect(&self) {
         self.attempt.fetch_add(1, Ordering::SeqCst);
-        let Some(account) = self.account() else { return self.emit(Event::CloudDisconnected) };
+        let Some(record) = self.read_record() else { return self.emit(Event::CloudDisconnected) };
         let mut failed = Vec::new();
-        if let Err(e) = self.store.discard(&account.id) {
-            failed.push(format!("the account record ({e})"));
-        }
-        // The record may already be gone while the keychain entry is not.
-        if let Err(e) = self.store.forget(&account.id) {
+        if let Err(e) = self.tokens.remove(&token_handle(&record.server, &record.login)) {
             failed.push(format!("the saved sign-in ({e})"));
         }
-        if let Err(e) = self.remove_cache(&account.id) {
+        if let Err(e) = self.remove_cache(&handle(&record.server, &record.login)) {
             failed.push(format!("the downloaded copies ({e})"));
+        }
+        // Last: while the record exists a failed step can be retried.
+        if failed.is_empty()
+            && let Err(e) = std::fs::remove_file(self.record_path())
+        {
+            failed.push(format!("the account record ({e})"));
         }
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
         *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -178,4 +221,18 @@ fn start_message(e: &DavError) -> String {
         DavError::Status { status, .. } => format!("The server answered HTTP {status}."),
         _ => "That server's answer wasn't a Nextcloud sign-in.".to_string(),
     }
+}
+
+/// Whether `base` is a Nextcloud server, from its `status.php`, before any sign-in starts.
+fn check_server<H: Http>(http: &H, base: &str) -> Result<(), String> {
+    let not_nextcloud = || "That address doesn't look like a Nextcloud server.".to_string();
+    let request =
+        craft_nextcloud::http::Request::new(craft_nextcloud::http::Method::Get, format!("{base}/status.php")).header("accept", "application/json");
+    let resp = http.send(request).map_err(|e| format!("Couldn't reach the server ({e})."))?;
+    if !resp.is_success() {
+        return Err(not_nextcloud());
+    }
+    let status: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|_| not_nextcloud())?;
+    let named = ["productname", "version"].iter().any(|k| status.get(k).and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty()));
+    if status.get("installed").and_then(serde_json::Value::as_bool) == Some(true) && named { Ok(()) } else { Err(not_nextcloud()) }
 }

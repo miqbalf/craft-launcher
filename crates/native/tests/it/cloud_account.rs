@@ -9,9 +9,13 @@ use artcraft_launcher_core::protocol::Event;
 use artcraft_launcher_native::cloud::{CloudService, SEARCH_PATH, SHARED_PATH};
 use artcraft_launcher_native::paths::Paths;
 use craft_nextcloud::http::{Http, Method, Request, Response};
-use craft_suite_account::{Memory, Store, accounts};
+use craft_suite_account::{Memory, NewAccount, Secret, Store, accounts};
 
 const SERVER: &str = "http://127.0.0.1:8080";
+fn token_handle() -> String {
+    format!("artcraft-launcher-nextcloud:{}", accounts::handle(SERVER, "alice"))
+}
+
 const PASSWORD: &str = "app-pass-w0rd-NEVER-ON-DISK";
 
 type Handler = dyn Fn(&Request) -> Response + Send + Sync;
@@ -64,7 +68,9 @@ fn response(href: &str, dir: bool) -> String {
 /// A server that completes the Login Flow on the first poll and lists three entries.
 fn friendly() -> Fake {
     Fake::new(|req| {
-        if req.url.ends_with("/index.php/login/v2") {
+        if req.url.ends_with("/status.php") {
+            json(r#"{"installed":true,"maintenance":false,"version":"30.0.1.2","productname":"Nextcloud"}"#)
+        } else if req.url.ends_with("/index.php/login/v2") {
             json(&format!(r#"{{"login":"{SERVER}/login/v2/flow/xyz","poll":{{"token":"tok","endpoint":"{SERVER}/login/v2/poll"}}}}"#))
         } else if req.url.ends_with("/login/v2/poll") {
             json(&format!(r#"{{"server":"{SERVER}","loginName":"alice","appPassword":"{PASSWORD}"}}"#))
@@ -89,11 +95,10 @@ fn rig(fake: Fake) -> Rig {
     let root = tempfile::tempdir().unwrap();
     let paths = Paths::under(root.path());
     let keychain = Memory::new();
-    let store = Store::at(Some(root.path().join("suite")), keychain.clone());
     let events: Arc<Mutex<Vec<Event>>> = Arc::default();
     let opened: Arc<Mutex<Vec<String>>> = Arc::default();
     let (sink, seen) = (events.clone(), opened.clone());
-    let service = CloudService::new(&paths, store, fake, move |e| sink.lock().unwrap().push(e))
+    let service = CloudService::new(&paths, keychain.clone(), fake, move |e| sink.lock().unwrap().push(e))
         .with_opener(move |url| {
             seen.lock().unwrap().push(url.to_string());
             Ok(())
@@ -132,12 +137,13 @@ fn connect_stores_token_only_in_keychain() {
     let rig = rig(friendly());
     rig.service.connect(SERVER);
     let account = rig.service.account().unwrap();
-    assert!(rig.keychain.has(&account.id), "the token should be in the keychain");
+    assert!(rig.keychain.has(&token_handle()), "the token should be in the keychain");
+    assert_eq!(rig.keychain.count(), 1);
     assert_eq!(account.id, accounts::handle(SERVER, "alice"));
 
     let mut files = Vec::new();
     files_under(rig._root.path(), &mut files);
-    assert!(!files.is_empty(), "the account list should have been written");
+    assert!(!files.is_empty(), "the account record should have been written");
     for file in files {
         let bytes = std::fs::read(&file).unwrap();
         assert!(!bytes.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes()), "password found in {}", file.display());
@@ -172,7 +178,8 @@ fn disconnect_removes_token_and_cache() {
 
     rig.service.disconnect();
 
-    assert!(!rig.keychain.has(&account.id), "the token should be gone");
+    assert!(!rig.keychain.has(&token_handle()), "the token should be gone");
+    assert!(!rig.paths.cloud_root().join("account.json").exists());
     assert!(!cache.exists(), "the account's cache should be gone");
     assert_eq!(std::fs::read(other.join("keep.txt")).unwrap(), b"keep");
     assert!(rig.paths.data.join("installed.json").exists());
@@ -287,7 +294,9 @@ fn cancel_stops_a_waiting_sign_in_quietly() {
 #[test]
 fn an_insecure_login_address_is_not_opened() {
     let fake = Fake::new(|req| {
-        if req.url.ends_with("/index.php/login/v2") {
+        if req.url.ends_with("/status.php") {
+            friendly().send_ok(req)
+        } else if req.url.ends_with("/index.php/login/v2") {
             json(r#"{"login":"file:///etc/passwd","poll":{"token":"t","endpoint":"http://127.0.0.1:8080/p"}}"#)
         } else {
             Response::new(404, Vec::new())
@@ -307,4 +316,52 @@ fn a_bad_server_address_is_an_error_before_any_request() {
     rig.service.connect("http://example.com");
     assert!(seen.lock().unwrap().is_empty());
     assert!(matches!(rig.events().as_slice(), [Event::CloudError(_)]));
+}
+
+#[test]
+fn a_server_that_is_not_nextcloud_stops_before_the_login_flow() {
+    for body in [r#"{"installed":false,"version":"30.0.1"}"#, r#"{"installed":true}"#, "<html>hello</html>"] {
+        let fake = Fake::new(move |_| json(body));
+        let seen = fake.seen.clone();
+        let rig = rig(fake);
+        rig.service.connect(SERVER);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, [format!("GET {SERVER}/status.php")], "{body}");
+        assert!(matches!(rig.events().as_slice(), [Event::CloudError(m)] if m.contains("Nextcloud")), "{body}: {:?}", rig.events());
+    }
+    let missing = Fake::new(|_| Response::new(404, Vec::new()));
+    let rig = rig(missing);
+    rig.service.connect(SERVER);
+    assert!(matches!(rig.events().as_slice(), [Event::CloudError(_)]));
+}
+
+fn suite_account(dir: &std::path::Path, tokens: &Memory) -> (Store<Memory>, String) {
+    let store = Store::at(Some(dir.to_path_buf()), tokens.clone());
+    let new = NewAccount { service: "https://suite.example".into(), user: "ada".into(), display: "Ada".into(), email: None, linked: true };
+    let saved = store.sign_in(&new, &Secret::new("suite-token"), 1).unwrap();
+    (store, saved.id)
+}
+
+#[test]
+fn disconnect_leaves_suite_accounts_alone() {
+    let rig = rig(friendly());
+    let (suite, id) = suite_account(&rig._root.path().join("suite"), &rig.keychain);
+    rig.service.connect(SERVER);
+    assert!(rig.service.account().is_some());
+    assert_eq!(suite.accounts().unwrap().active.as_deref(), Some(id.as_str()), "connect must not change the suite's active account");
+    rig.service.disconnect();
+    assert!(rig.service.account().is_none());
+    let list = suite.accounts().unwrap();
+    assert_eq!(list.active.as_deref(), Some(id.as_str()));
+    assert!(list.get(&id).is_some());
+    assert!(suite.has_token(&id).unwrap(), "the suite token must survive");
+}
+
+#[test]
+fn load_ignores_suite_accounts() {
+    let rig = rig(friendly());
+    let (_suite, _id) = suite_account(&rig._root.path().join("suite"), &rig.keychain);
+    assert!(rig.service.account().is_none());
+    rig.service.list("/");
+    assert!(matches!(rig.events().as_slice(), [Event::CloudListed { entries: Err(_), .. }]), "{:?}", rig.events());
 }

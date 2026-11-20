@@ -309,7 +309,7 @@ impl NativeBackend {
         });
         let cloud = http.as_ref().map(|h| {
             let sink = shared.clone();
-            Arc::new(CloudService::new(&paths, craft_suite_account::Store::open(), Transport::new(h), move |event| sink.emit(event)))
+            Arc::new(CloudService::new(&paths, craft_suite_account::Keychain, Transport::new(h), move |event| sink.emit(event)))
         });
         let backend = Self { shared, paths, http, source, platform: native_platform(), pins, spawn, cloud };
         backend.replay_cache();

@@ -3,7 +3,8 @@
 //! [`CloudService`] runs on the caller's thread and blocks on the network, so the backend calls it
 //! from worker threads. Every answer goes out as an [`Event`] through the `emit` function given to
 //! [`CloudService::new`]. The sign-in token lives only in the OS keychain (through
-//! `craft-suite-account`); the account list on disk holds no secret.
+//! `craft-suite-account`'s `TokenStore`); the account record on disk holds no secret and the
+//! suite account list is never touched.
 
 mod account;
 pub mod transport;
@@ -16,7 +17,7 @@ use artcraft_launcher_core::cloud::{CloudAccount, CloudEntry};
 use artcraft_launcher_core::protocol::Event;
 use craft_nextcloud::http::Http;
 use craft_nextcloud::{Account as DavAccount, Error as DavError, dav};
-use craft_suite_account::{Store, TokenStore};
+use craft_suite_account::TokenStore;
 
 use crate::paths::Paths;
 
@@ -43,7 +44,7 @@ struct Session {
 /// The cloud connection of this launcher.
 pub struct CloudService<S: TokenStore, H: Http> {
     paths: Paths,
-    store: Store<S>,
+    tokens: S,
     http: Mutex<H>,
     emit: Emit,
     open_url: Opener,
@@ -64,10 +65,10 @@ enum Failure {
 }
 
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
-    pub fn new(paths: &Paths, store: Store<S>, http: H, emit: impl Fn(Event) + Send + Sync + 'static) -> Self {
+    pub fn new(paths: &Paths, tokens: S, http: H, emit: impl Fn(Event) + Send + Sync + 'static) -> Self {
         Self {
             paths: paths.clone(),
-            store,
+            tokens,
             http: Mutex::new(http),
             emit: Box::new(emit),
             open_url: Box::new(|url| crate::process::open(std::ffi::OsStr::new(url))),
