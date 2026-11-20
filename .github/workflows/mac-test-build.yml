@@ -4,6 +4,8 @@ name: Mac test build
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/nextcloud-cloud-files]
 
 permissions:
   contents: read
