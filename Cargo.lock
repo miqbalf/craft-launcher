@@ -1184,7 +1184,7 @@ dependencies = [
 [[package]]
 name = "craft-quit"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=453b0da782ccef39be9a6dac8d27c80b553ef1cc#453b0da782ccef39be9a6dac8d27c80b553ef1cc"
+source = "git+https://github.com/miqbalf/craft-libs?rev=4a03ca77b72686a4488289b221c1abdeb0df660e#4a03ca77b72686a4488289b221c1abdeb0df660e"
 dependencies = [
  "dispatch2",
  "egui",
