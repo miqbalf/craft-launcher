@@ -253,6 +253,14 @@ pub struct NativeBackend {
 
 type Cloud = CloudService<craft_suite_account::Keychain, Transport>;
 
+/// Opens a cloud working copy in the installed catalog app `app`.
+fn open_in_app(shared: &Shared, app: &str, file: &std::path::Path) -> Result<(), String> {
+    let def = CraftApp::by_id(app).ok_or_else(|| "Opening from the cloud isn't supported for this app yet.".to_string())?;
+    let installed = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app).cloned();
+    let installed = installed.ok_or_else(|| format!("{} isn't installed. Install it from the Apps page, then open the file again.", def.name))?;
+    install::open_file(def, &installed, file)
+}
+
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
@@ -308,9 +316,17 @@ impl NativeBackend {
             std::thread::spawn(work);
         });
         let cloud = http.as_ref().map(|h| {
-            let sink = shared.clone();
-            Arc::new(CloudService::new(&paths, craft_suite_account::Keychain, Transport::new(h), move |event| sink.emit(event)))
+            let (sink, apps) = (shared.clone(), shared.clone());
+            Arc::new(
+                CloudService::new(&paths, craft_suite_account::Keychain, Transport::new(h), move |event| sink.emit(event))
+                    .with_launcher(move |app, file| open_in_app(&apps, app, file)),
+            )
         });
+        if let Some(cloud) = &cloud {
+            // Watches the files open from the cloud: shows last run's again and uploads their saves.
+            let cloud = cloud.clone();
+            std::thread::spawn(move || cloud.run_sync());
+        }
         let backend = Self { shared, paths, http, source, platform: native_platform(), pins, spawn, cloud };
         backend.replay_cache();
         backend.detect_all();
@@ -1735,10 +1751,10 @@ impl Backend for NativeBackend {
             Command::CloudList { path } => self.cloud_job(move |cloud| cloud.list(&path)),
             Command::CloudShared => self.cloud_job(|cloud| cloud.shared()),
             Command::CloudSearch { query } => self.cloud_job(move |cloud| cloud.search(&query)),
-            // Recent files and opening, saving and resolving a file come with the check-out work.
-            Command::CloudRecent | Command::CloudOpen { .. } | Command::CloudDone { .. } | Command::CloudResolve { .. } => {
-                self.shared.emit(Event::CloudError("Cloud files aren't available yet".to_string()));
-            }
+            Command::CloudRecent => self.cloud_job(|cloud| cloud.recent()),
+            Command::CloudOpen { path, app, read_only } => self.cloud_job(move |cloud| cloud.open(&path, app, read_only)),
+            Command::CloudDone { path } => self.cloud_job(move |cloud| cloud.done(&path)),
+            Command::CloudResolve { path, choice } => self.cloud_job(move |cloud| cloud.resolve(&path, choice)),
         }
     }
 

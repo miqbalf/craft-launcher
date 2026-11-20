@@ -41,6 +41,8 @@ pub struct Http {
     direct_download: ureq::Agent,
     /// Cloud (WebDAV) calls: follows no redirect, since the protocol client reads each status itself.
     dav: ureq::Agent,
+    /// Cloud file downloads and uploads: no overall limit, a long one per step.
+    dav_transfer: ureq::Agent,
     token: Option<String>,
 }
 
@@ -139,15 +141,37 @@ impl Http {
             .user_agent(USER_AGENT)
             .build()
             .new_agent();
+        // A large file on a slow line takes longer than a listing may: each step of a transfer
+        // has its own limit instead of one for the whole request.
+        let dav_transfer = ureq::Agent::config_builder()
+            .tls_config(tls())
+            .proxy(proxy.clone())
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_send_request(Some(Duration::from_secs(60)))
+            .timeout_send_body(Some(Duration::from_secs(30 * 60)))
+            .timeout_recv_response(Some(Duration::from_secs(5 * 60)))
+            .timeout_recv_body(Some(Duration::from_secs(30 * 60)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .user_agent(USER_AGENT)
+            .build()
+            .new_agent();
         // An optional token raises GitHub's limit from 60 to 5000 requests an hour. Only ever sent
         // to api.github.com.
         let token = std::env::var("ARTCRAFT_LAUNCHER_GITHUB_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        Ok(Self { small, feed, no_redirect, download, direct, direct_download, dav, token })
+        Ok(Self { small, feed, no_redirect, download, direct, direct_download, dav, dav_transfer, token })
     }
 
     /// The agent for cloud (WebDAV) calls: the launcher's TLS and proxy settings, no redirects.
     pub(crate) fn dav_agent(&self) -> ureq::Agent {
         self.dav.clone()
+    }
+
+    /// The agent for cloud file downloads and uploads: as [`Self::dav_agent`], with per-step
+    /// time limits long enough for a large file.
+    pub(crate) fn dav_transfer_agent(&self) -> ureq::Agent {
+        self.dav_transfer.clone()
     }
 
     /// GET a GitHub API resource, revalidating with `etag` when given.

@@ -947,6 +947,20 @@ pub fn launch(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[Stri
     .map_err(|e| format!("Couldn't open {}: {e}", app.name))
 }
 
+/// Opens `file` (a cloud working copy) in an installed app. macOS only in this version: the four
+/// office apps there take an open-document event, whether or not they are already running.
+#[cfg(target_os = "macos")]
+pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(), String> {
+    process::open_with(Path::new(&installed.location), file).map_err(|e| format!("Couldn't open {}: {e}", app.name))
+}
+
+/// Opens `file` (a cloud working copy) in an installed app: not on this system yet.
+#[cfg(not(target_os = "macos"))]
+pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(), String> {
+    let _ = (app, installed, file);
+    Err("Opening from the cloud isn't supported on this system yet".to_string())
+}
+
 /// Whether `location` names a program that is really there. Only a full path counts: detection
 /// stores the bare app name (`WordCraft`) when it can't find the exe, and `exists()` on that
 /// looks in the launcher's working folder, which is its own install folder. With the apps in a

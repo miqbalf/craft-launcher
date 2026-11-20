@@ -400,6 +400,15 @@ pub fn open_app(bundle: &Path, args: &[String]) -> Result<(), String> {
     spawn_detached(cmd)
 }
 
+/// macOS: opens `file` in the app at `bundle` (`open -a`), so an app that is already running
+/// gets an open-document event instead of a second copy starting.
+#[cfg(target_os = "macos")]
+pub fn open_with(bundle: &Path, file: &Path) -> Result<(), String> {
+    let mut cmd = command("open");
+    cmd.arg("-a").arg(bundle).arg(file);
+    spawn_detached(cmd)
+}
+
 /// The system's default opener for `target`: `explorer` on Windows, `open` on macOS, and
 /// `xdg-open` elsewhere (on the host, through `flatpak-spawn --host`, inside the sandbox).
 fn opener(target: &std::ffi::OsStr) -> Result<Command, String> {

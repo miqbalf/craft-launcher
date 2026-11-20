@@ -1,0 +1,595 @@
+//! Opening cloud files, saving them back and settling conflicts, against an in-memory WebDAV
+//! server, an injected app launcher and an injected clock (no sleeps).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus};
+use artcraft_launcher_core::protocol::Event;
+use artcraft_launcher_native::cloud::CloudService;
+use artcraft_launcher_native::paths::Paths;
+use craft_nextcloud::http::{Http, Method, Request, Response};
+use craft_suite_account::{Memory, Secret, TokenStore, accounts};
+
+const SERVER: &str = "http://127.0.0.1:8080";
+const PASSWORD: &str = "app-pass-w0rd-NEVER-ON-DISK";
+const FILE: &str = "/Docs/report.docx";
+const FILES_ROOT: &str = "http://127.0.0.1:8080/remote.php/dav/files/alice";
+
+/// One request as the fake saw it.
+#[derive(Clone, Debug)]
+struct Seen {
+    method: Method,
+    path: String,
+    if_match: Option<String>,
+    lock_if: Option<String>,
+}
+
+#[derive(Default)]
+struct Server {
+    files: HashMap<String, (Vec<u8>, String)>,
+    locks: HashMap<String, String>,
+    next: u64,
+    down: bool,
+    unauthorized: bool,
+    seen: Vec<Seen>,
+}
+
+impl Server {
+    fn tag(&mut self) -> String {
+        self.next += 1;
+        format!("etag-{}", self.next)
+    }
+}
+
+/// An in-memory WebDAV server: files with ETags, exclusive locks, If-Match and If-None-Match.
+#[derive(Clone, Default)]
+struct Dav(Arc<Mutex<Server>>);
+
+impl Dav {
+    fn with_file(path: &str, bytes: &[u8]) -> Dav {
+        let dav = Dav::default();
+        dav.change(path, bytes);
+        dav
+    }
+
+    /// Someone else saves `bytes` at `path`: a new ETag.
+    fn change(&self, path: &str, bytes: &[u8]) {
+        let mut s = self.0.lock().unwrap();
+        let tag = s.tag();
+        s.files.insert(path.to_string(), (bytes.to_vec(), tag));
+    }
+
+    fn lock_by_other(&self, path: &str) {
+        self.0.lock().unwrap().locks.insert(path.to_string(), "opaquelocktoken:somebody-else".to_string());
+    }
+
+    fn remote(&self, path: &str) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().files.get(path).map(|(b, _)| b.clone())
+    }
+
+    fn etag(&self, path: &str) -> String {
+        self.0.lock().unwrap().files.get(path).map(|(_, e)| e.clone()).unwrap()
+    }
+
+    fn held_lock(&self, path: &str) -> Option<String> {
+        self.0.lock().unwrap().locks.get(path).cloned()
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.0.lock().unwrap().seen.clone()
+    }
+
+    fn puts(&self) -> Vec<Seen> {
+        self.seen().into_iter().filter(|s| s.method == Method::Put).collect()
+    }
+
+    fn set_down(&self, down: bool) {
+        self.0.lock().unwrap().down = down;
+    }
+
+    fn set_unauthorized(&self, yes: bool) {
+        self.0.lock().unwrap().unauthorized = yes;
+    }
+
+    fn clear_seen(&self) {
+        self.0.lock().unwrap().seen.clear();
+    }
+}
+
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(Ok(v)) = s.get(i + 1..i + 3).map(|h| u8::from_str_radix(h, 16))
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap()
+}
+
+fn unquote(tag: &str) -> String {
+    tag.trim().trim_start_matches("W/").trim_matches('"').to_string()
+}
+
+impl Http for Dav {
+    type Error = String;
+
+    fn send(&self, req: Request) -> Result<Response, String> {
+        let mut s = self.0.lock().unwrap();
+        if s.down {
+            return Err("connection refused".to_string());
+        }
+        if s.unauthorized {
+            return Ok(Response::new(401, Vec::new()));
+        }
+        if req.url.contains("/ocs/v1.php/cloud/capabilities") {
+            return Ok(Response::new(200, br#"{"ocs":{"data":{"capabilities":{"files":{"locking":"1.0"}}}}}"#.to_vec()));
+        }
+        let Some(rest) = req.url.strip_prefix(FILES_ROOT) else { return Ok(Response::new(404, Vec::new())) };
+        let path = decode(rest);
+        let lock_if = req.get_header("if").map(str::to_string);
+        let if_match = req.get_header("if-match").map(unquote);
+        s.seen.push(Seen { method: req.method, path: path.clone(), if_match: if_match.clone(), lock_if: lock_if.clone() });
+        let held = s.locks.get(&path).cloned();
+        let sends_held = |held: &str| lock_if.as_deref().is_some_and(|h| h.contains(held));
+        match req.method {
+            Method::Get => match s.files.get(&path) {
+                Some((bytes, tag)) => Ok(Response::new(200, bytes.clone()).header("etag", format!("\"{tag}\""))),
+                None => Ok(Response::new(404, Vec::new())),
+            },
+            Method::Put => {
+                if let Some(held) = &held
+                    && !sends_held(held)
+                {
+                    return Ok(Response::new(423, Vec::new()));
+                }
+                let current = s.files.get(&path).map(|(_, t)| t.clone());
+                if req.get_header("if-none-match") == Some("*") && current.is_some() {
+                    return Ok(Response::new(412, Vec::new()));
+                }
+                if let Some(want) = &if_match
+                    && current.as_ref() != Some(want)
+                {
+                    return Ok(Response::new(412, Vec::new()));
+                }
+                let tag = s.tag();
+                s.files.insert(path, (req.body.clone(), tag.clone()));
+                Ok(Response::new(201, Vec::new()).header("etag", format!("\"{tag}\"")))
+            }
+            Method::Lock => {
+                if lock_if.is_some() {
+                    return Ok(match &held {
+                        Some(h) if sends_held(h) => Response::new(200, Vec::new()).header("lock-token", format!("<{h}>")),
+                        _ => Response::new(412, Vec::new()),
+                    });
+                }
+                if held.is_some() {
+                    return Ok(Response::new(423, Vec::new()));
+                }
+                let token = format!("opaquelocktoken:{}", s.tag());
+                s.locks.insert(path, token.clone());
+                Ok(Response::new(200, Vec::new()).header("lock-token", format!("<{token}>")))
+            }
+            Method::Unlock => {
+                let given = req.get_header("lock-token").map(|t| t.trim_matches(['<', '>']).to_string());
+                if held.is_some() && held == given {
+                    s.locks.remove(&path);
+                    Ok(Response::new(204, Vec::new()))
+                } else {
+                    Ok(Response::new(409, Vec::new()))
+                }
+            }
+            _ => Ok(Response::new(405, Vec::new())),
+        }
+    }
+}
+
+type Launched = Arc<Mutex<Vec<(String, PathBuf)>>>;
+
+struct Rig {
+    root: tempfile::TempDir,
+    paths: Paths,
+    keychain: Memory,
+    dav: Dav,
+    events: Arc<Mutex<Vec<Event>>>,
+    launched: Launched,
+    clock: Arc<Mutex<Instant>>,
+    service: CloudService<Memory, Dav>,
+}
+
+fn build(
+    paths: &Paths,
+    keychain: &Memory,
+    dav: &Dav,
+    events: &Arc<Mutex<Vec<Event>>>,
+    launched: &Launched,
+    clock: &Arc<Mutex<Instant>>,
+) -> CloudService<Memory, Dav> {
+    let (sink, seen, now) = (events.clone(), launched.clone(), clock.clone());
+    CloudService::new(paths, keychain.clone(), dav.clone(), move |e| sink.lock().unwrap().push(e))
+        .with_launcher(move |app: &str, file: &Path| {
+            seen.lock().unwrap().push((app.to_string(), file.to_path_buf()));
+            Ok(())
+        })
+        .with_clock(move || *now.lock().unwrap())
+}
+
+/// A connected account (record on disk, app password in the in-memory keychain) on `dav`.
+fn rig(dav: Dav) -> Rig {
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::under(root.path());
+    let keychain = Memory::new();
+    keychain.put(&format!("artcraft-launcher-nextcloud:{}", accounts::handle(SERVER, "alice")), &Secret::new(PASSWORD)).unwrap();
+    std::fs::create_dir_all(paths.cloud_root()).unwrap();
+    std::fs::write(paths.cloud_root().join("account.json"), format!(r#"{{"server":"{SERVER}","login":"alice","display":"alice"}}"#)).unwrap();
+    let events = Arc::default();
+    let launched = Arc::default();
+    let clock = Arc::new(Mutex::new(Instant::now()));
+    let service = build(&paths, &keychain, &dav, &events, &launched, &clock);
+    Rig { root, paths, keychain, dav, events, launched, clock, service }
+}
+
+impl Rig {
+    fn events(&self) -> Vec<Event> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn statuses(&self, path: &str) -> Vec<SyncStatus> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::CloudFileStatus { path: p, status, .. } if p == path => Some(status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn status(&self, path: &str) -> Option<SyncStatus> {
+        self.statuses(path).last().copied()
+    }
+
+    fn advance(&self, by: Duration) {
+        let mut now = self.clock.lock().unwrap();
+        *now += by;
+    }
+
+    /// A few seconds of the once-a-second sync loop.
+    fn settle(&self) {
+        for _ in 0..4 {
+            self.service.tick();
+            self.advance(Duration::from_secs(1));
+        }
+        self.service.tick();
+    }
+
+    /// Opens `path` for editing and returns the working copy the app was given.
+    fn open(&self, path: &str) -> PathBuf {
+        self.service.open(path, None, false);
+        self.launched.lock().unwrap().last().map(|(_, p)| p.clone()).unwrap_or_else(|| panic!("nothing launched: {:?}", self.events()))
+    }
+
+    /// Writes `bytes` the way apps save: a sibling temporary file renamed over the target.
+    fn save(&self, local: &Path, bytes: &[u8]) {
+        let tmp = local.with_file_name(".~report.docx.tmp");
+        std::fs::write(&tmp, bytes).unwrap();
+        std::fs::rename(&tmp, local).unwrap();
+    }
+
+    fn rebuild(&mut self) {
+        self.service = build(&self.paths, &self.keychain, &self.dav, &self.events, &self.launched, &self.clock);
+    }
+}
+
+#[test]
+fn open_locks_downloads_and_launches() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = rig.open(FILE);
+    assert!(rig.dav.held_lock(FILE).is_some(), "the file should be locked");
+    assert_eq!(std::fs::read(&local).unwrap(), b"remote v1");
+    assert!(local.starts_with(rig.paths.cloud_root()), "{}", local.display());
+    assert_eq!(local.file_name().unwrap(), "report.docx", "the real file name is kept");
+    assert_eq!(rig.launched.lock().unwrap()[0].0, "wordcraft");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+
+    let mut files = Vec::new();
+    files_under(rig.root.path(), &mut files);
+    for file in files {
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes()), "password in {}", file.display());
+    }
+    assert!(!format!("{:?}", rig.events()).contains(PASSWORD));
+}
+
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() { files_under(&path, out) } else { out.push(path) }
+    }
+}
+
+#[test]
+fn opening_again_keeps_unsynced_edits() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_down(true);
+    rig.save(&local, b"my unsynced edit");
+    dav.set_down(false);
+    dav.clear_seen();
+    let again = rig.open(FILE);
+    assert_eq!(again, local);
+    assert_eq!(std::fs::read(&local).unwrap(), b"my unsynced edit");
+    assert!(!dav.seen().iter().any(|s| s.method == Method::Get), "{:?}", dav.seen());
+}
+
+#[test]
+fn open_locked_by_other_offers_read_only() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.lock_by_other(FILE);
+    let rig = rig(dav.clone());
+    rig.service.open(FILE, None, false);
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudLockedBy { path, .. } if path == FILE)), "{:?}", rig.events());
+    assert!(rig.launched.lock().unwrap().is_empty(), "nothing opens until the user picks read-only");
+
+    rig.service.open(FILE, None, true);
+    let local = rig.launched.lock().unwrap()[0].1.clone();
+    assert_eq!(std::fs::read(&local).unwrap(), b"remote v1");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::ReadOnly));
+    rig.save(&local, b"local scribbles");
+    rig.settle();
+    assert!(dav.puts().is_empty(), "{:?}", dav.puts());
+    assert_eq!(dav.remote(FILE).unwrap(), b"remote v1");
+}
+
+#[test]
+fn atomic_save_uploads_once() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let old = dav.etag(FILE);
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    let tmp = local.with_file_name(".~report.docx.tmp");
+    std::fs::write(&tmp, b"my new version").unwrap();
+    rig.settle();
+    std::fs::rename(&tmp, &local).unwrap();
+    rig.settle();
+    rig.settle();
+
+    let puts = dav.puts();
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0].path, FILE);
+    assert_eq!(puts[0].if_match.as_deref(), Some(old.as_str()));
+    assert!(puts[0].lock_if.as_deref().is_some_and(|h| h.contains(&dav.held_lock(FILE).unwrap())), "the lock token is sent");
+    assert_eq!(dav.remote(FILE).unwrap(), b"my new version");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    assert!(rig.statuses(FILE).contains(&SyncStatus::Uploading));
+}
+
+#[test]
+fn remote_change_gives_conflict_and_no_overwrite() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.change(FILE, b"their version");
+    rig.save(&local, b"my version");
+    rig.settle();
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Conflict));
+    assert_eq!(dav.remote(FILE).unwrap(), b"their version");
+    assert_eq!(std::fs::read(&local).unwrap(), b"my version");
+
+    // Once in conflict, further saves are not uploaded.
+    dav.clear_seen();
+    rig.save(&local, b"my version, edited more");
+    rig.settle();
+    assert!(dav.puts().is_empty(), "{:?}", dav.puts());
+}
+
+fn conflicted(rig: &Rig) -> PathBuf {
+    let local = rig.open(FILE);
+    rig.dav.change(FILE, b"their version");
+    rig.save(&local, b"my version");
+    rig.settle();
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Conflict));
+    rig.dav.clear_seen();
+    local
+}
+
+#[test]
+fn keep_both_retargets_to_conflict_copy() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = conflicted(&rig);
+    rig.service.resolve(FILE, ConflictChoice::KeepBoth);
+    let copy = rig.dav.puts().first().map(|p| p.path.clone()).expect("my version is uploaded");
+    assert!(copy.starts_with("/Docs/report (conflict ") && copy.ends_with(").docx") && copy.contains("alice"), "{copy}");
+    assert_eq!(rig.dav.remote(&copy).unwrap(), b"my version");
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"their version");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+
+    rig.dav.clear_seen();
+    rig.save(&local, b"my version, edited more");
+    rig.settle();
+    let puts = rig.dav.puts();
+    assert!(!puts.is_empty());
+    assert!(puts.iter().all(|p| p.path == copy), "{puts:?}");
+    assert_eq!(rig.dav.remote(&copy).unwrap(), b"my version, edited more");
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"their version");
+}
+
+#[test]
+fn keep_both_picks_a_free_name() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let _local = conflicted(&rig);
+    // Take every conflict name the launcher could pick this minute without a number.
+    let stamp = jiff::Zoned::now().strftime("%Y-%m-%d %H%M").to_string();
+    rig.dav.change(&format!("/Docs/report (conflict {stamp} alice).docx"), b"earlier copy");
+    rig.service.resolve(FILE, ConflictChoice::KeepBoth);
+    let created: Vec<_> = rig.dav.puts().into_iter().map(|p| p.path).collect();
+    let last = created.last().unwrap();
+    assert_ne!(rig.dav.remote(last).unwrap(), b"earlier copy".to_vec());
+    assert_eq!(rig.dav.remote(last).unwrap(), b"my version");
+}
+
+#[test]
+fn use_mine_overwrites_without_if_match() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let _local = conflicted(&rig);
+    rig.service.resolve(FILE, ConflictChoice::UseMine);
+    let puts = rig.dav.puts();
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!((puts[0].path.as_str(), puts[0].if_match.as_deref()), (FILE, None));
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"my version");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+}
+
+#[test]
+fn use_theirs_requires_close_first() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = conflicted(&rig);
+    rig.service.resolve(FILE, ConflictChoice::UseTheirs);
+    assert_eq!(rig.status(FILE), Some(SyncStatus::CloseInAppFirst));
+    rig.save(&local, b"my version, saved again before closing");
+    rig.settle();
+    assert!(rig.dav.puts().is_empty(), "{:?}", rig.dav.puts());
+    assert_eq!(std::fs::read(&local).unwrap(), b"my version, saved again before closing");
+    let launches = rig.launched.lock().unwrap().len();
+
+    rig.service.resolve(FILE, ConflictChoice::TheirsClosed);
+    assert_eq!(std::fs::read(&local).unwrap(), b"their version");
+    let dir = local.parent().unwrap();
+    let backups: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p != &local && std::fs::read(p).unwrap() == b"my version, saved again before closing")
+        .collect();
+    assert_eq!(backups.len(), 1, "my version is kept as a backup beside it");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    assert!(rig.launched.lock().unwrap().len() > launches, "theirs is opened again in the app");
+    assert!(rig.dav.puts().is_empty());
+}
+
+#[test]
+fn network_down_waits_and_keeps_file() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_down(true);
+    rig.save(&local, b"offline edit");
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::WaitingToUpload));
+    assert_eq!(std::fs::read(&local).unwrap(), b"offline edit");
+    assert_eq!(dav.remote(FILE).unwrap(), b"remote v1");
+
+    dav.set_down(false);
+    rig.advance(Duration::from_secs(10 * 60));
+    rig.settle();
+    assert_eq!(dav.remote(FILE).unwrap(), b"offline edit");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    assert_eq!(std::fs::read(&local).unwrap(), b"offline edit");
+}
+
+#[test]
+fn unauthorized_keeps_checkout() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_unauthorized(true);
+    rig.save(&local, b"edit while signed out");
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::ReconnectNeeded));
+    assert_eq!(std::fs::read(&local).unwrap(), b"edit while signed out");
+    let record = std::fs::read_to_string(rig.paths.cloud_root().join("checkouts.json")).unwrap();
+    assert!(record.contains("report.docx"), "{record}");
+    // Opening again after the rejection still finds the same working copy.
+    dav.set_unauthorized(false);
+    assert_eq!(rig.open(FILE), local);
+    assert_eq!(std::fs::read(&local).unwrap(), b"edit while signed out");
+}
+
+#[test]
+fn resume_after_restart_uploads_offline_edit() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let old = dav.etag(FILE);
+    let mut rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    rig.save(&local, b"edited while the launcher was closed");
+    rig.rebuild();
+    rig.service.resume();
+    rig.settle();
+    let puts = dav.puts();
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0].if_match.as_deref(), Some(old.as_str()));
+    assert_eq!(dav.remote(FILE).unwrap(), b"edited while the launcher was closed");
+}
+
+#[test]
+fn done_uploads_unlocks_and_cleans() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    rig.save(&local, b"final words");
+    // No settling: Done does the last upload itself.
+    rig.service.done(FILE);
+    assert_eq!(dav.remote(FILE).unwrap(), b"final words");
+    assert!(dav.held_lock(FILE).is_none(), "unlocked");
+    assert!(dav.seen().iter().any(|s| s.method == Method::Unlock));
+    assert!(!local.exists(), "the synced copy is removed");
+    let record = std::fs::read_to_string(rig.paths.cloud_root().join("checkouts.json")).unwrap();
+    assert!(!record.contains("report.docx"), "{record}");
+}
+
+#[test]
+fn done_keeps_the_copy_when_the_upload_fails() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    rig.save(&local, b"final words");
+    dav.set_down(true);
+    rig.service.done(FILE);
+    assert_eq!(std::fs::read(&local).unwrap(), b"final words");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::WaitingToUpload));
+    dav.set_down(false);
+    assert!(dav.held_lock(FILE).is_some(), "the lock is kept until the copy is up");
+}
+
+#[test]
+fn disconnect_with_open_file_is_refused_and_keeps_copy() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_down(true);
+    rig.save(&local, b"not uploaded yet");
+    rig.service.disconnect();
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(m) if m.contains("Finish or close"))), "{:?}", rig.events());
+    assert_eq!(std::fs::read(&local).unwrap(), b"not uploaded yet");
+    assert!(rig.service.account().is_some());
+}
+
+#[test]
+fn recent_lists_opened_files_newest_first() {
+    let dav = Dav::with_file(FILE, b"one");
+    dav.change("/b.pdf", b"two");
+    let rig = rig(dav);
+    rig.open(FILE);
+    rig.open("/b.pdf");
+    rig.open(FILE);
+    rig.events.lock().unwrap().clear();
+    rig.service.recent();
+    match rig.events().as_slice() {
+        [Event::CloudRecentListed(list)] => {
+            let paths: Vec<_> = list.iter().map(|e| e.path.as_str()).collect();
+            assert_eq!(paths, [FILE, "/b.pdf"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}

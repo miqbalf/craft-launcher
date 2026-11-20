@@ -34,7 +34,9 @@ const POLL_FAILURES: u32 = 3;
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
     /// The connected account, looked up in the keychain-backed list the first time.
     pub fn account(&self) -> Option<CloudAccount> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|s| s.account.clone()).or_else(|| self.load())
+        // The guard must be gone before `load`, which takes the same lock.
+        let held = self.session.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|s| s.account.clone());
+        held.or_else(|| self.load())
     }
 
     pub(super) fn session_dav(&self) -> Option<DavAccount> {
@@ -176,14 +178,25 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 
     /// Forgets the account: its app password, its record, and its folder under the cloud root
     /// (nothing outside it). Emits [`Event::CloudDisconnected`], or an error if a step failed.
+    ///
+    /// Refused while any of its files is still open from the cloud: their working copies may hold
+    /// changes not uploaded yet, and the folder holding them would be deleted.
     pub fn disconnect(&self) {
         self.attempt.fetch_add(1, Ordering::SeqCst);
+        // Held to the end, so the watcher can't start an upload for the account being removed.
+        let mut book = self.lock_book();
         let Some(record) = self.read_record() else { return self.emit(Event::CloudDisconnected) };
+        let id = handle(&record.server, &record.login);
+        match self.book(&mut book) {
+            Ok(open) if open.has_account(&id) => return self.emit(Event::CloudError("Finish or close your open cloud files first.".to_string())),
+            Ok(_) => {}
+            Err(e) => return self.emit(Event::CloudError(format!("Couldn't read the list of open cloud files ({e}), so nothing was removed."))),
+        }
         let mut failed = Vec::new();
         if let Err(e) = self.tokens.remove(&token_handle(&record.server, &record.login)) {
             failed.push(format!("the saved sign-in ({e})"));
         }
-        if let Err(e) = self.remove_cache(&handle(&record.server, &record.login)) {
+        if let Err(e) = self.remove_cache(&id) {
             failed.push(format!("the downloaded copies ({e})"));
         }
         // Last: while the record exists a failed step can be retried.

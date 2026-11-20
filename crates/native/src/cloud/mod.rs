@@ -5,13 +5,20 @@
 //! [`CloudService::new`]. The sign-in token lives only in the OS keychain (through
 //! `craft-suite-account`'s `TokenStore`); the account record on disk holds no secret and the
 //! suite account list is never touched.
+//!
+//! Files opened from the cloud are checked out into a cache folder, opened in their Craft app and
+//! watched; saves go back with `If-Match`, so a newer version on the server is never replaced
+//! silently (see [`sync`]).
 
 mod account;
+mod checkout;
+mod sync;
 pub mod transport;
 
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::cloud::{CloudAccount, CloudEntry};
 use artcraft_launcher_core::protocol::Event;
@@ -27,6 +34,10 @@ pub const SHARED_PATH: &str = "@shared";
 /// The `path` of the [`Event::CloudListed`] that answers `CloudSearch`.
 pub const SEARCH_PATH: &str = "@search";
 
+/// The `detail` of the last [`Event::CloudFileStatus`] of a file after `CloudDone`: it is saved,
+/// closed and no longer watched.
+pub const CLOSED_DETAIL: &str = "Closed";
+
 /// How often the sign-in is checked while the user approves it in the browser.
 const POLL_EVERY: Duration = Duration::from_secs(2);
 /// How long a sign-in waits for the browser before giving up.
@@ -34,6 +45,9 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(20 * 60);
 
 type Emit = Box<dyn Fn(Event) + Send + Sync>;
 type Opener = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Opens a working copy in a catalog app: `(app id, file)`.
+type Launcher = Box<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
+type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 
 /// A signed-in account: what the UI sees, and what the WebDAV client needs.
 struct Session {
@@ -56,6 +70,11 @@ pub struct CloudService<S: TokenStore, H: Http> {
     attempt: AtomicU64,
     /// The folder last listed, for the name filter that stands in when the server can't search.
     last_listed: Mutex<Option<Vec<CloudEntry>>>,
+    launcher: Launcher,
+    clock: Clock,
+    /// The open files. `None` until first read from disk. Held for the whole of each sync step, so
+    /// an open, a poll, a Done, a resolve and a disconnect never interleave on one file.
+    book: Mutex<Option<checkout::Book>>,
 }
 
 /// Why a cloud call produced nothing.
@@ -77,7 +96,25 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             session: Mutex::new(None),
             attempt: AtomicU64::new(0),
             last_listed: Mutex::new(None),
+            launcher: Box::new(|_, _| Err("Opening from the cloud isn't supported on this system yet".to_string())),
+            clock: Box::new(Instant::now),
+            book: Mutex::new(None),
         }
+    }
+
+    /// Replaces how a working copy is opened in its app (the backend opens installed apps; tests
+    /// record the call).
+    #[must_use]
+    pub fn with_launcher(mut self, launch: impl Fn(&str, &Path) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        self.launcher = Box::new(launch);
+        self
+    }
+
+    /// Replaces the clock the watcher's waits are measured with (tests move it by hand).
+    #[must_use]
+    pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(now);
+        self
     }
 
     /// Replaces how the sign-in address is opened (tests must not start a browser).
@@ -169,12 +206,19 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 fn explain(failure: &Failure) -> (String, bool) {
     match failure {
         Failure::NotConnected => ("Connect to your cloud first.".to_string(), false),
-        Failure::Dav(DavError::Unauthorized) => ("Your cloud sign-in is no longer valid. Reconnect to continue.".to_string(), true),
-        Failure::Dav(DavError::NotFound) => ("That folder wasn't found in your cloud.".to_string(), false),
-        Failure::Dav(DavError::Transport(why)) => (format!("Couldn't reach your cloud server ({why})."), false),
-        Failure::Dav(DavError::Status { status, .. }) => (format!("Your cloud server answered HTTP {status}."), false),
-        Failure::Dav(DavError::Malformed(_)) => ("Your cloud server sent an answer the launcher couldn't read.".to_string(), false),
-        Failure::Dav(DavError::Conflict | DavError::Locked) => ("Your cloud server refused the request.".to_string(), false),
+        Failure::Dav(e) => explain_dav(e),
+    }
+}
+
+/// [`explain`] for a WebDAV error.
+fn explain_dav(e: &DavError) -> (String, bool) {
+    match e {
+        DavError::Unauthorized => ("Your cloud sign-in is no longer valid. Reconnect to continue.".to_string(), true),
+        DavError::NotFound => ("That folder wasn't found in your cloud.".to_string(), false),
+        DavError::Transport(why) => (format!("Couldn't reach your cloud server ({why})."), false),
+        DavError::Status { status, .. } => (format!("Your cloud server answered HTTP {status}."), false),
+        DavError::Malformed(_) => ("Your cloud server sent an answer the launcher couldn't read.".to_string(), false),
+        DavError::Conflict | DavError::Locked => ("Your cloud server refused the request.".to_string(), false),
     }
 }
 

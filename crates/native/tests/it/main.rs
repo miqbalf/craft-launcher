@@ -2,3 +2,4 @@
 #![allow(clippy::unwrap_used)]
 
 mod cloud_account;
+mod cloud_sync;
