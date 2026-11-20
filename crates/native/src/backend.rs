@@ -1707,6 +1707,16 @@ impl Backend for NativeBackend {
                 let shared = self.shared.clone();
                 std::thread::spawn(move || run_mcp(&shared, cmd));
             }
+            Command::CloudConnect { .. }
+            | Command::CloudCancelConnect
+            | Command::CloudDisconnect
+            | Command::CloudList { .. }
+            | Command::CloudShared
+            | Command::CloudSearch { .. }
+            | Command::CloudRecent
+            | Command::CloudOpen { .. }
+            | Command::CloudDone { .. }
+            | Command::CloudResolve { .. } => self.shared.emit(Event::CloudError("Cloud files aren't available yet".to_string())),
         }
     }
 

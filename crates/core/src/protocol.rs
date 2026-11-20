@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cloud::{CloudAccount, CloudEntry, ConflictChoice, SyncStatus};
 use crate::platform::{PackageKind, Platform};
 use crate::release::Release;
 use crate::status::Installed;
@@ -95,6 +96,41 @@ pub enum Command {
     /// Quit an MCP client and start it again, so it loads the entry just added.
     McpRestartClient {
         client: McpClient,
+    },
+    /// Start signing in to the cloud server at `server` (what the user typed).
+    CloudConnect {
+        server: String,
+    },
+    /// Stop a sign-in that is waiting for the browser.
+    CloudCancelConnect,
+    /// Forget the connected account and its saved sign-in.
+    CloudDisconnect,
+    /// List the folder `path`.
+    CloudList {
+        path: String,
+    },
+    /// List what others shared with the user.
+    CloudShared,
+    /// Search the cloud for `query`.
+    CloudSearch {
+        query: String,
+    },
+    /// List files opened through the launcher, newest first.
+    CloudRecent,
+    /// Open the file at `path` in `app` (or the app its extension picks), read-only if asked.
+    CloudOpen {
+        path: String,
+        app: Option<String>,
+        read_only: bool,
+    },
+    /// The user is finished with the file at `path`: save it back and stop watching it.
+    CloudDone {
+        path: String,
+    },
+    /// Settle a conflict on `path`.
+    CloudResolve {
+        path: String,
+        choice: ConflictChoice,
     },
 }
 
@@ -331,6 +367,28 @@ pub enum Event {
     McpError {
         message: String,
     },
+    /// The browser address to open to approve the sign-in.
+    CloudLoginUrl(String),
+    CloudConnected(CloudAccount),
+    CloudDisconnected,
+    /// The folder `path` was listed, or why it could not be.
+    CloudListed {
+        path: String,
+        entries: Result<Vec<CloudEntry>, String>,
+    },
+    CloudFileStatus {
+        path: String,
+        status: SyncStatus,
+        detail: Option<String>,
+    },
+    CloudLockedBy {
+        path: String,
+        by: String,
+    },
+    /// A cloud action failed; a short, user-facing message.
+    CloudError(String),
+    /// Files opened through the launcher, newest first, at most 50.
+    CloudRecentListed(Vec<CloudEntry>),
 }
 
 /// An MCP client the launcher can add the gateway entry to.

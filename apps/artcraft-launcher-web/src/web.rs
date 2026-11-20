@@ -314,6 +314,16 @@ impl Backend for WebBackend {
                     self.check();
                 }
             }
+            Command::CloudConnect { .. }
+            | Command::CloudCancelConnect
+            | Command::CloudDisconnect
+            | Command::CloudList { .. }
+            | Command::CloudShared
+            | Command::CloudSearch { .. }
+            | Command::CloudRecent
+            | Command::CloudOpen { .. }
+            | Command::CloudDone { .. }
+            | Command::CloudResolve { .. } => self.events.borrow_mut().push(Event::CloudError("Cloud files need the desktop launcher".to_string())),
             _ => {}
         }
     }

@@ -680,6 +680,15 @@ impl LauncherUi {
                 self.toast(message, true);
                 false
             }
+            // The Cloud page (a later task) handles these; nothing shows them yet.
+            Event::CloudLoginUrl(_)
+            | Event::CloudConnected(_)
+            | Event::CloudDisconnected
+            | Event::CloudListed { .. }
+            | Event::CloudFileStatus { .. }
+            | Event::CloudLockedBy { .. }
+            | Event::CloudError(_)
+            | Event::CloudRecentListed(_) => false,
         }
     }
 
