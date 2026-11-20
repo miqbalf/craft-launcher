@@ -253,6 +253,9 @@ pub struct NativeBackend {
 
 type Cloud = CloudService<craft_suite_account::Keychain, Transport>;
 
+/// Whether a cloud file can be opened in its app on this system (`install::open_file`).
+const CLOUD_OPENS_HERE: bool = cfg!(target_os = "macos");
+
 /// Opens a cloud working copy in the installed catalog app `app`.
 fn open_in_app(shared: &Shared, app: &str, file: &std::path::Path) -> Result<(), String> {
     let def = CraftApp::by_id(app).ok_or_else(|| "Opening from the cloud isn't supported for this app yet.".to_string())?;
@@ -1742,6 +1745,12 @@ impl Backend for NativeBackend {
                 let shared = self.shared.clone();
                 std::thread::spawn(move || run_mcp(&shared, cmd));
             }
+            // Without a cloud connection the sign-in ends at once, so the page stops waiting.
+            Command::CloudConnect { .. } if self.cloud.is_none() => {
+                self.shared.emit(Event::CloudConnectFailed(
+                    "Cloud files aren't available: secure connections can't be set up on this computer.".to_string(),
+                ));
+            }
             Command::CloudConnect { server } => self.cloud_job(move |cloud| cloud.connect(&server)),
             Command::CloudCancelConnect => {
                 if let Some(cloud) = &self.cloud {
@@ -1753,10 +1762,15 @@ impl Backend for NativeBackend {
             Command::CloudShared => self.cloud_job(|cloud| cloud.shared()),
             Command::CloudSearch { query } => self.cloud_job(move |cloud| cloud.search(&query)),
             Command::CloudRecent => self.cloud_job(|cloud| cloud.recent()),
+            // Refused before anything is locked or downloaded where no app can be given the file.
+            Command::CloudOpen { .. } if !CLOUD_OPENS_HERE => {
+                self.shared.emit(Event::CloudError("Opening from the cloud isn't supported on this system yet".to_string()));
+            }
             Command::CloudOpen { path, app, read_only } => self.cloud_job(move |cloud| cloud.open(&path, app, read_only)),
             Command::CloudDone { path } => self.cloud_job(move |cloud| cloud.done(&path)),
             Command::CloudResolve { path, choice } => self.cloud_job(move |cloud| cloud.resolve(&path, choice)),
             Command::CloudForget { path } => self.cloud_job(move |cloud| cloud.forget(&path)),
+            Command::CloudRevealKept => self.cloud_job(|cloud| cloud.reveal_kept()),
         }
     }
 
@@ -1780,6 +1794,7 @@ impl Backend for NativeBackend {
             reveal_label,
             self_update: self.launcher_update_job().is_some(),
             desktop_shortcuts: matches!(self.platform.map(|p| p.os), Some(Os::Windows)),
+            open_cloud_files: CLOUD_OPENS_HERE,
         }
     }
 

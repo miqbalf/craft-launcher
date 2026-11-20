@@ -15,6 +15,7 @@ mod checkout;
 mod sync;
 pub mod transport;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError};
@@ -28,7 +29,7 @@ use craft_suite_account::TokenStore;
 
 use crate::paths::Paths;
 
-pub use artcraft_launcher_core::cloud::{CLOSED_DETAIL, SEARCH_PATH, SHARED_PATH};
+pub use artcraft_launcher_core::cloud::{SEARCH_PATH, SHARED_PATH};
 
 /// How often the sign-in is checked while the user approves it in the browser.
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -40,6 +41,9 @@ type Opener = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Opens a working copy in a catalog app: `(app id, file)`.
 type Launcher = Box<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
+type WallClock = Box<dyn Fn() -> jiff::Timestamp + Send + Sync>;
+/// Shows a folder in the file manager.
+type Revealer = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 /// A signed-in account: what the UI sees, and what the WebDAV client needs.
 struct Session {
@@ -64,6 +68,14 @@ pub struct CloudService<S: TokenStore, H: Http> {
     last_listed: Mutex<Option<Vec<CloudEntry>>>,
     launcher: Launcher,
     clock: Clock,
+    /// The date and time names of conflict copies and backups carry.
+    wall: WallClock,
+    reveal: Revealer,
+    /// Runs just before a file action waits for the open files (tests make an account change
+    /// land in that gap).
+    before_book: Box<dyn Fn() + Send + Sync>,
+    /// Paths the last listings showed as not writable for this user: they open read-only.
+    not_writable: Mutex<HashSet<String>>,
     /// The open files. `None` until first read from disk. Held for the whole of each sync step, so
     /// an open, a poll, a Done, a resolve and a disconnect never interleave on one file.
     book: Mutex<Option<checkout::Book>>,
@@ -90,8 +102,36 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             last_listed: Mutex::new(None),
             launcher: Box::new(|_, _| Err("Opening from the cloud isn't supported on this system yet".to_string())),
             clock: Box::new(Instant::now),
+            wall: Box::new(jiff::Timestamp::now),
+            reveal: Box::new(crate::process::reveal),
+            before_book: Box::new(|| {}),
+            not_writable: Mutex::new(HashSet::new()),
             book: Mutex::new(None),
         }
+    }
+
+    /// Replaces the wall clock conflict and backup names are dated with (tests fix it).
+    #[must_use]
+    pub fn with_wall_clock(mut self, now: impl Fn() -> jiff::Timestamp + Send + Sync + 'static) -> Self {
+        self.wall = Box::new(now);
+        self
+    }
+
+    /// Replaces how the kept folder is shown in the file manager (tests record the call).
+    #[must_use]
+    pub fn with_revealer(mut self, reveal: impl Fn(&Path) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        self.reveal = Box::new(reveal);
+        self
+    }
+
+    /// Runs `pause` each time a file action (open, Done, Stop tracking, a conflict choice) is about
+    /// to wait for the open files, after it has checked the account. Tests use it to change the
+    /// account in that gap.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_pause_before_book(mut self, pause: impl Fn() + Send + Sync + 'static) -> Self {
+        self.before_book = Box::new(pause);
+        self
     }
 
     /// Replaces how a working copy is opened in its app (the backend opens installed apps; tests
@@ -154,16 +194,41 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// Searches by file name, answering with [`SEARCH_PATH`]. When the server can't search (any
     /// failure but a rejected sign-in) it filters the folder listed last by name instead.
     pub fn search(&self, query: &str) {
+        let mut folder_only = false;
         let result = match self.call(|files, http| files.search(http, query)) {
             Ok(entries) => Ok(sorted(entries)),
             Err(Failure::Dav(DavError::Unauthorized)) => Err(Failure::Dav(DavError::Unauthorized)),
             Err(Failure::NotConnected) => Err(Failure::NotConnected),
             Err(Failure::Dav(e)) => {
                 log::info!("cloud search failed ({e}); filtering the listed folder instead");
+                folder_only = true;
                 Ok(self.filter_listed(query))
             }
         };
-        self.answer(SEARCH_PATH, result);
+        self.answer_with(SEARCH_PATH, result, folder_only);
+    }
+
+    /// Whether the last listings showed `path` as not writable for this user.
+    fn listed_read_only(&self, path: &str) -> bool {
+        self.not_writable.lock().unwrap_or_else(PoisonError::into_inner).contains(path)
+    }
+
+    /// Remembers which of `entries` this user may not change.
+    fn note_writable(&self, entries: &[CloudEntry]) {
+        let mut set = self.not_writable.lock().unwrap_or_else(PoisonError::into_inner);
+        for e in entries.iter().filter(|e| !e.is_dir) {
+            if e.writable {
+                set.remove(&e.path);
+            } else {
+                set.insert(e.path.clone());
+            }
+        }
+    }
+
+    /// Forgets everything learnt from the listings of the account that was connected.
+    fn forget_listings(&self) {
+        *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.not_writable.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 
     /// The lock holder the last folder listing showed for `path`: `(name, held by an app)`. The
@@ -192,11 +257,19 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// Sends the outcome of a listing: always an [`Event::CloudListed`]; a rejected sign-in also
     /// an [`Event::CloudError`] that says to reconnect.
     fn answer(&self, path: &str, result: Result<Vec<CloudEntry>, Failure>) {
+        self.answer_with(path, result, false);
+    }
+
+    /// [`Self::answer`], saying whether the entries come from the folder listed last only.
+    fn answer_with(&self, path: &str, result: Result<Vec<CloudEntry>, Failure>, folder_only: bool) {
         match result {
-            Ok(entries) => self.emit(Event::CloudListed { path: path.to_string(), entries: Ok(entries) }),
+            Ok(entries) => {
+                self.note_writable(&entries);
+                self.emit(Event::CloudListed { path: path.to_string(), entries: Ok(entries), folder_only });
+            }
             Err(failure) => {
                 let (message, reconnect) = explain(&failure);
-                self.emit(Event::CloudListed { path: path.to_string(), entries: Err(message.clone()) });
+                self.emit(Event::CloudListed { path: path.to_string(), entries: Err(message.clone()), folder_only });
                 if reconnect {
                     self.emit(Event::CloudError(message));
                 }
@@ -240,6 +313,7 @@ fn entry(e: craft_cloud::Entry) -> CloudEntry {
         // empty name, which the UI words as "Locked".
         locked_by: e.lock.as_ref().map(|l| l.name.clone().or_else(|| l.id.clone()).unwrap_or_default()),
         lock_by_app: e.lock.as_ref().is_some_and(|l| l.app),
+        writable: e.writable,
     }
 }
 

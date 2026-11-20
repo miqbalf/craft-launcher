@@ -294,8 +294,9 @@ fn search_falls_back_to_listed_names_when_the_server_cannot_search() {
     rig.events.lock().unwrap().clear();
     rig.service.search("BETA");
     match rig.events().as_slice() {
-        [Event::CloudListed { path, entries: Ok(found) }] => {
+        [Event::CloudListed { path, entries: Ok(found), folder_only }] => {
             assert_eq!(path, SEARCH_PATH);
+            assert!(folder_only, "the results are said to come from the listed folder only");
             assert_eq!(found.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["beta.pdf"]);
         }
         other => panic!("{other:?}"),
@@ -329,7 +330,7 @@ fn shared_lists_what_others_shared() {
     }));
     rig.service.shared();
     match rig.events().as_slice() {
-        [Event::CloudListed { path, entries: Ok(found) }] => {
+        [Event::CloudListed { path, entries: Ok(found), folder_only: false }] => {
             assert_eq!(path, SHARED_PATH);
             assert_eq!(found.len(), 1);
             assert_eq!((found[0].path.as_str(), found[0].shared), ("/Team plan.docx", true));
@@ -348,7 +349,11 @@ fn cancel_stops_a_waiting_sign_in_quietly() {
     rig.service.cancel_connect();
     waiting.join().unwrap();
     assert!(rig.service.account().is_none());
-    assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudConnected(_) | Event::CloudError(_))), "{:?}", rig.events());
+    assert!(
+        !rig.events().iter().any(|e| matches!(e, Event::CloudConnected(_) | Event::CloudError(_) | Event::CloudConnectFailed(_))),
+        "{:?}",
+        rig.events()
+    );
 }
 
 #[test]
@@ -365,7 +370,7 @@ fn an_insecure_login_address_is_not_opened() {
     let rig = rig(fake);
     rig.service.connect(SERVER);
     assert!(rig.opened.lock().unwrap().is_empty());
-    assert!(matches!(rig.events().as_slice(), [Event::CloudError(_)]), "{:?}", rig.events());
+    assert!(matches!(rig.events().as_slice(), [Event::CloudConnectFailed(_)]), "{:?}", rig.events());
 }
 
 #[test]
@@ -375,7 +380,7 @@ fn a_bad_server_address_is_an_error_before_any_request() {
     let rig = rig(fake);
     rig.service.connect("http://example.com");
     assert!(seen.lock().unwrap().is_empty());
-    assert!(matches!(rig.events().as_slice(), [Event::CloudError(_)]));
+    assert!(matches!(rig.events().as_slice(), [Event::CloudConnectFailed(_)]));
 }
 
 #[test]
@@ -387,12 +392,12 @@ fn a_server_that_is_not_nextcloud_stops_before_the_login_flow() {
         rig.service.connect(SERVER);
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen, [format!("GET {SERVER}/status.php")], "{body}");
-        assert!(matches!(rig.events().as_slice(), [Event::CloudError(m)] if m.contains("Nextcloud")), "{body}: {:?}", rig.events());
+        assert!(matches!(rig.events().as_slice(), [Event::CloudConnectFailed(m)] if m.contains("Nextcloud")), "{body}: {:?}", rig.events());
     }
     let missing = Fake::new(|_| Response::new(404, Vec::new()));
     let rig = rig(missing);
     rig.service.connect(SERVER);
-    assert!(matches!(rig.events().as_slice(), [Event::CloudError(_)]));
+    assert!(matches!(rig.events().as_slice(), [Event::CloudConnectFailed(_)]));
 }
 
 fn suite_account(dir: &std::path::Path, tokens: &Memory) -> (Store<Memory>, String) {
@@ -424,4 +429,27 @@ fn load_ignores_suite_accounts() {
     assert!(rig.service.account().is_none());
     rig.service.list("/");
     assert!(matches!(rig.events().as_slice(), [Event::CloudListed { entries: Err(_), .. }]), "{:?}", rig.events());
+}
+
+#[test]
+fn a_cancelled_sign_in_reports_nothing_when_its_server_check_fails_afterwards() {
+    let (asked_tx, asked) = std::sync::mpsc::channel();
+    let (answer, answer_rx) = std::sync::mpsc::channel::<()>();
+    let (asked_tx, answer_rx) = (Mutex::new(asked_tx), Mutex::new(answer_rx));
+    let fake = Fake::new(move |req| {
+        if req.url.ends_with("/status.php") {
+            asked_tx.lock().unwrap().send(()).unwrap();
+            answer_rx.lock().unwrap().recv().unwrap();
+            return Response::new(500, Vec::new());
+        }
+        friendly().send_ok(req)
+    });
+    let rig = rig(fake);
+    let service = rig.service.clone();
+    let connecting = std::thread::spawn(move || service.connect(SERVER));
+    asked.recv().unwrap();
+    rig.service.cancel_connect();
+    answer.send(()).unwrap();
+    connecting.join().unwrap();
+    assert!(rig.events().is_empty(), "a sign-in the user called off says nothing: {:?}", rig.events());
 }

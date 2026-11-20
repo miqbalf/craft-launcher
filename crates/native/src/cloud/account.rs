@@ -81,48 +81,59 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     pub fn connect(&self, server: &str) {
         let base = match normalize_server(server) {
             Ok(b) => b,
-            Err(message) => return self.emit(Event::CloudError(message)),
+            Err(message) => return self.emit(Event::CloudConnectFailed(message)),
         };
         let mine = self.attempt.fetch_add(1, Ordering::SeqCst) + 1;
         let http = self.http();
         if let Err(message) = check_server(&http, &base) {
-            return self.emit(Event::CloudError(message));
+            return self.connect_failed(mine, message);
         }
         let flow = match LoginFlow::start(&http, &base) {
             Ok(f) => f,
-            Err(e) => return self.emit(Event::CloudError(start_message(&e))),
+            Err(e) => return self.connect_failed(mine, start_message(&e)),
         };
         // The server picks this address: only a secure page (or this computer) is opened.
         let url = flow.login_url().to_string();
         if !(url.starts_with("https://") || crate::http::is_loopback(&url)) {
-            return self.emit(Event::CloudError("That server sent a sign-in address that isn't secure, so it wasn't opened.".to_string()));
+            return self.connect_failed(mine, "That server sent a sign-in address that isn't secure, so it wasn't opened.".to_string());
+        }
+        if self.attempt.load(Ordering::SeqCst) != mine {
+            return;
         }
         self.emit(Event::CloudLoginUrl(url.clone()));
         if let Err(e) = (self.open_url)(&url) {
             log::warn!("couldn't open the sign-in page: {e}");
         }
         let Some(approved) = self.wait_for_approval(&flow, &http, mine) else { return };
+        // Checked and recorded under the book lock, as Disconnect and every file action run: no
+        // file opens for the account being replaced, and a cancel or newer sign-in that came
+        // first wins.
+        let mut book = self.lock_book();
         if self.attempt.load(Ordering::SeqCst) != mine {
             return;
         }
         // Files still open from another account would be watched by nobody (or, worse, as this
         // one): they must be finished first.
-        {
-            let mut book = self.lock_book();
-            let refusal = match self.book(&mut book) {
-                Ok(open) if open.has_other_than(&handle(&base, &approved.login_name)) => {
-                    Some("Finish or close the files open from your other cloud account before connecting a different one.".to_string())
-                }
-                Ok(_) => None,
-                Err(e) => Some(format!("Couldn't read the list of open cloud files ({e}), so the new account wasn't connected.")),
-            };
-            if let Some(message) = refusal {
-                return self.emit(Event::CloudError(message));
+        let refusal = match self.book(&mut book) {
+            Ok(open) if open.has_other_than(&handle(&base, &approved.login_name)) => {
+                Some("Finish or close the files open from your other cloud account before connecting a different one.".to_string())
             }
+            Ok(_) => None,
+            Err(e) => Some(format!("Couldn't read the list of open cloud files ({e}), so the new account wasn't connected.")),
+        };
+        if let Some(message) = refusal {
+            return self.emit(Event::CloudConnectFailed(message));
         }
         match self.record(&base, &approved.login_name, approved.app_password.expose()) {
             Ok(account) => self.emit(Event::CloudConnected(account)),
-            Err(message) => self.emit(Event::CloudError(message)),
+            Err(message) => self.emit(Event::CloudConnectFailed(message)),
+        }
+    }
+
+    /// Ends sign-in `mine` with `message`, unless a cancel or a newer sign-in already ended it.
+    fn connect_failed(&self, mine: u64, message: String) {
+        if self.attempt.load(Ordering::SeqCst) == mine {
+            self.emit(Event::CloudConnectFailed(message));
         }
     }
 
@@ -149,12 +160,12 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                     failures += 1;
                 }
                 Err(e) => {
-                    self.emit(Event::CloudError(start_message(&e)));
+                    self.connect_failed(mine, start_message(&e));
                     return None;
                 }
             }
             if started.elapsed() >= self.give_up_after {
-                self.emit(Event::CloudError("The sign-in wasn't approved in time. Connect again to retry.".to_string()));
+                self.connect_failed(mine, "The sign-in wasn't approved in time. Connect again to retry.".to_string());
                 return None;
             }
         }
@@ -187,7 +198,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let account = CloudAccount { id: handle(base, login), server: base.to_string(), login: login.to_string(), display: login.to_string() };
         let dav = DavAccount::new(base, login, password);
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: account.clone(), dav });
-        *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.forget_listings();
         Ok(account)
     }
 
@@ -200,7 +211,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self.attempt.fetch_add(1, Ordering::SeqCst);
         // Held to the end, so the watcher can't start an upload for the account being removed.
         let mut book = self.lock_book();
-        let Some(record) = self.read_record() else { return self.emit(Event::CloudDisconnected) };
+        // A record gone or unreadable on disk still leaves the account signed in for this session:
+        // it is the one forgotten then.
+        let held = self.session.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|s| s.account.clone());
+        let record = match (self.read_record(), held) {
+            (Some(record), _) => record,
+            (None, Some(a)) => Record { server: a.server, login: a.login, display: a.display },
+            (None, None) => {
+                self.forget_session();
+                return self.emit(Event::CloudDisconnected);
+            }
+        };
         let id = handle(&record.server, &record.login);
         match self.book(&mut book) {
             Ok(open) if open.has_account(&id) => return self.emit(Event::CloudError("Finish or close your open cloud files first.".to_string())),
@@ -223,16 +244,22 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         // Last: while the record exists a failed step can be retried.
         if failed.is_empty()
             && let Err(e) = std::fs::remove_file(self.record_path())
+            && e.kind() != std::io::ErrorKind::NotFound
         {
             failed.push(format!("the account record ({e})"));
         }
-        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.forget_session();
         if failed.is_empty() {
             self.emit(Event::CloudDisconnected);
         } else {
             self.emit(Event::CloudError(format!("Couldn't remove {}.", failed.join(", "))));
         }
+    }
+
+    /// Drops the signed-in account from memory: the watcher and every action see no account.
+    fn forget_session(&self) {
+        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.forget_listings();
     }
 
     fn remove_cache(&self, id: &str) -> Result<(), String> {

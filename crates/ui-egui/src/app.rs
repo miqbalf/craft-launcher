@@ -734,6 +734,7 @@ impl LauncherUi {
             | Event::CloudFileStatus { .. }
             | Event::CloudLockedBy { .. }
             | Event::CloudError(_)
+            | Event::CloudConnectFailed(_)
             | Event::CloudRecentListed(_)) => {
                 self.on_cloud(event);
                 false
@@ -1250,7 +1251,7 @@ mod tests {
         /// No install management, a neutral reveal label and no self-update, so UI paths needing them
         /// stay off.
         fn capabilities(&self) -> Capabilities {
-            Capabilities { manage_apps: false, reveal_label: "Show", self_update: false, desktop_shortcuts: false }
+            Capabilities { manage_apps: false, reveal_label: "Show", self_update: false, desktop_shortcuts: false, open_cloud_files: false }
         }
         /// Reports no platform, so the UI offers no OS-specific package format.
         fn platform(&self) -> Option<Platform> {

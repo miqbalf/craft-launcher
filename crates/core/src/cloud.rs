@@ -8,11 +8,6 @@ pub const SHARED_PATH: &str = "@shared";
 /// The `path` of the `Event::CloudListed` that answers `CloudSearch`.
 pub const SEARCH_PATH: &str = "@search";
 
-/// How the `detail` of the last `Event::CloudFileStatus` of a file starts once it is closed
-/// (`CloudDone` or `CloudForget`): it is no longer open from the cloud nor watched. Anything after
-/// it says what became of a copy left on this computer.
-pub const CLOSED_DETAIL: &str = "Closed";
-
 /// The message of a listing or status refused because the sign-in is no longer valid (HTTP 401):
 /// the UI offers Reconnect beside it.
 pub const SIGN_IN_EXPIRED: &str = "Your cloud sign-in is no longer valid. Reconnect to continue.";
@@ -101,6 +96,13 @@ pub struct CloudEntry {
     /// The lock is held by an editing app on a person's behalf, not by a person.
     #[serde(default)]
     pub lock_by_app: bool,
+    /// The user may change it. A read-only share still lists, but opens read-only.
+    #[serde(default = "yes")]
+    pub writable: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Where an open cloud file stands.

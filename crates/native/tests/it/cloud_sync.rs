@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus};
 use artcraft_launcher_core::protocol::Event;
-use artcraft_launcher_native::cloud::{CLOSED_DETAIL, CloudService};
+use artcraft_launcher_native::cloud::CloudService;
 use artcraft_launcher_native::paths::Paths;
 use craft_nextcloud::http::{Http, Method, Request, Response};
 use craft_suite_account::{Memory, Secret, TokenStore, accounts};
@@ -41,6 +41,12 @@ struct Server {
     login: String,
     /// Runs while an UNLOCK is in flight.
     on_unlock: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Requests of a method answered with a status instead (e.g. every PUT with 403).
+    refuse: Vec<(Method, u16)>,
+    /// Files listed as not writable for this user (`oc:permissions` without `W`).
+    read_only: Vec<String>,
+    /// The lock timeout the server grants (`Timeout: Second-N`); none is sent when unset.
+    grant: Option<u32>,
 }
 
 impl Server {
@@ -116,6 +122,19 @@ impl Dav {
     fn clear_seen(&self) {
         self.0.lock().unwrap().seen.clear();
     }
+
+    /// Answers every `method` request with `status` from now on.
+    fn refuse(&self, method: Method, status: u16) {
+        self.0.lock().unwrap().refuse.push((method, status));
+    }
+
+    fn list_read_only(&self, path: &str) {
+        self.0.lock().unwrap().read_only.push(path.to_string());
+    }
+
+    fn grant_locks_for(&self, secs: u32) {
+        self.0.lock().unwrap().grant = Some(secs);
+    }
 }
 
 fn decode(s: &str) -> String {
@@ -171,8 +190,16 @@ impl Http for Dav {
         let lock_if = req.get_header("if").map(str::to_string);
         let if_match = req.get_header("if-match").map(unquote);
         s.seen.push(Seen { method: req.method, path: path.clone(), if_match: if_match.clone(), lock_if: lock_if.clone() });
+        if let Some((_, status)) = s.refuse.iter().find(|(m, _)| *m == req.method) {
+            return Ok(Response::new(*status, Vec::new()));
+        }
         let held = s.locks.get(&path).cloned();
         let sends_held = |held: &str| lock_if.as_deref().is_some_and(|h| h.contains(held));
+        let grant = s.grant;
+        let granted = |resp: Response| match grant {
+            Some(secs) => resp.header("timeout", format!("Second-{secs}")),
+            None => resp,
+        };
         match req.method {
             Method::Get => match s.files.get(&path) {
                 Some((bytes, tag)) => Ok(Response::new(200, bytes.clone()).header("etag", format!("\"{tag}\""))),
@@ -200,16 +227,17 @@ impl Http for Dav {
             Method::Lock => {
                 if lock_if.is_some() {
                     return Ok(match &held {
-                        Some(h) if sends_held(h) => Response::new(200, Vec::new()).header("lock-token", format!("<{h}>")),
+                        Some(h) if sends_held(h) => granted(Response::new(200, Vec::new()).header("lock-token", format!("<{h}>"))),
                         _ => Response::new(412, Vec::new()),
                     });
                 }
                 if held.is_some() {
                     return Ok(Response::new(423, Vec::new()));
                 }
+                let resp = granted(Response::new(200, Vec::new()));
                 let token = format!("opaquelocktoken:{}", s.tag());
                 s.locks.insert(path, token.clone());
-                Ok(Response::new(200, Vec::new()).header("lock-token", format!("<{token}>")))
+                Ok(resp.header("lock-token", format!("<{token}>")))
             }
             Method::Unlock => {
                 if let Some(hook) = s.on_unlock.clone() {
@@ -237,6 +265,7 @@ impl Http for Dav {
                         (true, None) => "<nc:lock>1</nc:lock>".to_string(),
                         _ => String::new(),
                     };
+                    let lock = if s.read_only.contains(file) { format!("{lock}<oc:permissions>RG</oc:permissions>") } else { lock };
                     xml.push_str(&format!("<d:response><d:href>/remote.php/dav/files/alice{file}</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>9</d:getcontentlength>{lock}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
                 }
                 xml.push_str("</d:multistatus>");
@@ -248,6 +277,18 @@ impl Http for Dav {
 }
 
 type Launched = Arc<Mutex<Vec<(String, PathBuf)>>>;
+/// What the injected app launcher does before it records a launch (`None`: it succeeds).
+type LaunchHook = Arc<Mutex<Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>>>;
+/// What runs just before a file action waits for the open files.
+type PauseHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// The hooks a test can set on the service after building it.
+#[derive(Clone, Default)]
+struct Hooks {
+    launch: LaunchHook,
+    pause: PauseHook,
+    revealed: Arc<Mutex<Vec<PathBuf>>>,
+}
 
 struct Rig {
     root: tempfile::TempDir,
@@ -257,7 +298,14 @@ struct Rig {
     events: Arc<Mutex<Vec<Event>>>,
     launched: Launched,
     clock: Arc<Mutex<Instant>>,
+    hooks: Hooks,
     service: CloudService<Memory, Dav>,
+}
+
+/// The wall clock every rig's conflict and backup names are dated with: fixed, so no test sees
+/// the minute roll over.
+fn wall() -> jiff::Timestamp {
+    jiff::Timestamp::from_second(1_800_000_000).unwrap()
 }
 
 fn build(
@@ -267,14 +315,31 @@ fn build(
     events: &Arc<Mutex<Vec<Event>>>,
     launched: &Launched,
     clock: &Arc<Mutex<Instant>>,
+    hooks: &Hooks,
 ) -> CloudService<Memory, Dav> {
     let (sink, seen, now) = (events.clone(), launched.clone(), clock.clone());
+    let (launch, pause, revealed) = (hooks.launch.clone(), hooks.pause.clone(), hooks.revealed.clone());
     CloudService::new(paths, keychain.clone(), dav.clone(), move |e| sink.lock().unwrap().push(e))
         .with_launcher(move |app: &str, file: &Path| {
+            let hook = launch.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook()?;
+            }
             seen.lock().unwrap().push((app.to_string(), file.to_path_buf()));
             Ok(())
         })
+        .with_pause_before_book(move || {
+            let hook = pause.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        })
+        .with_revealer(move |dir: &Path| {
+            revealed.lock().unwrap().push(dir.to_path_buf());
+            Ok(())
+        })
         .with_clock(move || *now.lock().unwrap())
+        .with_wall_clock(wall)
         .with_opener(|_| Ok(()))
         .with_timing(Duration::ZERO, Duration::from_secs(5))
 }
@@ -290,8 +355,9 @@ fn rig(dav: Dav) -> Rig {
     let events = Arc::default();
     let launched = Arc::default();
     let clock = Arc::new(Mutex::new(Instant::now()));
-    let service = build(&paths, &keychain, &dav, &events, &launched, &clock);
-    Rig { root, paths, keychain, dav, events, launched, clock, service }
+    let hooks = Hooks::default();
+    let service = build(&paths, &keychain, &dav, &events, &launched, &clock, &hooks);
+    Rig { root, paths, keychain, dav, events, launched, clock, hooks, service }
 }
 
 impl Rig {
@@ -341,7 +407,7 @@ impl Rig {
     }
 
     fn rebuild(&mut self) {
-        self.service = build(&self.paths, &self.keychain, &self.dav, &self.events, &self.launched, &self.clock);
+        self.service = build(&self.paths, &self.keychain, &self.dav, &self.events, &self.launched, &self.clock, &self.hooks);
     }
 }
 
@@ -528,14 +594,18 @@ fn keep_both_retargets_to_conflict_copy() {
 fn keep_both_picks_a_free_name() {
     let rig = rig(Dav::with_file(FILE, b"remote v1"));
     let _local = conflicted(&rig);
-    // Take every conflict name the launcher could pick this minute without a number.
-    let stamp = jiff::Zoned::now().strftime("%Y-%m-%d %H%M").to_string();
-    rig.dav.change(&format!("/Docs/report (conflict {stamp} alice).docx"), b"earlier copy");
+    // The name the launcher picks first is taken (the rig's wall clock is fixed, so the minute in
+    // it can't roll over between here and the resolve).
+    let stamp = wall().to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H%M").to_string();
+    let taken = format!("/Docs/report (conflict {stamp} alice).docx");
+    rig.dav.change(&taken, b"earlier copy");
     rig.service.resolve(FILE, ConflictChoice::KeepBoth);
     let created: Vec<_> = rig.dav.puts().into_iter().map(|p| p.path).collect();
     let last = created.last().unwrap();
-    assert_ne!(rig.dav.remote(last).unwrap(), b"earlier copy".to_vec());
+    assert_ne!(last, &taken);
+    assert_eq!(rig.dav.remote(&taken).unwrap(), b"earlier copy", "the earlier copy is untouched");
     assert_eq!(rig.dav.remote(last).unwrap(), b"my version");
+    assert!(last.ends_with(") 2.docx") && last.contains(&stamp), "the next numbered name of the same minute: {last}");
 }
 
 #[test]
@@ -771,7 +841,7 @@ fn done_keeps_a_save_that_lands_during_unlock() {
     assert!(disconnected(&rig), "{:?}", rig.events());
     let kept = kept_with(&rig, b"saved during unlock");
     assert_eq!(kept.len(), 1, "the late save survives disconnecting");
-    assert!(told.is_some_and(|d| d != CLOSED_DETAIL && d.contains(&kept[0].display().to_string())), "the user is told where it is");
+    assert!(told.is_some_and(|d| d.contains(&kept[0].display().to_string())), "the user is told where it is");
 }
 
 #[test]
@@ -783,7 +853,7 @@ fn done_waits_while_the_copy_is_mid_save() {
     std::fs::rename(&local, &tmp).unwrap();
     std::fs::write(&tmp, b"the save being swapped in").unwrap();
     rig.service.done(FILE);
-    assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudFileStatus { detail: Some(d), .. } if d == CLOSED_DETAIL)));
+    assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudFileStatus { closed: true, .. })));
     std::fs::rename(&tmp, &local).unwrap();
     rig.settle();
     assert_eq!(dav.remote(FILE).unwrap(), b"the save being swapped in");
@@ -820,7 +890,7 @@ fn connecting_another_account_is_refused_while_files_are_open() {
     let local = rig.open(FILE);
     dav.sign_in_as("bob");
     rig.service.connect(SERVER);
-    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(m) if m.contains("different one"))), "{:?}", rig.events());
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudConnectFailed(m) if m.contains("different one"))), "{:?}", rig.events());
     assert_eq!(rig.service.account().unwrap().login, "alice");
     rig.save(&local, b"still alice's file");
     rig.settle();
@@ -892,11 +962,8 @@ fn forgetting_a_changed_read_only_copy_keeps_it_and_lets_disconnect_go() {
     let kept = kept_with(&rig, b"local scribbles");
     assert_eq!(kept.len(), 1, "the edits are kept, bytes intact: {:?}", rig.events());
     assert!(!local.exists(), "the copy moved out of the cache");
-    let told = rig.events().iter().rev().find_map(|e| match e {
-        Event::CloudFileStatus { path, detail: Some(d), .. } if path == FILE => Some(d.clone()),
-        _ => None,
-    });
-    assert!(told.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL) && d.contains(&kept[0].display().to_string())), "{told:?}");
+    let told = last_closed(&rig, FILE).and_then(|(_, d)| d);
+    assert!(told.as_deref().is_some_and(|d| d.contains(&kept[0].display().to_string())), "{told:?}");
 
     rig.service.disconnect();
     assert!(disconnected(&rig), "{:?}", rig.events());
@@ -953,9 +1020,17 @@ fn start_without_an_account_announces_nothing() {
 /// The last status of `path`: (status, detail, forgettable).
 fn last_status(rig: &Rig, path: &str) -> Option<(SyncStatus, Option<String>, bool)> {
     rig.events().into_iter().rev().find_map(|e| match e {
-        Event::CloudFileStatus { path: p, status, detail, forgettable } if p == path => Some((status, detail, forgettable)),
+        Event::CloudFileStatus { path: p, status, detail, forgettable, .. } if p == path => Some((status, detail, forgettable)),
         _ => None,
     })
+}
+
+/// The last status of `path` if it closed the file: (status, detail).
+fn last_closed(rig: &Rig, path: &str) -> Option<(SyncStatus, Option<String>)> {
+    rig.events().into_iter().rev().find_map(|e| match e {
+        Event::CloudFileStatus { path: p, status, detail, closed, .. } if p == path => Some(closed.then_some((status, detail))),
+        _ => None,
+    })?
 }
 
 #[test]
@@ -976,8 +1051,8 @@ fn forgetting_a_synced_copy_does_not_warn() {
     let rig = rig(Dav::with_file(FILE, b"remote v1"));
     rig.open(FILE);
     rig.service.forget(FILE);
-    let (_, detail, _) = last_status(&rig, FILE).unwrap();
-    assert!(detail.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL) && !d.contains("not saved")), "{detail:?}");
+    let (_, detail) = last_closed(&rig, FILE).unwrap();
+    assert!(detail.as_deref().is_some_and(|d| !d.contains("not saved")), "{detail:?}");
 }
 
 #[test]
@@ -1006,4 +1081,260 @@ fn only_a_read_only_edit_or_a_missing_copy_is_forgettable() {
     rig3.service.done(FILE);
     assert!(matches!(last_status(&rig3, FILE), Some((SyncStatus::WaitingToUpload, _, false))), "{:?}", rig3.events());
     assert!(rig3.events().iter().all(|e| !matches!(e, Event::CloudFileStatus { forgettable: true, .. })));
+}
+
+/// Whether `checkouts.json` records `path` as open.
+fn recorded(rig: &Rig, path: &str) -> bool {
+    std::fs::read_to_string(rig.paths.cloud_root().join("checkouts.json")).is_ok_and(|r| r.contains(&format!("\"{path}\"")))
+}
+
+#[test]
+fn a_failed_download_after_opening_closes_the_file_again_and_says_why() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.refuse(Method::Get, 500);
+    let rig = rig(dav.clone());
+    rig.service.open(FILE, None, false);
+    assert!(rig.statuses(FILE).contains(&SyncStatus::Opening), "{:?}", rig.events());
+    let (_, why) = last_closed(&rig, FILE).unwrap_or_else(|| panic!("the open is closed again: {:?}", rig.events()));
+    assert!(why.is_some_and(|w| !w.is_empty()), "the reason is given");
+    assert!(dav.held_lock(FILE).is_none(), "the lock is released");
+    assert!(!recorded(&rig, FILE));
+    assert!(rig.launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_app_that_cannot_be_given_the_file_leaves_nothing_open() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    *rig.hooks.launch.lock().unwrap() = Some(Arc::new(|| Err("WordCraft isn't installed.".to_string())));
+    rig.service.open(FILE, None, false);
+    let (_, why) = last_closed(&rig, FILE).unwrap_or_else(|| panic!("the open is closed again: {:?}", rig.events()));
+    assert!(why.is_some_and(|w| w.contains("isn't installed")), "the launcher's reason is given");
+    assert!(dav.held_lock(FILE).is_none(), "the lock is released");
+    assert!(!recorded(&rig, FILE), "no checkout is left");
+    assert!(!cache_file(&rig, "Docs/report.docx").exists(), "the unchanged download is removed");
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "nothing blocks disconnecting: {:?}", rig.events());
+}
+
+#[test]
+fn a_save_the_server_refuses_for_good_stops_uploading_and_can_be_dropped() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.refuse(Method::Put, 403);
+    rig.save(&local, b"edit to a read-only share");
+    rig.settle();
+    assert!(matches!(last_status(&rig, FILE), Some((SyncStatus::ReadOnly, Some(_), true))), "{:?}", rig.events());
+    dav.clear_seen();
+    rig.save(&local, b"edited again");
+    rig.advance(Duration::from_secs(10 * 60));
+    rig.settle();
+    assert!(dav.puts().is_empty(), "no more uploads: {:?}", dav.puts());
+    assert_eq!(std::fs::read(&local).unwrap(), b"edited again");
+    rig.service.forget(FILE);
+    assert_eq!(kept_with(&rig, b"edited again").len(), 1);
+}
+
+#[test]
+fn a_save_whose_place_on_the_server_is_gone_offers_stop_tracking() {
+    for status in [404, 409] {
+        let dav = Dav::with_file(FILE, b"remote v1");
+        let rig = rig(dav.clone());
+        let local = rig.open(FILE);
+        dav.refuse(Method::Put, status);
+        rig.save(&local, b"edit after the folder went");
+        rig.settle();
+        assert!(matches!(last_status(&rig, FILE), Some((SyncStatus::WaitingToUpload, Some(_), true))), "{status}: {:?}", rig.events());
+        assert_eq!(std::fs::read(&local).unwrap(), b"edit after the folder went");
+    }
+}
+
+#[test]
+fn a_conflict_or_a_rejected_sign_in_offers_stop_tracking() {
+    let rig1 = rig(Dav::with_file(FILE, b"remote v1"));
+    conflicted(&rig1);
+    assert!(matches!(last_status(&rig1, FILE), Some((SyncStatus::Conflict, _, true))), "{:?}", rig1.events());
+
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig2 = rig(dav.clone());
+    let local = rig2.open(FILE);
+    dav.set_unauthorized(true);
+    rig2.save(&local, b"edit while signed out");
+    rig2.settle();
+    assert!(matches!(last_status(&rig2, FILE), Some((SyncStatus::ReconnectNeeded, _, true))), "{:?}", rig2.events());
+}
+
+#[test]
+fn a_conflict_choice_the_server_refuses_stays_in_conflict_and_offers_stop_tracking() {
+    for choice in [ConflictChoice::KeepBoth, ConflictChoice::UseMine] {
+        let rig = rig(Dav::with_file(FILE, b"remote v1"));
+        let local = conflicted(&rig);
+        rig.dav.refuse(Method::Put, 409);
+        rig.events.lock().unwrap().clear();
+        rig.service.resolve(FILE, choice);
+        assert!(matches!(last_status(&rig, FILE), Some((SyncStatus::Conflict, Some(_), true))), "{choice:?}: {:?}", rig.events());
+        assert_eq!(std::fs::read(&local).unwrap(), b"my version");
+    }
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = conflicted(&rig);
+    rig.service.resolve(FILE, ConflictChoice::UseTheirs);
+    rig.dav.refuse(Method::Get, 404);
+    rig.service.resolve(FILE, ConflictChoice::TheirsClosed);
+    assert!(matches!(last_status(&rig, FILE), Some((SyncStatus::CloseInAppFirst, Some(_), true))), "{:?}", rig.events());
+    assert_eq!(std::fs::read(&local).unwrap(), b"my version", "nothing replaced");
+}
+
+#[test]
+fn a_file_listed_as_not_writable_opens_read_only() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.list_read_only(FILE);
+    let rig = rig(dav.clone());
+    rig.service.list("/Docs");
+    let local = rig.open(FILE);
+    assert_eq!(rig.status(FILE), Some(SyncStatus::ReadOnly));
+    assert!(dav.held_lock(FILE).is_none(), "nothing to lock for a file that can't be saved");
+    rig.save(&local, b"local scribbles");
+    rig.settle();
+    assert!(dav.puts().is_empty(), "{:?}", dav.puts());
+}
+
+#[test]
+fn an_open_that_waited_while_the_account_was_disconnected_does_nothing() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let (paused_tx, paused) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Arc::new(Mutex::new(go_rx));
+    *rig.hooks.pause.lock().unwrap() = Some(Arc::new(move || {
+        paused_tx.send(()).unwrap();
+        go_rx.lock().unwrap().recv().unwrap();
+    }));
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| rig.service.open(FILE, None, false));
+        paused.recv().unwrap();
+        // The open has checked the account and now waits: the account goes meanwhile.
+        rig.service.disconnect();
+        assert!(disconnected(&rig), "{:?}", rig.events());
+        go.send(()).unwrap();
+        opening.join().unwrap();
+    });
+    assert!(rig.launched.lock().unwrap().is_empty(), "nothing opened for an account that is gone");
+    assert!(dav.held_lock(FILE).is_none());
+    assert!(!recorded(&rig, FILE));
+    assert!(!rig.statuses(FILE).contains(&SyncStatus::Opening));
+}
+
+#[test]
+fn a_sign_in_cancelled_while_it_waits_for_the_open_files_connects_nothing() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let (launching_tx, launching) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Arc::new(Mutex::new(go_rx));
+    // The open holds the open files while it launches the app.
+    *rig.hooks.launch.lock().unwrap() = Some(Arc::new(move || {
+        launching_tx.send(()).unwrap();
+        go_rx.lock().unwrap().recv().unwrap();
+        Ok(())
+    }));
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| rig.service.open(FILE, None, false));
+        launching.recv().unwrap();
+        let connecting = scope.spawn(|| rig.service.connect(SERVER));
+        // Long enough for the sign-in to be approved and to wait for the open files.
+        std::thread::sleep(Duration::from_millis(300));
+        rig.events.lock().unwrap().clear();
+        rig.service.cancel_connect();
+        go.send(()).unwrap();
+        opening.join().unwrap();
+        connecting.join().unwrap();
+    });
+    assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudConnected(_) | Event::CloudConnectFailed(_))), "{:?}", rig.events());
+}
+
+#[test]
+fn a_copy_a_crash_left_mid_done_is_watched_again() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let mut rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    rig.save(&local, b"edit before the crash");
+    let closing = local.with_file_name(".~report.docx.closing1");
+    std::fs::rename(&local, &closing).unwrap();
+    rig.rebuild();
+    rig.service.resume();
+    assert_eq!(std::fs::read(&local).unwrap(), b"edit before the crash", "back under its real name");
+    rig.settle();
+    assert_eq!(dav.remote(FILE).unwrap(), b"edit before the crash");
+}
+
+#[test]
+fn disconnect_keeps_a_crash_leftover_under_its_real_name() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let leftover = cache_file(&rig, "Docs/.~stray.docx.closing1");
+    std::fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+    std::fs::write(&leftover, b"left mid-close").unwrap();
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "{:?}", rig.events());
+    let kept = kept_with(&rig, b"left mid-close");
+    assert_eq!(kept.len(), 1);
+    let name = kept[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("stray") && name.ends_with(".docx"), "{name}");
+}
+
+#[test]
+fn disconnect_with_an_unreadable_account_record_still_signs_out() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    assert!(rig.service.account().is_some());
+    std::fs::write(rig.paths.cloud_root().join("account.json"), b"{ not json").unwrap();
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "{:?}", rig.events());
+    assert!(rig.service.account().is_none(), "the session is gone too");
+    let token = format!("artcraft-launcher-nextcloud:{}", accounts::handle(SERVER, "alice"));
+    assert!(rig.keychain.get(&token).unwrap().is_none(), "and so is its saved sign-in");
+}
+
+#[test]
+fn a_save_changed_back_to_the_cloud_version_reads_as_saved() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_down(true);
+    rig.save(&local, b"a change");
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::WaitingToUpload));
+    rig.save(&local, b"remote v1");
+    dav.set_down(false);
+    dav.clear_seen();
+    rig.advance(Duration::from_secs(10 * 60));
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    assert!(dav.puts().is_empty(), "nothing to upload: {:?}", dav.puts());
+}
+
+#[test]
+fn the_lock_is_refreshed_before_the_granted_timeout_runs_out() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.grant_locks_for(60);
+    let rig = rig(dav.clone());
+    rig.open(FILE);
+    dav.clear_seen();
+    rig.advance(Duration::from_secs(45));
+    rig.service.tick();
+    assert!(dav.seen().iter().any(|s| s.method == Method::Lock && s.lock_if.is_some()), "{:?}", dav.seen());
+}
+
+#[test]
+fn show_kept_files_reveals_the_kept_folder() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    rig.service.reveal_kept();
+    assert!(rig.hooks.revealed.lock().unwrap().is_empty());
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(_))), "no kept files yet is said: {:?}", rig.events());
+    let local = rig.open(FILE);
+    rig.save(&local, b"kept edit");
+    rig.service.forget(FILE);
+    rig.service.reveal_kept();
+    let revealed = rig.hooks.revealed.lock().unwrap().clone();
+    let kept = kept_with(&rig, b"kept edit");
+    assert!(revealed.len() == 1 && kept[0].starts_with(&revealed[0]), "{revealed:?} {kept:?}");
 }

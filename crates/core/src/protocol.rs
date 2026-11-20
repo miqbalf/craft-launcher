@@ -137,6 +137,9 @@ pub enum Command {
     CloudForget {
         path: String,
     },
+    /// Show the folder where copies the launcher kept (backups, copies left when tracking
+    /// stopped) are, in the file manager.
+    CloudRevealKept,
 }
 
 /// Parent folders for new installs. Existing installations keep their recorded location.
@@ -380,6 +383,9 @@ pub enum Event {
     CloudListed {
         path: String,
         entries: Result<Vec<CloudEntry>, String>,
+        /// A search the server couldn't run, answered by filtering the folder listed last: the
+        /// results come from that folder only.
+        folder_only: bool,
     },
     CloudFileStatus {
         path: String,
@@ -390,6 +396,10 @@ pub enum Event {
         /// changes could still reach the cloud (a network failure, a lock), so nothing offers to
         /// stop tracking them.
         forgettable: bool,
+        /// The file is no longer open from the cloud nor watched (`CloudDone`, `CloudForget`, or
+        /// an open that failed after `Opening`). `detail` then says what became of a copy left on
+        /// this computer, or why the open failed.
+        closed: bool,
     },
     CloudLockedBy {
         path: String,
@@ -400,6 +410,9 @@ pub enum Event {
     },
     /// A cloud action failed; a short, user-facing message.
     CloudError(String),
+    /// A sign-in (`CloudConnect`) ended without connecting; a short, user-facing message. Unlike
+    /// [`Event::CloudError`], it means no sign-in is waiting any more.
+    CloudConnectFailed(String),
     /// Files opened through the launcher, newest first, at most 50.
     CloudRecentListed(Vec<CloudEntry>),
 }
@@ -454,6 +467,9 @@ pub struct Capabilities {
     pub self_update: bool,
     /// Offer "Add desktop shortcut" for installed apps (Windows desktop only).
     pub desktop_shortcuts: bool,
+    /// A file from the cloud can be opened in its Craft app on this system. Without it the Cloud
+    /// page still browses, but Open is off and says why.
+    pub open_cloud_files: bool,
 }
 
 /// The UI's view of a backend.

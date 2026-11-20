@@ -314,8 +314,11 @@ impl Backend for WebBackend {
                     self.check();
                 }
             }
-            Command::CloudConnect { .. }
-            | Command::CloudCancelConnect
+            // A sign-in that can't start ends here, so the page stops waiting for it.
+            Command::CloudConnect { .. } => {
+                self.events.borrow_mut().push(Event::CloudConnectFailed("Cloud files need the desktop launcher".to_string()));
+            }
+            Command::CloudCancelConnect
             | Command::CloudDisconnect
             | Command::CloudList { .. }
             | Command::CloudShared
@@ -324,7 +327,8 @@ impl Backend for WebBackend {
             | Command::CloudOpen { .. }
             | Command::CloudDone { .. }
             | Command::CloudResolve { .. }
-            | Command::CloudForget { .. } => self.events.borrow_mut().push(Event::CloudError("Cloud files need the desktop launcher".to_string())),
+            | Command::CloudForget { .. }
+            | Command::CloudRevealKept => self.events.borrow_mut().push(Event::CloudError("Cloud files need the desktop launcher".to_string())),
             _ => {}
         }
     }
@@ -334,7 +338,7 @@ impl Backend for WebBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { manage_apps: false, reveal_label: "", self_update: false, desktop_shortcuts: false }
+        Capabilities { manage_apps: false, reveal_label: "", self_update: false, desktop_shortcuts: false, open_cloud_files: false }
     }
 
     fn platform(&self) -> Option<Platform> {

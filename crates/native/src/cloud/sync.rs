@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use artcraft_launcher_core::cloud::{CLOUD_APPS, CloudEntry, ConflictChoice, SyncStatus, app_for};
+use artcraft_launcher_core::cloud::{CLOUD_APPS, CloudAccount, CloudEntry, ConflictChoice, SyncStatus, app_for};
 use artcraft_launcher_core::protocol::Event;
 use craft_nextcloud::dav::Files;
 use craft_nextcloud::http::Http;
@@ -19,14 +19,14 @@ use craft_nextcloud::{Account as DavAccount, Error as DavError};
 use craft_suite_account::TokenStore;
 
 use super::checkout::{self, Book, Checkout, HeldLock, Recent, Runtime, Synced, rt_key};
-use super::{CLOSED_DETAIL, CloudService, explain_dav};
+use super::{CloudService, explain_dav};
 
 /// How long a changed file must stay unchanged before it is uploaded: apps save in steps.
 const SETTLE: Duration = Duration::from_secs(2);
 /// The first wait after a failed upload, doubled after each further failure up to [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
-/// The lock asked for; it is refreshed at half this.
+/// The lock asked for. It is refreshed at half what the server granted, which may be less.
 const LOCK_SECS: u32 = 30 * 60;
 /// How often the backend's watcher looks at the open files.
 const POLL_EVERY: Duration = Duration::from_secs(1);
@@ -53,9 +53,23 @@ fn parent(path: &str) -> &str {
     trimmed.rfind('/').map_or("/", |i| &trimmed[..=i])
 }
 
-/// The local date and minute, as conflict and backup names carry them.
-fn minute() -> String {
-    jiff::Zoned::now().strftime("%Y-%m-%d %H%M").to_string()
+/// The local date and minute of `at`, as conflict and backup names carry them.
+fn minute(at: jiff::Timestamp) -> String {
+    at.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H%M").to_string()
+}
+
+/// Statuses only the user can settle (a version to choose, a sign-in to renew, an app to close),
+/// where Done can't close the file. Stop tracking keeps the copy and is always offered for them.
+fn needs_the_user(status: SyncStatus) -> bool {
+    matches!(status, SyncStatus::Conflict | SyncStatus::ReconnectNeeded | SyncStatus::CloseInAppFirst)
+}
+
+/// The name a crash left a working copy under while Done was retiring it (`.~name.closingN`),
+/// and the real name it had.
+fn closing_original(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(".~")?;
+    let (original, n) = rest.rsplit_once(".closing")?;
+    (!original.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(original)
 }
 
 /// A login as it may appear inside a file name.
@@ -64,14 +78,37 @@ fn name_safe(login: &str) -> String {
 }
 
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
+    /// A file's status. Statuses only the user can settle offer Stop tracking.
     fn status(&self, path: &str, status: SyncStatus, detail: Option<String>) {
-        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail, forgettable: false });
+        self.send_status(path, status, detail, needs_the_user(status), false);
     }
 
-    /// A status Done can't get past, where stopping tracking ([`Self::forget`]) loses nothing the
-    /// cloud could still get: a read-only copy with changes, or a copy that is missing.
+    /// A status Done can't get past, where stopping tracking ([`Self::forget`]) is the way out:
+    /// a read-only copy with changes, a copy that is missing, a save the server refuses for good.
     fn status_forgettable(&self, path: &str, status: SyncStatus, detail: String) {
-        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail: Some(detail), forgettable: true });
+        self.send_status(path, status, Some(detail), true, false);
+    }
+
+    /// The last status of a file that is no longer open from the cloud. `detail` says what became
+    /// of a copy left on this computer, or why it couldn't be opened.
+    fn closed(&self, path: &str, status: SyncStatus, detail: Option<String>) {
+        self.send_status(path, status, detail, false, true);
+    }
+
+    fn send_status(&self, path: &str, status: SyncStatus, detail: Option<String>, forgettable: bool, closed: bool) {
+        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail, forgettable, closed });
+    }
+
+    /// The open files, for a file action of `account`: `None` (and the user told) when another
+    /// account, or none, is connected by the time they are free.
+    fn book_for(&self, account: &CloudAccount) -> Option<MutexGuard<'_, Option<Book>>> {
+        (self.before_book)();
+        let guard = self.lock_book();
+        if self.account().is_none_or(|a| a.id != account.id) {
+            self.error("Your cloud account changed while that was waiting, so nothing was done.");
+            return None;
+        }
+        Some(guard)
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -110,7 +147,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         Ok(self.paths.cloud_root().join(id))
     }
 
-    fn connected(&self) -> Option<(artcraft_launcher_core::cloud::CloudAccount, DavAccount)> {
+    fn connected(&self) -> Option<(CloudAccount, DavAccount)> {
         let account = self.account()?;
         let dav = self.session_dav()?;
         Some((account, dav))
@@ -128,7 +165,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             path: path.to_string(),
             name: file_name(path).to_string(),
             app: app.to_string(),
-            opened: jiff::Timestamp::now().as_second(),
+            opened: (self.wall)().as_second(),
         };
         if let Err(e) = checkout::remember(&self.paths.cloud_root().join("recent.json"), item) {
             log::warn!("couldn't update the recent cloud files: {e}");
@@ -152,6 +189,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 shared: false,
                 locked_by: None,
                 lock_by_app: false,
+                writable: true,
             })
             .collect();
         self.emit(Event::CloudRecentListed(list));
@@ -159,7 +197,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 
     /// Opens the server file `path` in `app` (or the app its extension picks): locks it when the
     /// server can, downloads it into the cache and launches the app with it. A file already open
-    /// is not downloaded again: its working copy, with any unsynced edit, is opened instead.
+    /// is not downloaded again: its working copy, with any unsynced edit, is opened instead. A file
+    /// the last listing showed as not writable for this user opens read-only.
+    ///
+    /// Once [`SyncStatus::Opening`] is sent, the file always gets a closing status if the open
+    /// fails: nothing is left locked, recorded or half-open.
     pub fn open(&self, path: &str, app: Option<String>, read_only: bool) {
         let Some((account, dav)) = self.connected() else { return self.error("Connect to your cloud first.") };
         let app = match app.as_deref().or_else(|| app_for(file_name(path))) {
@@ -167,7 +209,10 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Some(_) => return self.error("Opening from the cloud isn't supported for this app yet."),
             None => return self.error("No Craft app opens this kind of file yet."),
         };
-        let mut guard = self.lock_book();
+        // Saves to a file the server won't let this user change would only be refused.
+        let not_writable = !read_only && self.listed_read_only(path);
+        let read_only = read_only || not_writable;
+        let Some(mut guard) = self.book_for(&account) else { return };
         let book = match self.book(&mut guard) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
@@ -199,19 +244,18 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             }
         };
         self.status(path, SyncStatus::Opening, None);
-        let unlock = |why: &str| {
+        // Every failure from here on: the lock goes and the file is said to be closed again.
+        let give_up = |why: &str, message: String| {
             if let Some(lock) = &lock
                 && let Err(e) = files.unlock(&http, &lock.to_dav())
             {
                 log::warn!("couldn't release the lock after {why}: {e}");
             }
+            self.closed(path, SyncStatus::ReadOnly, Some(message));
         };
         let (bytes, etag) = match files.get(&http, path, super::transport::MAX_FILE) {
             Ok(got) => got,
-            Err(e) => {
-                unlock("a failed download");
-                return self.error(open_message(&e));
-            }
+            Err(e) => return give_up("a failed download", open_message(&e)),
         };
         // Left from an earlier run, owned by no checkout: kept, never replaced.
         let mut kept = None;
@@ -219,38 +263,62 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             match self.keep(&account.id, path, &local, "earlier copy") {
                 Ok(at) => kept = Some(at),
                 Err(e) => {
-                    unlock("a failed write");
-                    return self.error(format!("Couldn't move an earlier copy of the file out of the way ({e}), so nothing was replaced."));
+                    return give_up(
+                        "a failed write",
+                        format!("Couldn't move an earlier copy of the file out of the way ({e}), so nothing was replaced."),
+                    );
                 }
             }
         }
+        let kept_note = kept.map(|at| format!("An earlier copy found on this computer is kept at {}.", at.display()));
+        let with_kept = |message: String| match &kept_note {
+            Some(note) => format!("{message} {note}"),
+            None => message,
+        };
         if let Err(e) = crate::paths::write_atomic(&local, &bytes) {
-            unlock("a failed write");
-            return self.error(format!("Couldn't save the file on this computer ({e})."));
+            return give_up("a failed write", with_kept(format!("Couldn't save the file on this computer ({e}).")));
         }
         let Some(stamp) = checkout::stamp(&local) else {
-            unlock("a failed write");
-            return self.error("Couldn't save the file on this computer.");
+            return give_up("a failed write", with_kept("Couldn't save the file on this computer.".to_string()));
         };
         let status = if read_only { SyncStatus::ReadOnly } else { SyncStatus::Saved };
-        book.list.push(Checkout {
+        let checkout = Checkout {
             account: account.id.clone(),
             path: path.to_string(),
             remote: path.to_string(),
             local: local.clone(),
             etag,
-            lock,
+            lock: lock.clone(),
             app: app.clone(),
             tracks_remote: !read_only,
             status,
             synced: Some(Synced::of(stamp, &bytes)),
-        });
+        };
+        // Launched before it is recorded (the book is held, so the watcher waits): an app that
+        // can't be given the file leaves nothing locked, recorded or in the cache.
+        if let Err(e) = (self.launcher)(&app, &local) {
+            let mut message = sentence(&e);
+            if !self.retire(&checkout) && std::fs::symlink_metadata(&local).is_ok() {
+                match self.keep(&account.id, path, &local, "not opened") {
+                    Ok(at) => message.push_str(&format!(" A copy of it is kept at {}.", at.display())),
+                    Err(e) => message.push_str(&format!(" A copy of it couldn't be moved aside ({e}); it is at {}.", local.display())),
+                }
+            }
+            return give_up("a failed launch", with_kept(message));
+        }
+        book.list.push(checkout);
         book.runtime.insert(rt_key(&account.id, path), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
         self.save_book(book);
         drop(guard);
         self.remember(&account.id, path, &app);
-        self.status(path, status, kept.map(|at| format!("An earlier copy found on this computer is kept at {}", at.display())));
-        self.launch(&app, &local);
+        let detail = if not_writable {
+            Some(with_kept(
+                "Nextcloud doesn't let you change this file, so it opened read-only. Changes you make aren't saved to the cloud.".to_string(),
+            ))
+        } else {
+            kept_note.clone()
+        };
+        self.status(path, status, detail);
     }
 
     /// Locks `path` when the server offers locking. `Ok(None)`: no lock (the server has none, or
@@ -290,6 +358,20 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
         };
         book.runtime.clear();
+        // A crash while Done was retiring a copy leaves it under its private closing name: it goes
+        // back to its real name, so it is watched (and uploaded) again.
+        for c in &book.list {
+            if std::fs::symlink_metadata(&c.local).is_ok() {
+                continue;
+            }
+            let Some(name) = c.local.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            let leftover = (1..=99).map(|n| c.local.with_file_name(format!(".~{name}.closing{n}"))).find(|p| checkout::stamp(p).is_some());
+            if let Some(leftover) = leftover
+                && let Err(e) = std::fs::rename(&leftover, &c.local)
+            {
+                log::warn!("couldn't put back a cloud working copy left while closing ({e}); it is at {}", leftover.display());
+            }
+        }
         let shown: Vec<(String, SyncStatus)> = book
             .list
             .iter()
@@ -426,9 +508,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
         let synced = Synced::of(before, &bytes);
         if c.synced.as_ref().is_some_and(|s| s.sha256 == synced.sha256) {
-            // Touched but not changed.
-            book.list[i].synced = Some(synced);
+            // Touched but not changed (or changed back): the cloud has this version.
+            let entry = &mut book.list[i];
+            entry.synced = Some(synced);
+            let was = std::mem::replace(&mut entry.status, SyncStatus::Saved);
+            let rt = book.runtime.entry(rt_key(account, key)).or_default();
+            rt.retry_at = None;
+            rt.backoff = Duration::ZERO;
             self.save_book(book);
+            if was != SyncStatus::Saved {
+                self.status(key, SyncStatus::Saved, None);
+            }
             return Upload::Saved;
         }
         self.status(key, SyncStatus::Uploading, None);
@@ -436,6 +526,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let rt = book.runtime.entry(rt_key(account, key)).or_default();
         rt.seen = None;
         let c = &mut book.list[i];
+        let mut forgettable = false;
         let (status, detail, outcome) = match result {
             Ok(etag) => {
                 c.etag = etag;
@@ -457,6 +548,36 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 rt.rejected_under = Some(self.attempt.load(Ordering::SeqCst));
                 (SyncStatus::ReconnectNeeded, Some(explain_dav(&DavError::Unauthorized).0), Upload::Failed)
             }
+            // The server won't let this user change the file (a read-only share opened for
+            // editing): it never will, so uploads stop and the edits stay here.
+            Err(DavError::Status { status: 403, .. }) => {
+                c.tracks_remote = false;
+                rt.retry_at = None;
+                forgettable = true;
+                let local = c.local.display().to_string();
+                log::info!("the server refused a save of a cloud file (403); uploads stop");
+                (
+                    SyncStatus::ReadOnly,
+                    Some(format!("Nextcloud doesn't let you change this file, so your changes weren't saved to the cloud. They're kept at {local}.")),
+                    Upload::Failed,
+                )
+            }
+            // The file or its folder is gone from the server (deleted, moved or renamed): tried
+            // again later in case it comes back, and Stop tracking keeps the edits meanwhile.
+            Err(e @ (DavError::NotFound | DavError::Status { status: 409, .. })) => {
+                rt.backoff = if rt.backoff.is_zero() { FIRST_BACKOFF } else { (rt.backoff * 2).min(MAX_BACKOFF) };
+                rt.retry_at = Some(now + rt.backoff);
+                forgettable = true;
+                log::info!("couldn't upload a cloud file ({e}); its place on the server is gone");
+                (
+                    SyncStatus::WaitingToUpload,
+                    Some(
+                        "This file, or the folder it was in, is no longer in Nextcloud (it may have been moved, renamed or deleted). Your changes are kept here; Stop tracking moves them to the kept folder."
+                            .to_string(),
+                    ),
+                    Upload::Failed,
+                )
+            }
             Err(e) => {
                 rt.backoff = if rt.backoff.is_zero() { FIRST_BACKOFF } else { (rt.backoff * 2).min(MAX_BACKOFF) };
                 rt.retry_at = Some(now + rt.backoff);
@@ -470,7 +591,10 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         };
         c.status = status;
         self.save_book(book);
-        self.status(key, status, detail);
+        match detail {
+            Some(detail) if forgettable => self.status_forgettable(key, status, detail),
+            detail => self.status(key, status, detail),
+        }
         outcome
     }
 
@@ -478,7 +602,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// the working copy once the server has every change. Anything unsaved keeps the file open.
     pub fn done(&self, path: &str) {
         let Some((account, dav)) = self.connected() else { return self.error("Connect to your cloud first.") };
-        let mut guard = self.lock_book();
+        let Some(mut guard) = self.book_for(&account) else { return };
         let book = match self.book(&mut guard) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
@@ -513,7 +637,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 return self.status_forgettable(
                     &key,
                     SyncStatus::ReadOnly,
-                    format!("This file was opened read-only, so your changes weren't saved to the cloud. They're kept at {local}."),
+                    format!("This file is read-only here, so your changes weren't saved to the cloud. They're kept at {local}."),
                 );
             }
             Some(true) => match self.upload(book, &dav, &account.id, &key, self.now()) {
@@ -540,7 +664,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         // next disconnect would delete it: it is kept instead, and the user is told where.
         let detail = if std::fs::symlink_metadata(&c.local).is_ok() {
             match self.keep(&account.id, &key, &c.local, "saved after closing") {
-                Ok(at) => format!("Closed. A save made while it was closing wasn't uploaded; it is kept at {}", at.display()),
+                Ok(at) => Some(format!("A save made while it was closing wasn't uploaded; it is kept at {}", at.display())),
                 Err(e) => {
                     // It can't be moved aside, so it stays open: watched and uploaded like any
                     // other save (If-Match still guards it), and Disconnect still refuses.
@@ -554,9 +678,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 }
             }
         } else {
-            CLOSED_DETAIL.to_string()
+            None
         };
-        self.status(&key, SyncStatus::Saved, Some(detail));
+        // Read-only: nothing went up, so it isn't called saved to the cloud.
+        let last = if c.tracks_remote { SyncStatus::Saved } else { SyncStatus::ReadOnly };
+        self.closed(&key, last, detail);
     }
 
     /// Stops tracking `path` without saving it back: the working copy moves to the kept folder
@@ -564,7 +690,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// the copy went. If the copy can't be kept, nothing changes and the file stays open.
     pub fn forget(&self, path: &str) {
         let Some((account, dav)) = self.connected() else { return self.error("Connect to your cloud first.") };
-        let mut guard = self.lock_book();
+        let Some(mut guard) = self.book_for(&account) else { return };
         let book = match self.book(&mut guard) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
@@ -576,13 +702,13 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         // The copy goes first: if it can't be kept, the checkout (and its lock) stays.
         let mut detail = if std::fs::symlink_metadata(&c.local).is_ok() {
             match self.keep(&account.id, &c.path, &c.local, "kept when you stopped tracking") {
-                Ok(at) => format!("{CLOSED_DETAIL}. You stopped tracking this file; your copy is kept at {}", at.display()),
+                Ok(at) => format!("You stopped tracking this file; your copy is kept at {}", at.display()),
                 Err(e) => {
                     return self.error(format!("Couldn't keep your copy of the file ({e}), so it is still open and nothing was removed."));
                 }
             }
         } else {
-            format!("{CLOSED_DETAIL}. You stopped tracking this file; there was no copy of it on this computer.")
+            "You stopped tracking this file; there was no copy of it on this computer.".to_string()
         };
         if unsaved {
             detail.push_str(if detail.ends_with('.') { " " } else { ". " });
@@ -598,7 +724,19 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             log::warn!("couldn't release a cloud file lock ({e}); it runs out on its own");
         }
         // Read-only: from now on nothing of it is uploaded.
-        self.status(&c.path, SyncStatus::ReadOnly, Some(detail));
+        self.closed(&c.path, SyncStatus::ReadOnly, Some(detail));
+    }
+
+    /// Shows the folder where kept copies are (backups, copies left when tracking stopped) in the
+    /// file manager.
+    pub fn reveal_kept(&self) {
+        let kept = self.paths.cloud_root().join("kept");
+        if !std::fs::symlink_metadata(&kept).is_ok_and(|m| m.is_dir()) {
+            return self.error("No copies have been kept on this computer yet.");
+        }
+        if let Err(e) = (self.reveal)(&kept) {
+            self.error(format!("Couldn't show the kept files ({e})."));
+        }
     }
 
     /// Moves every regular file still in `account`'s cache to the kept folder, so removing the
@@ -613,14 +751,22 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let mut pending = vec![cache.clone()];
         while let Some(dir) = pending.pop() {
             let entries = std::fs::read_dir(&dir).map_err(|e| format!("{} couldn't be read ({e})", dir.display()))?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            // An entry that can't be read could be a file of the user's: the sweep stops, so the
+            // cache isn't removed with it inside.
+            for entry in entries {
+                let path = entry.map_err(|e| format!("{} couldn't be read ({e})", dir.display()))?.path();
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{} couldn't be read ({e})", path.display()))?;
                 if meta.is_dir() {
                     pending.push(path);
                 } else if meta.is_file() {
                     let relative = path.strip_prefix(&cache).map_err(|_| format!("{} is outside the cache", path.display()))?;
-                    let server: String = relative.components().map(|c| format!("/{}", c.as_os_str().to_string_lossy())).collect();
+                    let mut server: String = relative.components().map(|c| format!("/{}", c.as_os_str().to_string_lossy())).collect();
+                    // A copy a crash left under Done's private name is kept under its real one.
+                    if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                        && let Some(original) = closing_original(&name)
+                    {
+                        server = format!("{}{original}", parent(&server));
+                    }
                     self.keep(account, &server, &path, "left in cache").map_err(|e| format!("{} ({e})", path.display()))?;
                 }
             }
@@ -697,7 +843,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// after the UI has asked the user to confirm.
     pub fn resolve(&self, path: &str, choice: ConflictChoice) {
         let Some((account, dav)) = self.connected() else { return self.error("Connect to your cloud first.") };
-        let mut guard = self.lock_book();
+        let Some(mut guard) = self.book_for(&account) else { return };
         let book = match self.book(&mut guard) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
@@ -732,7 +878,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let Some((stamp, bytes)) = read_settled(&c.local) else { return self.error("Couldn't read your version of the file.") };
         let files = Files::new(dav);
         let http = self.http();
-        let label = format!("conflict {} {}", minute(), name_safe(login));
+        let label = format!("conflict {} {}", minute((self.wall)()), name_safe(login));
         let mut made = None;
         for n in 1..=CONFLICT_NAMES {
             let target = format!("{}{}", parent(&c.remote), checkout::labelled(file_name(&c.remote), &label, n));
@@ -742,7 +888,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                     break;
                 }
                 Err(DavError::Conflict) => {}
-                Err(e) => return self.error(format!("Couldn't upload your copy. {}", explain_dav(&e).0)),
+                Err(e) => return self.still_in_conflict(&c, &format!("Couldn't upload your copy. {}", explain_dav(&e).0)),
             }
         }
         let Some((target, etag)) = made else {
@@ -764,6 +910,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         book.runtime.insert(rt_key(&c.account, &key), Runtime::default());
         self.save_book(book);
         self.status(&key, SyncStatus::Saved, Some(format!("Saving to {}", file_name(&target))));
+    }
+
+    /// A conflict choice that didn't go through: the file stays where it was (in conflict, or
+    /// waiting to be closed), says why, and offers Stop tracking, as the server may refuse for good
+    /// (the file deleted or moved there).
+    fn still_in_conflict(&self, c: &Checkout, why: &str) {
+        self.status_forgettable(
+            &c.path,
+            c.status,
+            format!("{} Choose again, or stop tracking it to keep your copy on this computer.", sentence(why)),
+        );
     }
 
     /// Replaces the server's version with the working copy, with no version check.
@@ -790,8 +947,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 self.save_book(book);
                 self.status(&key, SyncStatus::Saved, None);
             }
-            Err(DavError::Locked) => self.error("Someone else has this file locked, so your version couldn't replace theirs yet."),
-            Err(e) => self.error(format!("Couldn't upload your version. {}", explain_dav(&e).0)),
+            Err(DavError::Locked) => self.still_in_conflict(&c, "Someone else has this file locked, so your version couldn't replace theirs yet."),
+            Err(e) => self.still_in_conflict(&c, &format!("Couldn't upload your version. {}", explain_dav(&e).0)),
         }
     }
 
@@ -802,11 +959,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         // Download first: a failure leaves the working copy as it is.
         let (bytes, etag) = match Files::new(dav).get(&self.http(), &c.remote, super::transport::MAX_FILE) {
             Ok(got) => got,
-            Err(e) => return self.error(format!("Couldn't download their version. {}", explain_dav(&e).0)),
+            Err(e) => return self.still_in_conflict(&c, &format!("Couldn't download their version. {}", explain_dav(&e).0)),
         };
         let mut kept = None;
         if std::fs::symlink_metadata(&c.local).is_ok() {
-            match self.keep(&c.account, &c.path, &c.local, &format!("my version {}", minute())) {
+            match self.keep(&c.account, &c.path, &c.local, &format!("my version {}", minute((self.wall)()))) {
                 Ok(at) => kept = Some(at),
                 Err(e) => return self.error(format!("Couldn't keep your version as a backup ({e}), so nothing was replaced.")),
             }
@@ -848,6 +1005,12 @@ fn read_settled(local: &Path) -> Option<(checkout::Stamp, Vec<u8>)> {
     let before = checkout::stamp(local)?;
     let bytes = std::fs::read(local).ok()?;
     (checkout::stamp(local) == Some(before)).then_some((before, bytes))
+}
+
+/// `text` ending in a full stop, so more can follow it.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with(['.', '!', '?']) { text.to_string() } else { format!("{text}.") }
 }
 
 fn open_message(e: &DavError) -> String {
