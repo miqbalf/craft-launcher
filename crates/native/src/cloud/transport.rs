@@ -103,6 +103,48 @@ mod tests {
         assert!(read_limit(&huge) <= MAX_FILE as u64, "never above the file limit");
     }
 
+    /// Answers `n` requests on a loopback port with `207`, recording each request line.
+    fn serve(n: usize) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = tx.send(first.trim().to_string());
+                let _ = write!(stream, "HTTP/1.1 207 Multi-Status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        (base, rx)
+    }
+
+    #[test]
+    fn webdav_methods_reach_the_server() {
+        // The HTTP library refuses methods outside RFC 9110 unless told otherwise; Nextcloud
+        // needs PROPFIND, SEARCH, LOCK and UNLOCK on both the listing and the transfer path.
+        let methods = [Method::Propfind, Method::Search, Method::Report, Method::Mkcol, Method::Lock, Method::Unlock];
+        let (base, seen) = serve(methods.len() * 2);
+        let transport = Transport::new(&crate::http::Http::new().unwrap());
+        for m in methods {
+            for path in ["/ocs/x", "/remote.php/dav/files/a/x.docx"] {
+                let resp = transport.send(Request::new(m, format!("{base}{path}")));
+                assert!(resp.is_ok(), "{m:?} to {path} was refused: {:?}", resp.err().map(|e| e.0));
+                let line = seen.recv().unwrap();
+                assert!(line.starts_with(m.as_str()), "{line} carries {m:?}");
+            }
+        }
+    }
+
     #[test]
     fn reading_stops_just_past_the_limit() {
         // An endless body: reading it all would never finish.
