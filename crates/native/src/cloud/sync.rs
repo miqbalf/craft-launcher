@@ -507,7 +507,19 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         {
             log::warn!("couldn't release a cloud file lock ({e}); it runs out on its own");
         }
-        self.status(&key, SyncStatus::Saved, Some(CLOSED_DETAIL.to_string()));
+        // A save that landed after the copy was retired would sit in the cache untracked, and the
+        // next disconnect would delete it: it is kept instead, and the user is told where.
+        let detail = if std::fs::symlink_metadata(&c.local).is_ok() {
+            match self.keep(&account.id, &key, &c.local, "saved after closing") {
+                Ok(at) => format!("Closed. A save made while it was closing wasn't uploaded; it is kept at {}", at.display()),
+                Err(e) => {
+                    format!("Closed. A save made while it was closing wasn't uploaded and couldn't be kept ({e}); it is at {}", c.local.display())
+                }
+            }
+        } else {
+            CLOSED_DETAIL.to_string()
+        };
+        self.status(&key, SyncStatus::Saved, Some(detail));
     }
 
     /// Removes a fully synced working copy, unless a save lands while it is removed: it is first
@@ -530,11 +542,16 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
         let unchanged = read_settled(&closing).is_some_and(|(stamp, bytes)| stamp == synced.stamp || checkout::digest(&bytes) == synced.sha256);
         if !unchanged {
-            // Put it back, unless the app has already saved a newer one in its place.
-            if std::fs::symlink_metadata(&c.local).is_err()
-                && let Err(e) = std::fs::rename(&closing, &c.local)
-            {
-                log::warn!("couldn't put a cloud working copy back ({e}); it is at {}", closing.display());
+            // Put it back, unless the app has already saved a newer one in its place. Then this
+            // changed version would be in the cache with nothing tracking it: it is kept instead.
+            let back = std::fs::symlink_metadata(&c.local).is_err() && std::fs::rename(&closing, &c.local).is_ok();
+            if !back {
+                match self.keep(&c.account, &c.path, &closing, "changed while closing") {
+                    Ok(at) => self.error(format!("A version saved while the file was closing is kept at {}.", at.display())),
+                    Err(e) => {
+                        self.error(format!("A version saved while the file was closing couldn't be kept ({e}); it is at {}.", closing.display()))
+                    }
+                }
             }
             return false;
         }

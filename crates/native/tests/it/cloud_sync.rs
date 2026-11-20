@@ -694,7 +694,15 @@ fn done_keeps_a_save_that_lands_during_unlock() {
     let late = local.clone();
     dav.during_unlock(move || std::fs::write(&late, b"saved during unlock").unwrap());
     rig.service.done(FILE);
-    assert_eq!(std::fs::read(&local).unwrap(), b"saved during unlock");
+    let told = rig.events().iter().rev().find_map(|e| match e {
+        Event::CloudFileStatus { path, detail: Some(d), .. } if path == FILE => Some(d.clone()),
+        _ => None,
+    });
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "{:?}", rig.events());
+    let kept = kept_with(&rig, b"saved during unlock");
+    assert_eq!(kept.len(), 1, "the late save survives disconnecting");
+    assert!(told.is_some_and(|d| d != CLOSED_DETAIL && d.contains(&kept[0].display().to_string())), "the user is told where it is");
 }
 
 #[test]
