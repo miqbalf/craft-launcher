@@ -166,6 +166,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self.answer(SEARCH_PATH, result);
     }
 
+    /// The lock holder the last folder listing showed for `path`: `(name, held by an app)`. The
+    /// name is empty when the listing didn't say or didn't show the file.
+    fn listed_lock(&self, path: &str) -> (String, bool) {
+        let listed = self.last_listed.lock().unwrap_or_else(PoisonError::into_inner);
+        listed
+            .iter()
+            .flatten()
+            .find(|e| e.path == path)
+            .map_or_else(|| (String::new(), false), |e| (e.locked_by.clone().unwrap_or_default(), e.lock_by_app))
+    }
+
     fn filter_listed(&self, query: &str) -> Vec<CloudEntry> {
         let needle = query.trim().to_lowercase();
         let listed = self.last_listed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -225,8 +236,10 @@ fn entry(e: craft_cloud::Entry) -> CloudEntry {
         modified,
         etag: e.etag.unwrap_or_default(),
         shared: e.shared_by.is_some(),
-        // The listing doesn't say; a lock is found when a file is opened.
-        locked_by: None,
+        // The holder's name, else its account id; a lock the server gives no holder for is an
+        // empty name, which the UI words as "Locked".
+        locked_by: e.lock.as_ref().map(|l| l.name.clone().or_else(|| l.id.clone()).unwrap_or_default()),
+        lock_by_app: e.lock.as_ref().is_some_and(|l| l.app),
     }
 }
 

@@ -292,18 +292,20 @@ impl LauncherUi {
                     self.on_file_status(path, status, detail, forgettable);
                 }
             }
-            Event::CloudLockedBy { path, by } => {
+            Event::CloudLockedBy { path, by, app } => {
                 if !connected {
                     return;
                 }
                 let name = file_name(&path).to_string();
-                let text = if by.is_empty() {
+                let text = if app {
+                    fmt(tl!("{name} is locked by an app in Nextcloud."), &[("name", &name)])
+                } else if by.is_empty() {
                     fmt(tl!("Someone else is editing {name}."), &[("name", &name)])
                 } else {
                     fmt(tl!("{by} is editing {name}."), &[("by", &by), ("name", &name)])
                 };
                 self.announce(text);
-                self.show_cloud_dialog(Dialog::CloudLocked { path, by });
+                self.show_cloud_dialog(Dialog::CloudLocked { path, by, app });
             }
             Event::CloudError(message) => {
                 // A sign-in ends with CloudConnected or an error: either way it no longer waits.
@@ -727,7 +729,13 @@ impl LauncherUi {
             marks.push(tl!("Shared").to_string());
         }
         if let Some(by) = &entry.locked_by {
-            marks.push(if by.is_empty() { tl!("Locked").to_string() } else { fmt(tl!("Locked by {name}"), &[("name", by)]) });
+            marks.push(if entry.lock_by_app {
+                tl!("Locked by an app").to_string()
+            } else if by.is_empty() {
+                tl!("Locked").to_string()
+            } else {
+                fmt(tl!("Locked by {name}"), &[("name", by)])
+            });
         }
         let mut facts: Vec<String> = vec![kind_text.clone()];
         facts.extend([size.clone(), when.clone()].into_iter().filter(|s| !s.is_empty()));
@@ -848,6 +856,7 @@ impl LauncherUi {
                 etag: String::new(),
                 shared: false,
                 locked_by: None,
+                lock_by_app: false,
             };
             let (icon, _) = ui.allocate_exact_size(vec2(24.0, theme::CONTROL_H), Sense::hover());
             let color = app.and_then(|a| self.entry(a)).map_or(t.muted, |e| t.app_ink(e.app));
@@ -1051,10 +1060,12 @@ impl LauncherUi {
     }
 
     /// Someone else holds the file's lock: open it read-only, or not at all.
-    pub(crate) fn cloud_locked_dialog(&mut self, ui: &mut Ui, path: &str, by: &str) -> bool {
+    pub(crate) fn cloud_locked_dialog(&mut self, ui: &mut Ui, path: &str, by: &str, app: bool) -> bool {
         let t = Tokens::get(ui.ctx());
         Self::prompt_width(ui);
-        let title = if by.is_empty() {
+        let title = if app {
+            tl!("This file is locked by an app in Nextcloud").to_string()
+        } else if by.is_empty() {
             tl!("Someone else is editing this file").to_string()
         } else {
             fmt(tl!("{name} is editing this file"), &[("name", by)])

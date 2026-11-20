@@ -47,7 +47,8 @@ fn json(body: &str) -> Response {
 }
 
 fn multistatus(items: &[(&str, bool)]) -> Response {
-    let mut xml = String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">"#);
+    let mut xml =
+        String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">"#);
     xml.push_str(&response("/remote.php/dav/files/alice/", true));
     for (name, dir) in items {
         xml.push_str(&response(&format!("/remote.php/dav/files/alice/{name}"), *dir));
@@ -63,6 +64,21 @@ fn response(href: &str, dir: bool) -> String {
         "<d:resourcetype/><d:getcontentlength>12</d:getcontentlength><d:getlastmodified>Tue, 03 Nov 2026 10:00:00 GMT</d:getlastmodified>"
     };
     format!("<d:response><d:href>{href}</d:href><d:propstat><d:prop>{kind}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")
+}
+
+/// A listing of one file that carries `lock_props` (the `nc:lock*` properties) in its answer.
+fn locked_listing(lock_props: &str) -> Response {
+    let mut xml =
+        String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">"#);
+    xml.push_str(&response("/remote.php/dav/files/alice/", true));
+    xml.push_str(&format!(
+        "<d:response><d:href>/remote.php/dav/files/alice/plan.docx</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>12</d:getcontentlength>{lock_props}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"
+    ));
+    Response::new(207, xml.into_bytes())
+}
+
+fn lock_server(lock_props: &'static str) -> Fake {
+    Fake::new(move |req| if req.method == Method::Propfind { locked_listing(lock_props) } else { friendly().send_ok(req) })
 }
 
 /// A server that completes the Login Flow on the first poll and lists three entries.
@@ -205,6 +221,50 @@ fn list_maps_entries_and_sorts_folders_first() {
     let file = &entries[2];
     assert_eq!((file.path.as_str(), file.size, file.is_dir), ("/zeta.docx", 12, false));
     assert_eq!(file.modified, 1_793_700_000, "Tue, 03 Nov 2026 10:00:00 GMT");
+}
+
+#[test]
+fn a_listed_lock_names_its_holder() {
+    let rig = Rig::connected(lock_server(
+        "<nc:lock>1</nc:lock><nc:lock-owner>bea</nc:lock-owner><nc:lock-owner-displayname>Bea Ortiz</nc:lock-owner-displayname><nc:lock-owner-type>0</nc:lock-owner-type>",
+    ));
+    rig.service.list("/");
+    let entries = listed(&rig.events());
+    assert_eq!(entries[0].locked_by.as_deref(), Some("Bea Ortiz"));
+    assert!(!entries[0].lock_by_app, "a person holds it");
+}
+
+#[test]
+fn a_lock_without_a_display_name_falls_back_to_the_account_id() {
+    let rig = Rig::connected(lock_server("<nc:lock>1</nc:lock><nc:lock-owner>bea</nc:lock-owner><nc:lock-owner-type>0</nc:lock-owner-type>"));
+    rig.service.list("/");
+    assert_eq!(listed(&rig.events())[0].locked_by.as_deref(), Some("bea"));
+}
+
+#[test]
+fn a_lock_with_no_owner_still_reads_as_locked() {
+    let rig = Rig::connected(lock_server("<nc:lock>1</nc:lock>"));
+    rig.service.list("/");
+    let entries = listed(&rig.events());
+    assert!(entries[0].locked_by.is_some(), "locked, holder unknown");
+    assert_eq!(entries[0].locked_by.as_deref().map(str::is_empty), Some(true), "the UI reads an empty name as someone");
+}
+
+#[test]
+fn an_app_lock_is_marked_as_held_by_an_app() {
+    let rig = Rig::connected(lock_server("<nc:lock>1</nc:lock><nc:lock-owner>bea</nc:lock-owner><nc:lock-owner-type>1</nc:lock-owner-type>"));
+    rig.service.list("/");
+    let entries = listed(&rig.events());
+    assert!(entries[0].locked_by.is_some());
+    assert!(entries[0].lock_by_app);
+}
+
+#[test]
+fn a_file_with_no_lock_is_not_marked() {
+    let rig = Rig::connected(lock_server("<nc:lock>0</nc:lock>"));
+    rig.service.list("/");
+    let entries = listed(&rig.events());
+    assert_eq!((entries[0].locked_by.clone(), entries[0].lock_by_app), (None, false));
 }
 
 #[test]

@@ -31,6 +31,8 @@ struct Seen {
 struct Server {
     files: HashMap<String, (Vec<u8>, String)>,
     locks: HashMap<String, String>,
+    /// What a listing says about a lock: `nc:lock-owner-displayname` and `nc:lock-owner-type`.
+    lock_owners: HashMap<String, (String, u8)>,
     next: u64,
     down: bool,
     unauthorized: bool,
@@ -76,6 +78,11 @@ impl Dav {
 
     fn etag(&self, path: &str) -> String {
         self.0.lock().unwrap().files.get(path).map(|(_, e)| e.clone()).unwrap()
+    }
+
+    /// The server lists `path` as locked by the person (`kind` 0) or app (`kind` 1) `name`.
+    fn list_lock_owner(&self, path: &str, name: &str, kind: u8) {
+        self.0.lock().unwrap().lock_owners.insert(path.to_string(), (name.to_string(), kind));
     }
 
     fn held_lock(&self, path: &str) -> Option<String> {
@@ -215,6 +222,25 @@ impl Http for Dav {
                 } else {
                     Ok(Response::new(409, Vec::new()))
                 }
+            }
+            Method::Propfind => {
+                let parent = path.trim_end_matches('/');
+                let mut xml = String::from(
+                    r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">"#,
+                );
+                xml.push_str(&format!("<d:response><d:href>/remote.php/dav/files/alice{path}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                for file in s.files.keys().filter(|f| f.rsplit_once('/').is_some_and(|(dir, _)| dir == parent)) {
+                    let lock = match (s.locks.contains_key(file), s.lock_owners.get(file)) {
+                        (true, Some((name, kind))) => format!(
+                            "<nc:lock>1</nc:lock><nc:lock-owner-displayname>{name}</nc:lock-owner-displayname><nc:lock-owner-type>{kind}</nc:lock-owner-type>"
+                        ),
+                        (true, None) => "<nc:lock>1</nc:lock>".to_string(),
+                        _ => String::new(),
+                    };
+                    xml.push_str(&format!("<d:response><d:href>/remote.php/dav/files/alice{file}</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>9</d:getcontentlength>{lock}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                }
+                xml.push_str("</d:multistatus>");
+                Ok(Response::new(207, xml.into_bytes()))
             }
             _ => Ok(Response::new(405, Vec::new())),
         }
@@ -361,6 +387,48 @@ fn opening_again_keeps_unsynced_edits() {
     assert!(!dav.seen().iter().any(|s| s.method == Method::Get), "{:?}", dav.seen());
 }
 
+/// The last `CloudLockedBy` the service sent for `FILE`.
+fn locked_event(rig: &Rig) -> Option<(String, bool)> {
+    rig.events().into_iter().rev().find_map(|e| match e {
+        Event::CloudLockedBy { path, by, app } if path == FILE => Some((by, app)),
+        _ => None,
+    })
+}
+
+#[test]
+fn open_locked_by_other_names_the_holder_from_the_last_listing() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.lock_by_other(FILE);
+    dav.list_lock_owner(FILE, "Bea Ortiz", 0);
+    let rig = rig(dav);
+    rig.service.list("/Docs");
+    rig.service.open(FILE, None, false);
+    assert_eq!(locked_event(&rig), Some(("Bea Ortiz".to_string(), false)));
+}
+
+#[test]
+fn open_locked_by_an_app_says_so() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.lock_by_other(FILE);
+    dav.list_lock_owner(FILE, "Bea Ortiz", 1);
+    let rig = rig(dav);
+    rig.service.list("/Docs");
+    rig.service.open(FILE, None, false);
+    assert_eq!(locked_event(&rig).map(|(_, app)| app), Some(true));
+}
+
+#[test]
+fn open_locked_by_other_in_another_folder_leaves_the_name_empty() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.change("/Other/x.docx", b"x");
+    dav.lock_by_other(FILE);
+    dav.list_lock_owner(FILE, "Bea Ortiz", 0);
+    let rig = rig(dav);
+    rig.service.list("/Other");
+    rig.service.open(FILE, None, false);
+    assert_eq!(locked_event(&rig), Some((String::new(), false)));
+}
+
 #[test]
 fn open_locked_by_other_offers_read_only() {
     let dav = Dav::with_file(FILE, b"remote v1");
@@ -369,6 +437,7 @@ fn open_locked_by_other_offers_read_only() {
     rig.service.open(FILE, None, false);
     assert!(rig.events().iter().any(|e| matches!(e, Event::CloudLockedBy { path, .. } if path == FILE)), "{:?}", rig.events());
     assert!(rig.launched.lock().unwrap().is_empty(), "nothing opens until the user picks read-only");
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudLockedBy { by, app: false, .. } if by.is_empty())), "no listing cached, so no name");
 
     rig.service.open(FILE, None, true);
     let local = rig.launched.lock().unwrap()[0].1.clone();

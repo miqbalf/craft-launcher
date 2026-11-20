@@ -513,6 +513,9 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Shared	Shared
 	Locked	Locked
 	Locked by {name}	Locked by {name}
+	Locked by an app	Locked by an app
+	{name} is locked by an app in Nextcloud.	{name} is locked by an app in Nextcloud.
+	This file is locked by an app in Nextcloud	This file is locked by an app in Nextcloud
 	Opening from the cloud isn't supported for this app yet.	Opening from the cloud isn't supported for this app yet.
 	{app} isn't installed. Install it to open this file.	{app} isn't installed. Install it to open this file.
 	Install {app}	Install {app}

@@ -151,6 +151,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 etag: String::new(),
                 shared: false,
                 locked_by: None,
+                lock_by_app: false,
             })
             .collect();
         self.emit(Event::CloudRecentListed(list));
@@ -262,9 +263,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
         match files.lock(http, path, LOCK_SECS) {
             Ok(lock) => Ok(Some(HeldLock::from_dav(lock))),
-            // The server doesn't say who; the UI words an empty name as "someone else".
+            // LOCK doesn't say who; the last listing of the folder may have. Without it the name is
+            // empty and the UI words it as "someone else".
             Err(DavError::Locked) => {
-                self.emit(Event::CloudLockedBy { path: path.to_string(), by: String::new() });
+                let (by, app) = self.listed_lock(path);
+                self.emit(Event::CloudLockedBy { path: path.to_string(), by, app });
                 Err(())
             }
             Err(e @ (DavError::Unauthorized | DavError::NotFound | DavError::Transport(_))) => {

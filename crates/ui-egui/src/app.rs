@@ -125,7 +125,7 @@ pub(crate) enum Dialog {
     CloudConflict(String),
     CloudUseMine(String),
     CloudCloseInApp(String),
-    CloudLocked { path: String, by: String },
+    CloudLocked { path: String, by: String, app: bool },
     CloudForget(String),
     CloudDisconnect,
 }

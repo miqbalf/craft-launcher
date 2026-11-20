@@ -4838,6 +4838,7 @@ fn cloud_entry(path: &str, is_dir: bool) -> CloudEntry {
         etag: "e1".into(),
         shared: false,
         locked_by: None,
+        lock_by_app: false,
     }
 }
 
@@ -5047,10 +5048,65 @@ fn keyboard_only_reaches_open() {
     assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudOpen { path: "/report.docx".into(), app: Some("wordcraft".into()), read_only: false }));
 }
 
+fn locked_row_description(entry: CloudEntry) -> Option<String> {
+    let (h, _, _) = connected_with(vec![entry]);
+    h.query_all_by_role_and_label(Role::Button, "plan.docx").next()?.accesskit_node().description()
+}
+
+#[test]
+fn a_locked_row_names_the_holder_in_its_description() {
+    let mut e = cloud_entry("/plan.docx", false);
+    e.locked_by = Some("Bea Ortiz".into());
+    let d = locked_row_description(e).unwrap_or_default();
+    assert!(d.contains("Locked by Bea Ortiz"), "{d}");
+}
+
+#[test]
+fn a_locked_row_without_a_name_says_locked_only() {
+    let mut e = cloud_entry("/plan.docx", false);
+    e.locked_by = Some(String::new());
+    let d = locked_row_description(e).unwrap_or_default();
+    assert!(d.contains("Locked"), "{d}");
+    assert!(!d.contains("Locked by"), "{d}");
+}
+
+#[test]
+fn an_app_lock_row_does_not_name_a_person() {
+    let mut e = cloud_entry("/plan.docx", false);
+    e.locked_by = Some("Bea Ortiz".into());
+    e.lock_by_app = true;
+    let d = locked_row_description(e).unwrap_or_default();
+    assert!(d.contains("Locked by an app"), "{d}");
+    assert!(!d.contains("Bea Ortiz"), "{d}");
+}
+
+#[test]
+fn an_unlocked_row_is_not_described_as_locked() {
+    let d = locked_row_description(cloud_entry("/plan.docx", false)).unwrap_or_default();
+    assert!(!d.contains("Locked"), "{d}");
+}
+
+#[test]
+fn locked_by_an_app_does_not_say_a_person_is_editing() {
+    let (mut h, _, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(Event::CloudLockedBy { path: "/report.docx".into(), by: "Bea Ortiz".into(), app: true });
+    h.run_steps(4);
+    h.get_by_label("This file is locked by an app in Nextcloud");
+    assert!(h.query_by_label_contains("Bea Ortiz is editing").is_none());
+}
+
+#[test]
+fn locked_by_a_named_person_says_who_is_editing() {
+    let (mut h, _, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(Event::CloudLockedBy { path: "/report.docx".into(), by: "Bea Ortiz".into(), app: false });
+    h.run_steps(4);
+    h.get_by_label("Bea Ortiz is editing this file");
+}
+
 #[test]
 fn locked_by_someone_offers_read_only_without_a_name() {
     let (mut h, sent, inbox) = connected_with(top_folder());
-    inbox.borrow_mut().push(Event::CloudLockedBy { path: "/report.docx".into(), by: String::new() });
+    inbox.borrow_mut().push(Event::CloudLockedBy { path: "/report.docx".into(), by: String::new(), app: false });
     h.run_steps(4);
     h.get_by_label("Someone else is editing this file");
     h.get_by_role_and_label(Role::Button, "Open read-only").click();

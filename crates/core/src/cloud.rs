@@ -95,8 +95,12 @@ pub struct CloudEntry {
     pub modified: i64,
     pub etag: String,
     pub shared: bool,
-    /// Who has the file locked, if anyone.
+    /// Who has the file locked: `None` when it isn't. An empty name is a lock whose holder the
+    /// server doesn't give, and the UI words it as "Locked" or "Someone".
     pub locked_by: Option<String>,
+    /// The lock is held by an editing app on a person's behalf, not by a person.
+    #[serde(default)]
+    pub lock_by_app: bool,
 }
 
 /// Where an open cloud file stands.

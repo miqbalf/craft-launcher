@@ -393,7 +393,10 @@ pub enum Event {
     },
     CloudLockedBy {
         path: String,
+        /// The holder's name; empty when the server doesn't say.
         by: String,
+        /// An editing app holds the lock, not a person.
+        app: bool,
     },
     /// A cloud action failed; a short, user-facing message.
     CloudError(String),
