@@ -4,8 +4,8 @@ Status: approved by owner 2026-11-20. Built in fork `miqbalf/craft-launcher`, ai
 
 ## Intent
 
-Give the Craft App Suite a starting screen like the Microsoft 365 home or ONLYOFFICE Desktop's
-"Connect to cloud":
+Give the Craft App Suite a cloud start screen, like the ones office suites offer, with a
+"Connect to cloud" step:
 
 1. Click **Connect to cloud** and choose Nextcloud.
 2. Type the server address. Log in through the browser.
@@ -15,7 +15,8 @@ Give the Craft App Suite a starting screen like the Microsoft 365 home or ONLYOF
 5. Saves go back to Nextcloud automatically, without overwriting anyone else's work.
 
 Why: WordCraft and the other Craft apps are good editors, but they have no cloud storage. The
-owner uses Nextcloud and wants to avoid ONLYOFFICE and Microsoft 365 / OneDrive.
+owner uses Nextcloud and wants to keep documents on their own server, with native apps and no
+web view.
 
 ## Goals
 
@@ -63,14 +64,13 @@ owner uses Nextcloud and wants to avoid ONLYOFFICE and Microsoft 365 / OneDrive.
     "Connect to cloud" and names Nextcloud only as the provider.
 - Build and test on the home servers (pipit or arboy), not on the Mac. Manual macOS app testing is
   done by the owner.
-- Personal fork. Nothing learned from reverse-engineering Microsoft 365 goes into this code.
 
 ## Approaches
 
 | | Approach | Trade-off |
 |---|---|---|
 | **A (chosen)** | Native Nextcloud browser in the launcher; apps open a local working copy that the launcher uploads on save | Works with every Craft app today, no app changes. Apps' own Save As still points at the local cache. |
-| B | Embed Nextcloud's web interface in a webview, like ONLYOFFICE, and intercept file clicks | Looks the most like ONLYOFFICE, but adds a browser engine to a pure-Rust app, and intercepting the web UI is fragile. Still needs A's sync part. |
+| B | Embed Nextcloud's web interface in a webview and intercept file clicks | Looks the most like the web interface, but adds a browser engine to a pure-Rust app, and intercepting the web UI is fragile. Still needs A's sync part. |
 | C | Each app talks to Nextcloud directly through the craft-cloud `CloudBackend` (RFC-0024) | Cleanest long term, but needs an adapter plus wiring in every app before anything works. |
 
 The owner picked **A**. Its login, credential storage, WebDAV listing and conditional upload are the
@@ -82,17 +82,17 @@ parts C needs later, so the work carries over.
 
 - A **Connect to cloud** button on a new **Cloud** page. The first provider is Nextcloud.
 - The user types the server address (for example `https://cloud.example.com`). The launcher
-  normalises it: adds `https://`, drops a pasted `/index.php/...` or `/apps/...` tail, and keeps a sub-path install such as `https://host/nextcloud`. Then it checks `<base>/status.php`.
+  normalises it: adds `https://`, drops a pasted `/index.php/...` or `/apps/...` tail, and keeps a sub-path install such as `https://host/nextcloud`. Then it checks `<base>/status.php` (as built: this check runs before Login Flow starts).
 - The launcher starts Nextcloud Login Flow v2 (`POST /index.php/login/v2`). It opens the returned
   login URL in the system browser and polls the returned endpoint until the user approves.
   The result is the server, the login name and an **app password** that the user can revoke in
   Nextcloud.
-- The app password goes into the OS credential store: macOS Keychain, Windows Credential Manager,
+- (Changed, see As built: account storage.) The app password goes into the OS credential store: macOS Keychain, Windows Credential Manager,
   Secret Service on Linux. Launcher settings keep only the server URL, login name and display name.
 - When storytold/craft-launcher#366 ("Make the launcher the suite's keychain") lands, credential
   storage moves behind it. Until then, use a small `CredentialStore` trait so it can be swapped.
 - **Disconnect** deletes the stored app password and the local cache, after warning about unsynced
-  files.
+  files. (Changed, see As built: Disconnect refuses while files are open and keeps backups.)
 
 ### 2. Browsing
 
@@ -104,7 +104,7 @@ parts C needs later, so the work carries over.
 - Sections: **Files** (folder tree with breadcrumbs), **Shared with me**, **Recent**. Recent comes
   from the launcher's own record of files opened through it.
 - Search by name uses WebDAV `SEARCH`. If the server refuses it, fall back to filtering the current
-  folder.
+  folder. (Changed, see As built: the fallback only applies to non-auth errors.)
 - Files with no matching installed Craft app are shown but cannot be opened. A hint offers to
   install the right app when one exists in the catalog.
 
@@ -136,7 +136,7 @@ Sketch:
   reads them from each app's packaging (macOS `Info.plist` document types or the Linux desktop
   entry) and keeps the table in sync.
 - If an extension maps to several apps, the first one in the table wins. A right-click
-  **Open with** menu lists the others.
+  **Open with** menu lists the others. (Not built, see As built.)
 
 ### 4. Opening (check-out)
 
@@ -146,7 +146,7 @@ On a click:
    the OCS capabilities). If someone else holds the lock, offer **Open read-only** (no uploads) or
    **Cancel**.
 2. **Download** it into the cache: `<launcher data>/cloud/<account>/<server path>`, keeping the real
-   file name so the app's title bar and Recent list read correctly. Record the ETag and file id.
+   file name so the app's title bar and Recent list read correctly. Record the ETag and file id. (File id not built, see As built.)
 3. **Launch** the app with the file through the existing `install::launch`. On macOS use
    `open -a <App> <file>`, so an app that is already running gets an "open document" event. All
    four office apps already handle that event (`apps/*/src/apple_events.rs`).
@@ -163,7 +163,7 @@ local edits are never thrown away.
   `PUT … If-Match: <last ETag>`, sending the lock token when one is held. On success, store the new
   ETag from the PUT response.
 - **412 Precondition Failed** (someone changed the file in Nextcloud):
-  - Stop uploading that file. Mark it **Conflict** in the panel and send a desktop notification.
+  - Stop uploading that file. Mark it **Conflict** in the panel and send a desktop notification. (Notification not built, see As built.)
   - Offer: **Keep both** (upload mine as `name (conflict <date> <user>).docx`, the default), **Use
     mine** (overwrite after explicit confirmation), **Use theirs** (download theirs, keep mine as
     a local backup file).
@@ -174,9 +174,10 @@ local edits are never thrown away.
 ### 6. Closing (check-in)
 
 - The launcher cannot tell when an app closes one document. So the panel has a **Done** button per
-  file: final upload, unlock, then remove the local copy if it is fully synced.
+  file: final upload, unlock, then remove the local copy if it is fully synced. (Changed, see As
+  built: Done order.)
 - When the launcher quits with files still open, it uploads what it can and keeps their locks and
-  working copies. It shows them again on the next start.
+  working copies. (Not built, see As built: no quit-time flush.) It shows them again on the next start.
 - Locks are refreshed while a file is checked out, so a long editing session does not lose its
   lock. The refresh interval and lock timeout are the builder's call.
 
@@ -242,8 +243,8 @@ the whole flow works. Each step is then cut into its own PR from that branch.
 ## Decided by the owner
 
 - Desktop launcher, native browsing, approach A.
-- Nextcloud first, connected the same way ONLYOFFICE Desktop does it ("Connect to cloud", server
-  address, browser login).
+- Nextcloud first, connected the way another desktop office app's connect-to-cloud flow works ("Connect to
+  cloud", server address, browser login).
 - Clicking a file opens the right Craft app window. These are separate programs, so there are no
   shared tabs.
 
@@ -284,3 +285,85 @@ the whole flow works. Each step is then cut into its own PR from that branch.
 - Icons, exact UI layout and copy, within the sketch above and the house accessibility rules.
 - Test strategy. Expected: unit tests in `core` for URL normalisation, extension mapping and
   multistatus parsing, plus a fake WebDAV server in `native` tests for lock, PUT/If-Match and 412.
+
+## As built (2026-11-20)
+
+This section records where the build differs from the design above. Where the two disagree, this
+section wins.
+
+### Account storage
+- The app password is stored in the OS keychain through craft-suite-account's `TokenStore`, under
+  the handle `artcraft-launcher-nextcloud:<handle>`.
+- A non-secret record (server, login name, display name) is kept in `cloud/account.json`.
+- The account is not stored in the suite account list. That list holds Craft deployment accounts.
+  Putting a Nextcloud account there could be mistaken for one, and Disconnect would sign the user
+  out of the suite. The launcher never calls the suite's sign-in, active-account, discard or forget
+  functions.
+- If this is moved into the suite list later, it needs a one-time record migration.
+
+### Connecting
+- The `status.php` check runs before Login Flow v2 starts. A server that fails it gets a clear
+  "doesn't look like a Nextcloud server" error and no browser opens.
+- Connecting a different account is refused while files are open, so no open file is orphaned.
+- At start, the backend emits `CloudConnected` for an existing account, before it resumes file
+  statuses. The UI otherwise cannot learn about an existing connection.
+- A 401 shows a **Reconnect** button in the account bar and on the listing error.
+
+### Browsing
+- Search falls back to filtering the current folder only on a non-auth error. A 401 is shown as an
+  error. The page does not yet say that results came from the folder only.
+- **Shared with me** uses the OCS shares API (`shared_with_me=true`). Search (WebDAV `SEARCH`) and
+  shared-with-me were both added to craft-nextcloud, in the craft-libs fork, because it had neither
+  (rule 9).
+- The lock holder is shown in the listing. A lock held by an app is worded separately from one held
+  by a person. A 423 on open names the holder from the last folder listing.
+- Files that are not W-writable still open as editable. Saves then fail with 403.
+
+### Local backups
+- All local backups go under `cloud/kept/<account>/…`, with a label in the file name:
+  "my version", "saved after closing", "left in cache", "kept when you stopped tracking".
+- Disconnect never deletes `kept/`.
+
+### Disconnect
+- Disconnect refuses while files are open. It does not warn and carry on.
+- Before it removes anything, it sweeps leftover cache files into `kept/` (label "left in
+  cache"). If a file cannot be kept, Disconnect refuses.
+- Only then are the app password, the cache and `account.json` removed.
+
+### Done (check-in)
+- Done renames the working copy to a private name, verifies it is unchanged and uploaded, and
+  deletes it. Only then does it send UNLOCK.
+- A save that lands during Done is kept (label "saved after closing"). If it cannot be moved
+  aside, the file goes back on the open list as Waiting to upload, and the save is uploaded.
+- A missing working copy no longer counts as clean. Done waits instead.
+
+### Case-twin guard
+- Two server paths that differ only by case (or that point at the same file on disk) cannot take
+  over each other's working copy. The second open is refused. The compare uses lower-casing, not
+  Unicode normalisation, so names that differ only in NFC/NFD form on APFS are not caught.
+
+### Stop tracking
+- A new command, `CloudForget { path }`, shown as **Stop tracking (keep a local copy)**. It moves
+  the working copy to `kept/`, unlocks, drops the check-out, and names the kept path. It never
+  deletes data.
+- `Event::CloudFileStatus` gained a `forgettable` flag. It is true only for read-only copies with
+  local changes and for waits where the copy is missing. The UI offers the action only then,
+  behind a confirmation. If the changes are not in Nextcloud, the text says so.
+- Its reason: without it, a read-only copy with edits, or a deleted copy, would block Done and
+  Disconnect for good.
+
+### Not built yet
+- File id and rename-following. Check-outs are tracked by path only.
+- **Open with** for files that map to several apps.
+- Desktop notification on conflict. Only the status event is sent.
+- Quit-time flush. Open files are resumed on the next start instead.
+- A label for search results that came from the folder fallback.
+
+### Not tested
+- The macOS app launch code (`install::open_file`, `process::open_with`) has not been compiled or
+  run. It is the owner's Task 8 step, on a Mac.
+
+### Fork-only dependency
+- The launcher pins craft-libs at the fork-only rev `63ac40b`. It carries the craft-nextcloud
+  adapter, search, shared-with-me and the lock holder. This deviates from rule 10 (move the rev in
+  its own PR). It must be upstreamed and the rev moved before any upstream PR.
