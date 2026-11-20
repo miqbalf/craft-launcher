@@ -18,7 +18,7 @@ use craft_nextcloud::http::Http;
 use craft_nextcloud::{Account as DavAccount, Error as DavError};
 use craft_suite_account::TokenStore;
 
-use super::checkout::{self, Book, Checkout, HeldLock, Recent, Runtime, Synced};
+use super::checkout::{self, Book, Checkout, HeldLock, Recent, Runtime, Synced, rt_key};
 use super::{CLOSED_DETAIL, CloudService, explain_dav};
 
 /// How long a changed file must stay unchanged before it is uploaded: apps save in steps.
@@ -176,6 +176,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Ok(l) => l,
             Err(e) => return self.error(e),
         };
+        // Another open file whose name differs only in letter case would share this file on a
+        // case-insensitive disk: refuse rather than move or overwrite its working copy.
+        if book.owns_slot(&local) {
+            return self.error("Another file with nearly the same name is open from the cloud. Choose Done on it first, then open this one.");
+        }
         let http = self.http();
         let files = Files::new(&dav);
         let lock = if read_only {
@@ -201,7 +206,18 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 return self.error(open_message(&e));
             }
         };
-        if let Err(e) = place(&local, &bytes) {
+        // Left from an earlier run, owned by no checkout: kept, never replaced.
+        let mut kept = None;
+        if std::fs::symlink_metadata(&local).is_ok() {
+            match self.keep(&account.id, path, &local, "earlier copy") {
+                Ok(at) => kept = Some(at),
+                Err(e) => {
+                    unlock("a failed write");
+                    return self.error(format!("Couldn't move an earlier copy of the file out of the way ({e}), so nothing was replaced."));
+                }
+            }
+        }
+        if let Err(e) = crate::paths::write_atomic(&local, &bytes) {
             unlock("a failed write");
             return self.error(format!("Couldn't save the file on this computer ({e})."));
         }
@@ -222,11 +238,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             status,
             synced: Some(Synced::of(stamp, &bytes)),
         });
-        book.runtime.insert(path.to_string(), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
+        book.runtime.insert(rt_key(&account.id, path), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
         self.save_book(book);
         drop(guard);
         self.remember(&account.id, path, &app);
-        self.status(path, status, None);
+        self.status(path, status, kept.map(|at| format!("An earlier copy found on this computer is kept at {}", at.display())));
         self.launch(&app, &local);
     }
 
@@ -297,17 +313,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let keys: Vec<String> = book.list.iter().filter(|c| c.account == account.id).map(|c| c.path.clone()).collect();
         let now = self.now();
         for key in keys {
-            self.refresh_lock(book, &dav, &key, now);
-            self.watch(book, &dav, &key, now);
+            self.refresh_lock(book, &dav, &account.id, &key, now);
+            self.watch(book, &dav, &account.id, &key, now);
         }
     }
 
     /// Refreshes the file's lock at half its timeout. A lock the server no longer knows is taken
     /// again; if someone else has it now, saves still carry `If-Match`.
-    fn refresh_lock(&self, book: &mut Book, dav: &DavAccount, key: &str, now: Instant) {
-        let Some(i) = book.list.iter().position(|c| c.path == key) else { return };
+    fn refresh_lock(&self, book: &mut Book, dav: &DavAccount, account: &str, key: &str, now: Instant) {
+        let Some(i) = book.index(account, key) else { return };
         let Some(lock) = book.list[i].lock.clone() else { return };
-        let rt = book.runtime.entry(key.to_string()).or_default();
+        let rt = book.runtime.entry(rt_key(account, key)).or_default();
         let half = Duration::from_secs(u64::from(lock.timeout_secs / 2));
         if rt.lock_checked.is_some_and(|t| now.saturating_duration_since(t) < half) {
             return;
@@ -334,14 +350,14 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     }
 
     /// Uploads the working copy once a change has settled for [`SETTLE`].
-    fn watch(&self, book: &mut Book, dav: &DavAccount, key: &str, now: Instant) {
-        let Some(i) = book.list.iter().position(|c| c.path == key) else { return };
+    fn watch(&self, book: &mut Book, dav: &DavAccount, account: &str, key: &str, now: Instant) {
+        let Some(i) = book.index(account, key) else { return };
         let c = &book.list[i];
         if !c.tracks_remote {
             return;
         }
         let attempt = self.attempt.load(Ordering::SeqCst);
-        let rt = book.runtime.entry(key.to_string()).or_default();
+        let rt = book.runtime.entry(rt_key(account, key)).or_default();
         if c.status == SyncStatus::ReconnectNeeded && rt.rejected_under == Some(attempt) {
             return;
         }
@@ -365,14 +381,14 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 return;
             }
         }
-        self.upload(book, dav, key, now);
+        self.upload(book, dav, account, key, now);
     }
 
     /// Uploads the working copy over the version it started from. A newer version on the server
     /// gives [`SyncStatus::Conflict`] and stops uploads of this file; a failure leaves the
     /// working copy alone and retries later.
-    fn upload(&self, book: &mut Book, dav: &DavAccount, key: &str, now: Instant) -> Upload {
-        let Some(i) = book.list.iter().position(|c| c.path == key) else { return Upload::Failed };
+    fn upload(&self, book: &mut Book, dav: &DavAccount, account: &str, key: &str, now: Instant) -> Upload {
+        let Some(i) = book.index(account, key) else { return Upload::Failed };
         let c = book.list[i].clone();
         let Some(before) = checkout::stamp(&c.local) else { return Upload::Busy };
         let bytes = match std::fs::read(&c.local) {
@@ -383,7 +399,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             }
         };
         if checkout::stamp(&c.local) != Some(before) {
-            book.runtime.entry(key.to_string()).or_default().seen = None;
+            book.runtime.entry(rt_key(account, key)).or_default().seen = None;
             return Upload::Busy;
         }
         let synced = Synced::of(before, &bytes);
@@ -395,7 +411,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
         self.status(key, SyncStatus::Uploading, None);
         let result = put_checked(&Files::new(dav), &self.http(), &c, bytes);
-        let rt = book.runtime.entry(key.to_string()).or_default();
+        let rt = book.runtime.entry(rt_key(account, key)).or_default();
         rt.seen = None;
         let c = &mut book.list[i];
         let (status, detail, outcome) = match result {
@@ -456,8 +472,14 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             }
             _ => {}
         }
-        if self.changed(book, i) {
-            if !book.list[i].tracks_remote {
+        let busy = |this: &Self| {
+            this.status(&key, SyncStatus::WaitingToUpload, Some("The file is being saved right now. Choose Done again in a moment.".to_string()));
+        };
+        match self.changed(book, i) {
+            // Missing: an app may be swapping in a save right now.
+            None => return busy(self),
+            Some(false) => {}
+            Some(true) if !book.list[i].tracks_remote => {
                 let local = book.list[i].local.display().to_string();
                 return self.status(
                     &key,
@@ -465,51 +487,87 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                     Some(format!("This file was opened read-only, so your changes weren't saved to the cloud. They're kept at {local}.")),
                 );
             }
-            match self.upload(book, &dav, &key, self.now()) {
-                Upload::Saved if !self.changed(book, i) => {}
+            Some(true) => match self.upload(book, &dav, &account.id, &key, self.now()) {
+                Upload::Saved if self.changed(book, i) == Some(false) => {}
                 // Its status says why.
                 Upload::Failed => return,
-                _ => {
-                    return self.status(
-                        &key,
-                        SyncStatus::WaitingToUpload,
-                        Some("The file changed while it was being saved. Choose Done again.".to_string()),
-                    );
-                }
-            }
+                _ => return busy(self),
+            },
         }
-        let c = book.list.remove(i);
-        book.runtime.remove(&key);
+        // The copy goes before the lock and the record: a save that lands now is never deleted.
+        let c = book.list[i].clone();
+        if !self.retire(&c) {
+            return busy(self);
+        }
+        book.list.remove(i);
+        book.runtime.remove(&rt_key(&account.id, &key));
+        self.save_book(book);
         if let Some(lock) = &c.lock
             && let Err(e) = Files::new(&dav).unlock(&self.http(), &lock.to_dav())
         {
             log::warn!("couldn't release a cloud file lock ({e}); it runs out on its own");
         }
-        if let Ok(cache) = self.cache_dir(&account.id)
-            && c.local.starts_with(&cache)
-            && let Err(e) = std::fs::remove_file(&c.local)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!("couldn't remove a synced cloud working copy ({e})");
-        }
-        self.save_book(book);
         self.status(&key, SyncStatus::Saved, Some(CLOSED_DETAIL.to_string()));
     }
 
-    /// Whether the working copy differs from the version last in step with the server. A missing
-    /// working copy has nothing to send.
-    fn changed(&self, book: &mut Book, i: usize) -> bool {
-        let c = &book.list[i];
-        let Some(stamp) = checkout::stamp(&c.local) else { return false };
-        if c.synced.as_ref().is_some_and(|s| s.stamp == stamp) {
+    /// Removes a fully synced working copy, unless a save lands while it is removed: it is first
+    /// renamed to a private name, checked against the synced version, and only then deleted.
+    /// `false`: the copy changed (or is mid-save) and stays.
+    fn retire(&self, c: &Checkout) -> bool {
+        let inside = self.cache_dir(&c.account).is_ok_and(|cache| c.local.starts_with(cache));
+        let Some(synced) = c.synced.as_ref() else { return false };
+        if !inside {
+            // Not ours to delete; only the record goes.
+            return true;
+        }
+        let name = c.local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some(closing) = (1..=99).map(|n| c.local.with_file_name(format!(".~{name}.closing{n}"))).find(|p| std::fs::symlink_metadata(p).is_err())
+        else {
+            return false;
+        };
+        if std::fs::rename(&c.local, &closing).is_err() {
             return false;
         }
-        let Ok(bytes) = std::fs::read(&c.local) else { return true };
+        let unchanged = read_settled(&closing).is_some_and(|(stamp, bytes)| stamp == synced.stamp || checkout::digest(&bytes) == synced.sha256);
+        if !unchanged {
+            // Put it back, unless the app has already saved a newer one in its place.
+            if std::fs::symlink_metadata(&c.local).is_err()
+                && let Err(e) = std::fs::rename(&closing, &c.local)
+            {
+                log::warn!("couldn't put a cloud working copy back ({e}); it is at {}", closing.display());
+            }
+            return false;
+        }
+        if let Err(e) = std::fs::remove_file(&closing) {
+            log::warn!("couldn't remove a synced cloud working copy ({e})");
+        }
+        // A save that landed after the rename is a new file: it stays, and so does the checkout.
+        std::fs::symlink_metadata(&c.local).is_err()
+    }
+
+    /// Moves `local` (a file of `account`'s `path`) to where kept copies live, outside the
+    /// account's cache. Returns where it went.
+    fn keep(&self, account: &str, path: &str, local: &Path, label: &str) -> Result<PathBuf, String> {
+        let root = self.cache_dir(account).map(|_| self.paths.cloud_root().join("kept").join(account))?;
+        let at = checkout::kept_place(&root, path, label)?;
+        std::fs::rename(local, &at).map_err(|e| e.to_string())?;
+        Ok(at)
+    }
+
+    /// Whether the working copy differs from the version last in step with the server. `None`:
+    /// it is missing, as it is for a moment while an app swaps in a save.
+    fn changed(&self, book: &mut Book, i: usize) -> Option<bool> {
+        let c = &book.list[i];
+        let stamp = checkout::stamp(&c.local)?;
+        if c.synced.as_ref().is_some_and(|s| s.stamp == stamp) {
+            return Some(false);
+        }
+        let Ok(bytes) = std::fs::read(&c.local) else { return Some(true) };
         let same = c.synced.as_ref().is_some_and(|s| s.sha256 == checkout::digest(&bytes));
         if same {
             book.list[i].synced = Some(Synced::of(stamp, &bytes));
         }
-        !same
+        Some(!same)
     }
 
     /// Settles a conflict on `path` (see the spec's "After a conflict"). `UseMine` is sent only
@@ -580,7 +638,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         entry.tracks_remote = true;
         entry.status = SyncStatus::Saved;
         let key = entry.path.clone();
-        book.runtime.insert(key.clone(), Runtime::default());
+        book.runtime.insert(rt_key(&c.account, &key), Runtime::default());
         self.save_book(book);
         self.status(&key, SyncStatus::Saved, Some(format!("Saving to {}", file_name(&target))));
     }
@@ -605,7 +663,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 entry.tracks_remote = true;
                 entry.status = SyncStatus::Saved;
                 let key = entry.path.clone();
-                book.runtime.insert(key.clone(), Runtime::default());
+                book.runtime.insert(rt_key(&c.account, &key), Runtime::default());
                 self.save_book(book);
                 self.status(&key, SyncStatus::Saved, None);
             }
@@ -625,15 +683,12 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         };
         let mut kept = None;
         if std::fs::symlink_metadata(&c.local).is_ok() {
-            let Some(backup) = checkout::free_sibling(&c.local, &format!("my version {}", minute())) else {
-                return self.error("Couldn't find a free name to keep your version under.");
-            };
-            if let Err(e) = std::fs::rename(&c.local, &backup) {
-                return self.error(format!("Couldn't keep your version as a backup ({e}), so nothing was replaced."));
+            match self.keep(&c.account, &c.path, &c.local, &format!("my version {}", minute())) {
+                Ok(at) => kept = Some(at),
+                Err(e) => return self.error(format!("Couldn't keep your version as a backup ({e}), so nothing was replaced.")),
             }
-            kept = Some(backup);
         }
-        if let Err(e) = place(&c.local, &bytes) {
+        if let Err(e) = crate::paths::write_atomic(&c.local, &bytes) {
             return self.error(format!("Couldn't save their version on this computer ({e}). Your version is kept as a backup."));
         }
         let Some(stamp) = checkout::stamp(&c.local) else { return self.error("Couldn't save their version on this computer.") };
@@ -643,7 +698,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         entry.tracks_remote = true;
         entry.status = SyncStatus::Saved;
         let (key, app, local) = (entry.path.clone(), entry.app.clone(), entry.local.clone());
-        book.runtime.insert(key.clone(), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
+        book.runtime.insert(rt_key(&c.account, &key), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
         self.save_book(book);
         let detail = kept.map(|b| format!("Your version is kept at {}", b.display()));
         self.status(&key, SyncStatus::Saved, detail);
@@ -670,17 +725,6 @@ fn read_settled(local: &Path) -> Option<(checkout::Stamp, Vec<u8>)> {
     let before = checkout::stamp(local)?;
     let bytes = std::fs::read(local).ok()?;
     (checkout::stamp(local) == Some(before)).then_some((before, bytes))
-}
-
-/// Writes a freshly downloaded file at `local`. Something already there that no checkout owns
-/// (left from an earlier run) is moved aside, never replaced.
-fn place(local: &Path, bytes: &[u8]) -> Result<(), String> {
-    if std::fs::symlink_metadata(local).is_ok() {
-        let aside = checkout::free_sibling(local, "earlier copy").ok_or("no free name to move an earlier copy to")?;
-        std::fs::rename(local, &aside).map_err(|e| e.to_string())?;
-        log::info!("moved an earlier cloud working copy aside before downloading again");
-    }
-    crate::paths::write_atomic(local, bytes)
 }
 
 fn open_message(e: &DavError) -> String {

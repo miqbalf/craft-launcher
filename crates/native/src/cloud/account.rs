@@ -105,6 +105,21 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         if self.attempt.load(Ordering::SeqCst) != mine {
             return;
         }
+        // Files still open from another account would be watched by nobody (or, worse, as this
+        // one): they must be finished first.
+        {
+            let mut book = self.lock_book();
+            let refusal = match self.book(&mut book) {
+                Ok(open) if open.has_other_than(&handle(&base, &approved.login_name)) => {
+                    Some("Finish or close the files open from your other cloud account before connecting a different one.".to_string())
+                }
+                Ok(_) => None,
+                Err(e) => Some(format!("Couldn't read the list of open cloud files ({e}), so the new account wasn't connected.")),
+            };
+            if let Some(message) = refusal {
+                return self.emit(Event::CloudError(message));
+            }
+        }
         match self.record(&base, &approved.login_name, approved.app_password.expose()) {
             Ok(account) => self.emit(Event::CloudConnected(account)),
             Err(message) => self.emit(Event::CloudError(message)),

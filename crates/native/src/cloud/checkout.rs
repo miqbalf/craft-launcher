@@ -107,11 +107,17 @@ pub(super) struct Runtime {
     pub rejected_under: Option<u64>,
 }
 
+/// The key of a file's [`Runtime`]: its account and the path it was opened as.
+pub(super) fn rt_key(account: &str, path: &str) -> (String, String) {
+    (account.to_string(), path.to_string())
+}
+
 /// The open files, as loaded from `checkouts.json`.
 pub(super) struct Book {
     file: PathBuf,
     pub list: Vec<Checkout>,
-    pub runtime: HashMap<String, Runtime>,
+    /// Keyed by [`rt_key`]: two accounts may have the same path open.
+    pub runtime: HashMap<(String, String), Runtime>,
 }
 
 impl Book {
@@ -137,8 +143,23 @@ impl Book {
         self.list.iter().position(|c| c.account == account && (c.path == path || c.remote == path))
     }
 
+    /// The index of `account`'s checkout opened as `path`, exactly: the watcher's lookup.
+    pub fn index(&self, account: &str, path: &str) -> Option<usize> {
+        self.list.iter().position(|c| c.account == account && c.path == path)
+    }
+
     pub fn has_account(&self, account: &str) -> bool {
         self.list.iter().any(|c| c.account == account)
+    }
+
+    /// Whether a file of an account other than `account` is open.
+    pub fn has_other_than(&self, account: &str) -> bool {
+        self.list.iter().any(|c| c.account != account)
+    }
+
+    /// Whether `local` would be the same file on disk as some checkout's working copy.
+    pub fn owns_slot(&self, local: &Path) -> bool {
+        self.list.iter().any(|c| same_slot(&c.local, local))
     }
 }
 
@@ -157,6 +178,33 @@ pub(super) fn working_copy(cache: &Path, server_path: &str) -> Result<PathBuf, S
         any = true;
     }
     if any { Ok(out) } else { Err("That isn't a file.".to_string()) }
+}
+
+/// Whether `a` and `b` may name the same file. macOS folds letter case by default, and a server
+/// can hold `Report.docx` beside `report.docx`, so paths that differ only in case count as the
+/// same; so do two names of one existing file (same device and inode, on Unix).
+pub(super) fn same_slot(a: &Path, b: &Path) -> bool {
+    if a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return x.dev() == y.dev() && x.ino() == y.ino();
+        }
+    }
+    false
+}
+
+/// Where a file the user must not lose (their version after "Use theirs", an earlier copy found
+/// in the cache) is kept: under `kept_root` (outside every account's cache, so disconnecting never
+/// deletes it), in the server path's folders, as `name (label).ext` with a free name.
+pub(super) fn kept_place(kept_root: &Path, server_path: &str, label: &str) -> Result<PathBuf, String> {
+    let beside = working_copy(kept_root, server_path)?;
+    let dir = beside.parent().ok_or("no folder to keep the copy in")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
+    free_sibling(&beside, label).ok_or_else(|| "no free name to keep the copy under".to_string())
 }
 
 /// A name beside `path` that is not taken: `stem (label).ext`, then `stem (label) 2.ext`, ...
