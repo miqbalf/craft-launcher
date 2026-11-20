@@ -1,0 +1,33 @@
+# Fork-only: builds an unsigned macOS launcher for a manual test of the
+# cloud files feature. Not for upstream; drop this file before any PR.
+name: Mac test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check macOS-only code
+        run: cargo check -p artcraft-launcher-native -p artcraft-launcher
+      - name: Build release
+        run: cargo build --release -p artcraft-launcher
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/artcraft-launcher dist/
+          tar -C dist -czf artcraft-launcher-macos-arm64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-launcher-macos-arm64
+          path: artcraft-launcher-macos-arm64.tar.gz
+          retention-days: 14
