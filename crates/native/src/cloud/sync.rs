@@ -65,7 +65,13 @@ fn name_safe(login: &str) -> String {
 
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
     fn status(&self, path: &str, status: SyncStatus, detail: Option<String>) {
-        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail });
+        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail, forgettable: false });
+    }
+
+    /// A status Done can't get past, where stopping tracking ([`Self::forget`]) loses nothing the
+    /// cloud could still get: a read-only copy with changes, or a copy that is missing.
+    fn status_forgettable(&self, path: &str, status: SyncStatus, detail: String) {
+        self.emit(Event::CloudFileStatus { path: path.to_string(), status, detail: Some(detail), forgettable: true });
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -295,9 +301,13 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// What the backend does once at start: says which account is still connected (so the UI
     /// learns of it without signing in again), then [`Self::resume`].
     pub fn start(&self) {
+        // Under the book lock, as Disconnect and a sign-in's check are: an account removed or
+        // replaced meanwhile is never announced after the event that removed it.
+        let guard = self.lock_book();
         if let Some(account) = self.account() {
             self.emit(Event::CloudConnected(account));
         }
+        drop(guard);
         self.resume();
     }
 
@@ -485,15 +495,22 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             this.status(&key, SyncStatus::WaitingToUpload, Some("The file is being saved right now. Choose Done again in a moment.".to_string()));
         };
         match self.changed(book, i) {
-            // Missing: an app may be swapping in a save right now.
-            None => return busy(self),
+            // Missing: an app may be swapping in a save right now, or the copy is gone.
+            None => {
+                return self.status_forgettable(
+                    &key,
+                    SyncStatus::WaitingToUpload,
+                    "The file isn't on this computer right now; an app may be saving it. Choose Done again in a moment, or stop tracking it."
+                        .to_string(),
+                );
+            }
             Some(false) => {}
             Some(true) if !book.list[i].tracks_remote => {
                 let local = book.list[i].local.display().to_string();
-                return self.status(
+                return self.status_forgettable(
                     &key,
                     SyncStatus::ReadOnly,
-                    Some(format!("This file was opened read-only, so your changes weren't saved to the cloud. They're kept at {local}.")),
+                    format!("This file was opened read-only, so your changes weren't saved to the cloud. They're kept at {local}."),
                 );
             }
             Some(true) => match self.upload(book, &dav, &account.id, &key, self.now()) {
@@ -550,9 +567,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
         };
         let Some(i) = book.find(&account.id, path) else { return self.error("That file isn't open from the cloud.") };
+        // Asked before the copy moves: whatever the server doesn't have is said so.
+        let unsaved = self.changed(book, i) != Some(false);
         let c = book.list[i].clone();
         // The copy goes first: if it can't be kept, the checkout (and its lock) stays.
-        let detail = if std::fs::symlink_metadata(&c.local).is_ok() {
+        let mut detail = if std::fs::symlink_metadata(&c.local).is_ok() {
             match self.keep(&account.id, &c.path, &c.local, "kept when you stopped tracking") {
                 Ok(at) => format!("{CLOSED_DETAIL}. You stopped tracking this file; your copy is kept at {}", at.display()),
                 Err(e) => {
@@ -562,6 +581,10 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         } else {
             format!("{CLOSED_DETAIL}. You stopped tracking this file; there was no copy of it on this computer.")
         };
+        if unsaved {
+            detail.push_str(if detail.ends_with('.') { " " } else { ". " });
+            detail.push_str("Your latest changes were not saved to the cloud.");
+        }
         book.list.remove(i);
         book.runtime.remove(&rt_key(&account.id, &c.path));
         self.save_book(book);

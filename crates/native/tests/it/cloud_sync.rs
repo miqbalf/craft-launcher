@@ -880,3 +880,61 @@ fn start_without_an_account_announces_nothing() {
     rig.service.start();
     assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudConnected(_))), "{:?}", rig.events());
 }
+
+/// The last status of `path`: (status, detail, forgettable).
+fn last_status(rig: &Rig, path: &str) -> Option<(SyncStatus, Option<String>, bool)> {
+    rig.events().into_iter().rev().find_map(|e| match e {
+        Event::CloudFileStatus { path: p, status, detail, forgettable } if p == path => Some((status, detail, forgettable)),
+        _ => None,
+    })
+}
+
+#[test]
+fn forgetting_unsaved_edits_says_they_are_not_in_the_cloud() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    rig.save(&local, b"edit not uploaded yet");
+    rig.service.forget(FILE);
+    assert_eq!(kept_with(&rig, b"edit not uploaded yet").len(), 1, "{:?}", rig.events());
+    let (_, detail, _) = last_status(&rig, FILE).unwrap();
+    assert!(detail.as_deref().is_some_and(|d| d.contains("not saved to the cloud")), "{detail:?}");
+    assert_eq!(dav.remote(FILE).unwrap(), b"remote v1");
+}
+
+#[test]
+fn forgetting_a_synced_copy_does_not_warn() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    rig.open(FILE);
+    rig.service.forget(FILE);
+    let (_, detail, _) = last_status(&rig, FILE).unwrap();
+    assert!(detail.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL) && !d.contains("not saved")), "{detail:?}");
+}
+
+#[test]
+fn only_a_read_only_edit_or_a_missing_copy_is_forgettable() {
+    // Read-only with edits: Done is refused, and Stop tracking is the way out.
+    let rig1 = rig(Dav::with_file(FILE, b"remote v1"));
+    rig1.service.open(FILE, None, true);
+    let local = rig1.launched.lock().unwrap()[0].1.clone();
+    rig1.save(&local, b"scribbles");
+    rig1.service.done(FILE);
+    assert!(matches!(last_status(&rig1, FILE), Some((SyncStatus::ReadOnly, Some(_), true))), "{:?}", rig1.events());
+
+    // The copy is missing.
+    let rig2 = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = rig2.open(FILE);
+    std::fs::remove_file(&local).unwrap();
+    rig2.service.done(FILE);
+    assert!(matches!(last_status(&rig2, FILE), Some((SyncStatus::WaitingToUpload, Some(_), true))), "{:?}", rig2.events());
+
+    // A network failure: the edits can still go up later, so nothing offers to drop them.
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig3 = rig(dav.clone());
+    let local = rig3.open(FILE);
+    rig3.save(&local, b"offline edit");
+    dav.set_down(true);
+    rig3.service.done(FILE);
+    assert!(matches!(last_status(&rig3, FILE), Some((SyncStatus::WaitingToUpload, _, false))), "{:?}", rig3.events());
+    assert!(rig3.events().iter().all(|e| !matches!(e, Event::CloudFileStatus { forgettable: true, .. })));
+}

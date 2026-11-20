@@ -385,6 +385,11 @@ pub enum Event {
         path: String,
         status: SyncStatus,
         detail: Option<String>,
+        /// Done can't close the file, and `Command::CloudForget` is the way out without losing
+        /// anything: a read-only copy with changes, or a copy that is missing. False whenever the
+        /// changes could still reach the cloud (a network failure, a lock), so nothing offers to
+        /// stop tracking them.
+        forgettable: bool,
     },
     CloudLockedBy {
         path: String,

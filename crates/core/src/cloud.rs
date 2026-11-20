@@ -13,6 +13,10 @@ pub const SEARCH_PATH: &str = "@search";
 /// it says what became of a copy left on this computer.
 pub const CLOSED_DETAIL: &str = "Closed";
 
+/// The message of a listing or status refused because the sign-in is no longer valid (HTTP 401):
+/// the UI offers Reconnect beside it.
+pub const SIGN_IN_EXPIRED: &str = "Your cloud sign-in is no longer valid. Reconnect to continue.";
+
 /// Catalog ids of the office apps a cloud file can open in.
 pub const CLOUD_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
 

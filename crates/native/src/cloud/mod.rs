@@ -205,7 +205,7 @@ fn explain(failure: &Failure) -> (String, bool) {
 /// [`explain`] for a WebDAV error.
 fn explain_dav(e: &DavError) -> (String, bool) {
     match e {
-        DavError::Unauthorized => ("Your cloud sign-in is no longer valid. Reconnect to continue.".to_string(), true),
+        DavError::Unauthorized => (artcraft_launcher_core::cloud::SIGN_IN_EXPIRED.to_string(), true),
         DavError::NotFound => ("That folder wasn't found in your cloud.".to_string(), false),
         DavError::Transport(why) => (format!("Couldn't reach your cloud server ({why})."), false),
         DavError::Status { status, .. } => (format!("Your cloud server answered HTTP {status}."), false),
