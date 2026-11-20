@@ -28,15 +28,7 @@ use craft_suite_account::TokenStore;
 
 use crate::paths::Paths;
 
-/// The `path` of the [`Event::CloudListed`] that answers `CloudShared`. Real folder paths start
-/// with `/`, so this can't be one.
-pub const SHARED_PATH: &str = "@shared";
-/// The `path` of the [`Event::CloudListed`] that answers `CloudSearch`.
-pub const SEARCH_PATH: &str = "@search";
-
-/// The `detail` of the last [`Event::CloudFileStatus`] of a file after `CloudDone`: it is saved,
-/// closed and no longer watched.
-pub const CLOSED_DETAIL: &str = "Closed";
+pub use artcraft_launcher_core::cloud::{CLOSED_DETAIL, SEARCH_PATH, SHARED_PATH};
 
 /// How often the sign-in is checked while the user approves it in the browser.
 const POLL_EVERY: Duration = Duration::from_secs(2);

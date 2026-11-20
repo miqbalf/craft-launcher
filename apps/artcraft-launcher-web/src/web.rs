@@ -323,7 +323,8 @@ impl Backend for WebBackend {
             | Command::CloudRecent
             | Command::CloudOpen { .. }
             | Command::CloudDone { .. }
-            | Command::CloudResolve { .. } => self.events.borrow_mut().push(Event::CloudError("Cloud files need the desktop launcher".to_string())),
+            | Command::CloudResolve { .. }
+            | Command::CloudForget { .. } => self.events.borrow_mut().push(Event::CloudError("Cloud files need the desktop launcher".to_string())),
             _ => {}
         }
     }

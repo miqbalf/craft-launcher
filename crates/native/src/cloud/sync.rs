@@ -292,9 +292,18 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
     }
 
-    /// Watches the open files for good: [`Self::resume`], then [`Self::tick`] once a second.
-    pub fn run_sync(&self) {
+    /// What the backend does once at start: says which account is still connected (so the UI
+    /// learns of it without signing in again), then [`Self::resume`].
+    pub fn start(&self) {
+        if let Some(account) = self.account() {
+            self.emit(Event::CloudConnected(account));
+        }
         self.resume();
+    }
+
+    /// Watches the open files for good: [`Self::start`], then [`Self::tick`] once a second.
+    pub fn run_sync(&self) {
+        self.start();
         loop {
             self.tick();
             std::thread::sleep(POLL_EVERY);
@@ -528,6 +537,42 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             CLOSED_DETAIL.to_string()
         };
         self.status(&key, SyncStatus::Saved, Some(detail));
+    }
+
+    /// Stops tracking `path` without saving it back: the working copy moves to the kept folder
+    /// (never deleted), the lock is released and the file is closed. The last status names where
+    /// the copy went. If the copy can't be kept, nothing changes and the file stays open.
+    pub fn forget(&self, path: &str) {
+        let Some((account, dav)) = self.connected() else { return self.error("Connect to your cloud first.") };
+        let mut guard = self.lock_book();
+        let book = match self.book(&mut guard) {
+            Ok(b) => b,
+            Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
+        };
+        let Some(i) = book.find(&account.id, path) else { return self.error("That file isn't open from the cloud.") };
+        let c = book.list[i].clone();
+        // The copy goes first: if it can't be kept, the checkout (and its lock) stays.
+        let detail = if std::fs::symlink_metadata(&c.local).is_ok() {
+            match self.keep(&account.id, &c.path, &c.local, "kept when you stopped tracking") {
+                Ok(at) => format!("{CLOSED_DETAIL}. You stopped tracking this file; your copy is kept at {}", at.display()),
+                Err(e) => {
+                    return self.error(format!("Couldn't keep your copy of the file ({e}), so it is still open and nothing was removed."));
+                }
+            }
+        } else {
+            format!("{CLOSED_DETAIL}. You stopped tracking this file; there was no copy of it on this computer.")
+        };
+        book.list.remove(i);
+        book.runtime.remove(&rt_key(&account.id, &c.path));
+        self.save_book(book);
+        drop(guard);
+        if let Some(lock) = &c.lock
+            && let Err(e) = Files::new(&dav).unlock(&self.http(), &lock.to_dav())
+        {
+            log::warn!("couldn't release a cloud file lock ({e}); it runs out on its own");
+        }
+        // Read-only: from now on nothing of it is uploaded.
+        self.status(&c.path, SyncStatus::ReadOnly, Some(detail));
     }
 
     /// Moves every regular file still in `account`'s cache to the kept folder, so removing the

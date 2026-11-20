@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The `path` of the `Event::CloudListed` that answers `CloudShared`. Real folder paths start
+/// with `/`, so this can't be one.
+pub const SHARED_PATH: &str = "@shared";
+/// The `path` of the `Event::CloudListed` that answers `CloudSearch`.
+pub const SEARCH_PATH: &str = "@search";
+
+/// How the `detail` of the last `Event::CloudFileStatus` of a file starts once it is closed
+/// (`CloudDone` or `CloudForget`): it is no longer open from the cloud nor watched. Anything after
+/// it says what became of a copy left on this computer.
+pub const CLOSED_DETAIL: &str = "Closed";
+
 /// Catalog ids of the office apps a cloud file can open in.
 pub const CLOUD_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
 

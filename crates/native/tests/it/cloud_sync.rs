@@ -808,3 +808,75 @@ fn done_keeps_watching_a_late_save_it_cannot_move_aside() {
     rig.settle();
     assert_eq!(dav.remote(FILE).unwrap(), b"saved during unlock", "the late save is uploaded after all");
 }
+
+#[test]
+fn forgetting_a_changed_read_only_copy_keeps_it_and_lets_disconnect_go() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    rig.service.open(FILE, None, true);
+    let local = rig.launched.lock().unwrap()[0].1.clone();
+    rig.save(&local, b"local scribbles");
+    rig.service.done(FILE);
+    rig.service.disconnect();
+    assert!(!disconnected(&rig), "an open file blocks disconnecting: {:?}", rig.events());
+
+    rig.service.forget(FILE);
+    let kept = kept_with(&rig, b"local scribbles");
+    assert_eq!(kept.len(), 1, "the edits are kept, bytes intact: {:?}", rig.events());
+    assert!(!local.exists(), "the copy moved out of the cache");
+    let told = rig.events().iter().rev().find_map(|e| match e {
+        Event::CloudFileStatus { path, detail: Some(d), .. } if path == FILE => Some(d.clone()),
+        _ => None,
+    });
+    assert!(told.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL) && d.contains(&kept[0].display().to_string())), "{told:?}");
+
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "{:?}", rig.events());
+    assert_eq!(kept_with(&rig, b"local scribbles").len(), 1, "disconnecting keeps it too");
+}
+
+#[test]
+fn forget_refuses_when_the_copy_cannot_be_kept() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    dav.set_down(true);
+    rig.save(&local, b"unsynced edit");
+    let blocker = rig.paths.cloud_root().join("kept").join(accounts::handle(SERVER, "alice"));
+    std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+    std::fs::write(&blocker, b"in the way").unwrap();
+
+    rig.service.forget(FILE);
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(_))), "{:?}", rig.events());
+    assert_eq!(std::fs::read(&local).unwrap(), b"unsynced edit", "the copy stays where it was");
+    assert!(dav.held_lock(FILE).is_some(), "still checked out, still locked");
+    rig.service.disconnect();
+    assert!(!disconnected(&rig), "still open, so disconnecting is still refused");
+
+    std::fs::remove_file(&blocker).unwrap();
+    dav.set_down(false);
+    rig.service.forget(FILE);
+    assert_eq!(kept_with(&rig, b"unsynced edit").len(), 1);
+    assert!(dav.held_lock(FILE).is_none(), "stopping tracking releases the lock");
+    assert_eq!(dav.remote(FILE).unwrap(), b"remote v1", "nothing is uploaded");
+}
+
+#[test]
+fn start_announces_the_connection_before_the_open_files() {
+    let mut rig = rig(Dav::with_file(FILE, b"remote v1"));
+    rig.open(FILE);
+    rig.rebuild();
+    rig.events.lock().unwrap().clear();
+    rig.service.start();
+    let events = rig.events();
+    let connected = events.iter().position(|e| matches!(e, Event::CloudConnected(a) if a.login == "alice"));
+    let status = events.iter().position(|e| matches!(e, Event::CloudFileStatus { path, .. } if path == FILE));
+    assert!(connected.is_some_and(|c| status.is_some_and(|s| c < s)), "{events:?}");
+}
+
+#[test]
+fn start_without_an_account_announces_nothing() {
+    let rig = rig(Dav::default());
+    std::fs::remove_file(rig.paths.cloud_root().join("account.json")).unwrap();
+    rig.service.start();
+    assert!(!rig.events().iter().any(|e| matches!(e, Event::CloudConnected(_))), "{:?}", rig.events());
+}

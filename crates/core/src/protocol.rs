@@ -132,6 +132,11 @@ pub enum Command {
         path: String,
         choice: ConflictChoice,
     },
+    /// Stop tracking the file at `path` without saving it back: its copy on this computer is
+    /// moved to the kept folder (never deleted), its lock is released and it is closed.
+    CloudForget {
+        path: String,
+    },
 }
 
 /// Parent folders for new installs. Existing installations keep their recorded location.

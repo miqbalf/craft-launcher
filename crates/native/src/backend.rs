@@ -323,7 +323,8 @@ impl NativeBackend {
             )
         });
         if let Some(cloud) = &cloud {
-            // Watches the files open from the cloud: shows last run's again and uploads their saves.
+            // Says whether an account is still connected, then watches the files open from the
+            // cloud: shows last run's again and uploads their saves.
             let cloud = cloud.clone();
             std::thread::spawn(move || cloud.run_sync());
         }
@@ -1755,6 +1756,7 @@ impl Backend for NativeBackend {
             Command::CloudOpen { path, app, read_only } => self.cloud_job(move |cloud| cloud.open(&path, app, read_only)),
             Command::CloudDone { path } => self.cloud_job(move |cloud| cloud.done(&path)),
             Command::CloudResolve { path, choice } => self.cloud_job(move |cloud| cloud.resolve(&path, choice)),
+            Command::CloudForget { path } => self.cloud_job(move |cloud| cloud.forget(&path)),
         }
     }
 
