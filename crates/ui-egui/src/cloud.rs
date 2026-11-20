@@ -7,7 +7,7 @@
 //! Craft app opens yet is shown but can't be opened.
 
 use artcraft_launcher_core::cloud::{
-    CLOSED_DETAIL, CloudAccount, CloudEntry, ConflictChoice, SEARCH_PATH, SHARED_PATH, SyncStatus, app_for, normalize_server,
+    CLOSED_DETAIL, CloudAccount, CloudEntry, ConflictChoice, SEARCH_PATH, SHARED_PATH, SIGN_IN_EXPIRED, SyncStatus, app_for, normalize_server,
 };
 use artcraft_launcher_core::protocol::{Command, Event};
 use egui::{Color32, CornerRadius, FontId, Id, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -42,11 +42,9 @@ pub(crate) struct OpenFile {
     pub path: String,
     pub status: SyncStatus,
     pub detail: Option<String>,
-    /// Done was chosen and the answer hasn't come yet.
-    pub done_sent: bool,
-    /// Done was refused for a reason Stop tracking can get past (a read-only copy with changes,
-    /// a copy that is missing or won't upload).
-    pub done_refused: bool,
+    /// The backend says Stop tracking loses nothing it could still upload (a read-only copy with
+    /// changes, a copy that is missing): only then is it offered.
+    pub forgettable: bool,
 }
 
 /// The last listing asked for: `key` is the folder path, [`SHARED_PATH`] or [`SEARCH_PATH`];
@@ -289,9 +287,9 @@ impl LauncherUi {
                     listing.entries = Some(entries);
                 }
             }
-            Event::CloudFileStatus { path, status, detail } => {
+            Event::CloudFileStatus { path, status, detail, forgettable } => {
                 if connected {
-                    self.on_file_status(path, status, detail);
+                    self.on_file_status(path, status, detail, forgettable);
                 }
             }
             Event::CloudLockedBy { path, by } => {
@@ -308,9 +306,10 @@ impl LauncherUi {
                 self.show_cloud_dialog(Dialog::CloudLocked { path, by });
             }
             Event::CloudError(message) => {
+                // A sign-in ends with CloudConnected or an error: either way it no longer waits.
+                self.cloud.waiting = false;
+                self.cloud.login_url = None;
                 if !connected {
-                    self.cloud.waiting = false;
-                    self.cloud.login_url = None;
                     self.cloud.form_error = Some(message.clone());
                 }
                 self.toast(message, true);
@@ -320,7 +319,7 @@ impl LauncherUi {
         }
     }
 
-    fn on_file_status(&mut self, path: String, status: SyncStatus, detail: Option<String>) {
+    fn on_file_status(&mut self, path: String, status: SyncStatus, detail: Option<String>, forgettable: bool) {
         let name = file_name(&path).to_string();
         if detail.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL)) {
             self.cloud.open.retain(|f| f.path != path);
@@ -341,18 +340,12 @@ impl LauncherUi {
         let i = match self.cloud.open.iter().position(|f| f.path == path) {
             Some(i) => i,
             None => {
-                self.cloud.open.push(OpenFile { path: path.clone(), status, detail: None, done_sent: false, done_refused: false });
+                self.cloud.open.push(OpenFile { path: path.clone(), status, detail: None, forgettable });
                 self.cloud.open.len() - 1
             }
         };
         let file = &mut self.cloud.open[i];
-        if file.done_sent && detail.is_some() {
-            file.done_sent = false;
-            file.done_refused = matches!(status, SyncStatus::ReadOnly | SyncStatus::WaitingToUpload);
-        }
-        if !matches!(status, SyncStatus::ReadOnly | SyncStatus::WaitingToUpload) {
-            file.done_refused = false;
-        }
+        file.forgettable = forgettable;
         file.status = status;
         file.detail.clone_from(&detail);
         let mut text = format!("{name}: {}", status_label(status));
@@ -431,6 +424,11 @@ impl LauncherUi {
             self.connect_form(ui, &t);
             return;
         }
+        if self.cloud.waiting {
+            // Reconnecting: the sign-in waits for the browser while the files stay listed.
+            self.sign_in_waiting(ui, &t);
+            ui.add_space(14.0);
+        }
         self.account_bar(ui, &t);
         ui.add_space(14.0);
         self.view_bar(ui, &t);
@@ -473,18 +471,7 @@ impl LauncherUi {
         ui.label(RichText::new(tl!("Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.")).color(t.muted));
         ui.add_space(18.0);
         if self.cloud.waiting {
-            ui.label(RichText::new(tl!("Waiting for you to approve the sign-in in your browser…")).color(t.ink));
-            if let Some(url) = self.cloud.login_url.clone() {
-                ui.add_space(6.0);
-                ui.label(RichText::new(tl!("If the browser didn't open, go to this address:")).color(t.muted));
-                ui.add(egui::Label::new(RichText::new(url).family(theme::mono()).color(t.ink)).selectable(true));
-            }
-            ui.add_space(12.0);
-            if widgets::button(ui, tl!("Cancel"), Kind::Secondary, 0.0).clicked() {
-                self.act_command(Command::CloudCancelConnect);
-                self.cloud.waiting = false;
-                self.cloud.login_url = None;
-            }
+            self.sign_in_waiting(ui, t);
             return;
         }
         widgets::hud(ui, tl!("Server address"), t.faint);
@@ -525,7 +512,31 @@ impl LauncherUi {
         ui.label(RichText::new(tl!("The launcher keeps a sign-in you can revoke in Nextcloud, never your password.")).size(12.0).color(t.faint));
     }
 
-    /// Who is connected, and Disconnect.
+    /// A sign-in waiting for the browser: its address, and Cancel.
+    fn sign_in_waiting(&mut self, ui: &mut Ui, t: &Tokens) {
+        ui.label(RichText::new(tl!("Waiting for you to approve the sign-in in your browser…")).color(t.ink));
+        if let Some(url) = self.cloud.login_url.clone() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(tl!("If the browser didn't open, go to this address:")).color(t.muted));
+            ui.add(egui::Label::new(RichText::new(url).family(theme::mono()).color(t.ink)).selectable(true));
+        }
+        ui.add_space(12.0);
+        if widgets::button(ui, tl!("Cancel"), Kind::Secondary, 0.0).clicked() {
+            self.act_command(Command::CloudCancelConnect);
+            self.cloud.waiting = false;
+            self.cloud.login_url = None;
+        }
+    }
+
+    /// Signs in again to the connected server (after the sign-in was revoked or ran out).
+    fn reconnect(&mut self) {
+        if let Some(server) = self.cloud.account.as_ref().map(|a| a.server.clone()) {
+            self.cloud.waiting = true;
+            self.act_command(Command::CloudConnect { server });
+        }
+    }
+
+    /// Who is connected, Reconnect and Disconnect.
     fn account_bar(&mut self, ui: &mut Ui, t: &Tokens) {
         let Some(account) = self.cloud.account.clone() else { return };
         ui.horizontal(|ui| {
@@ -537,6 +548,11 @@ impl LauncherUi {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::button(ui, tl!("Disconnect"), Kind::Secondary, 0.0).clicked() {
                     self.show_cloud_dialog(Dialog::CloudDisconnect);
+                }
+                if !self.cloud.waiting
+                    && widgets::button(ui, tl!("Reconnect"), Kind::Secondary, 0.0).on_hover_text(tl!("Sign in to this server again")).clicked()
+                {
+                    self.reconnect();
                 }
             });
         });
@@ -633,7 +649,11 @@ impl LauncherUi {
                 ui.add_space(20.0);
                 ui.add(egui::Label::new(RichText::new(msg(&why)).color(t.bad)).wrap());
                 ui.add_space(10.0);
-                if widgets::button(ui, tl!("Try again"), Kind::Secondary, 0.0).clicked() {
+                if why == SIGN_IN_EXPIRED {
+                    if !self.cloud.waiting && widgets::button(ui, tl!("Reconnect"), Kind::Primary, 0.0).clicked() {
+                        self.reconnect();
+                    }
+                } else if widgets::button(ui, tl!("Try again"), Kind::Secondary, 0.0).clicked() {
                     self.show_view(self.cloud.view);
                 }
                 return;
@@ -880,10 +900,8 @@ impl LauncherUi {
             }
             SyncStatus::ReconnectNeeded => {
                 let label = tl!("Reconnect");
-                if let Some(server) = self.cloud.account.as_ref().map(|a| a.server.clone())
-                    && widgets::labelled_button(ui, label, &named(label), Kind::Primary, 0.0).clicked()
-                {
-                    self.act_command(Command::CloudConnect { server });
+                if !self.cloud.waiting && widgets::labelled_button(ui, label, &named(label), Kind::Primary, 0.0).clicked() {
+                    self.reconnect();
                 }
             }
             SyncStatus::Opening | SyncStatus::Uploading => {}
@@ -893,19 +911,15 @@ impl LauncherUi {
                     .on_hover_text(tl!("Uploads what is left, then closes the file here"))
                     .clicked()
                 {
-                    let path = file.path.clone();
-                    if let Some(f) = self.cloud.open.iter_mut().find(|f| f.path == path) {
-                        f.done_sent = true;
-                    }
-                    self.act_command(Command::CloudDone { path });
+                    self.act_command(Command::CloudDone { path: file.path.clone() });
                 }
-                if file.done_refused {
+                if file.forgettable {
                     let label = tl!("Stop tracking (keep a local copy)");
                     if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)
                         .on_hover_text(tl!("Stops saving this file to the cloud; your copy moves to the kept folder on this computer"))
                         .clicked()
                     {
-                        self.act_command(Command::CloudForget { path: file.path.clone() });
+                        self.show_cloud_dialog(Dialog::CloudForget(file.path.clone()));
                     }
                 }
             }
@@ -1066,6 +1080,38 @@ impl LauncherUi {
                     self.focus_default(&cancel);
                 }
                 close |= cancel.clicked();
+            });
+        });
+        close
+    }
+
+    /// Stop tracking only after a confirmation that says what isn't in the cloud. Cancel has focus,
+    /// so Enter keeps the file tracked.
+    pub(crate) fn cloud_forget_dialog(&mut self, ui: &mut Ui, path: &str) -> bool {
+        let t = Tokens::get(ui.ctx());
+        Self::prompt_width(ui);
+        let name = file_name(path);
+        Self::prompt_title(ui, &t, &fmt(tl!("Stop tracking {name}?"), &[("name", name)]));
+        let warning = tl!(
+            "Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done."
+        );
+        ui.add(egui::Label::new(RichText::new(warning).color(t.ink)).wrap());
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(RichText::new(tl!("Nothing is uploaded and nothing is deleted. The file in the cloud stays as it is.")).color(t.muted))
+                .wrap(),
+        );
+        ui.add_space(16.0);
+        let mut close = false;
+        ui.horizontal(|ui| {
+            let cancel = widgets::button(ui, tl!("Cancel"), Kind::Secondary, 0.0);
+            self.focus_default(&cancel);
+            close |= cancel.clicked();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::button(ui, tl!("Stop tracking"), Kind::Danger, 0.0).clicked() {
+                    self.act_command(Command::CloudForget { path: path.to_string() });
+                    close = true;
+                }
             });
         });
         close

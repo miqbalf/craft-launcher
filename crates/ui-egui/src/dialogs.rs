@@ -51,6 +51,7 @@ impl LauncherUi {
             Dialog::CloudUseMine(path) => modal.show(ctx, |ui| close = self.cloud_use_mine_dialog(ui, path)),
             Dialog::CloudCloseInApp(path) => modal.show(ctx, |ui| close = self.cloud_close_in_app_dialog(ui, path)),
             Dialog::CloudLocked { path, by } => modal.show(ctx, |ui| close = self.cloud_locked_dialog(ui, path, by)),
+            Dialog::CloudForget(path) => modal.show(ctx, |ui| close = self.cloud_forget_dialog(ui, path)),
             Dialog::CloudDisconnect => modal.show(ctx, |ui| close = self.cloud_disconnect_dialog(ui)),
         };
         if self.dialog.as_ref().is_some_and(|active| active.key() != dialog.key()) {

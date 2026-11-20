@@ -120,11 +120,13 @@ pub(crate) enum Dialog {
     LaunchFlags { app: String, flags: String },
     // The Cloud page's prompts (`cloud.rs`), each about one cloud file's path: which version to
     // keep after a conflict, the confirmation "Use mine" needs, closing the document after
-    // "Use theirs", someone else's lock (`by` may be empty: not known), and Disconnect.
+    // "Use theirs", someone else's lock (`by` may be empty: not known), the confirmation Stop
+    // tracking needs, and Disconnect.
     CloudConflict(String),
     CloudUseMine(String),
     CloudCloseInApp(String),
     CloudLocked { path: String, by: String },
+    CloudForget(String),
     CloudDisconnect,
 }
 
@@ -146,6 +148,7 @@ impl Dialog {
             Dialog::CloudUseMine(path) => ("cloud-use-mine", path),
             Dialog::CloudCloseInApp(path) => ("cloud-close-in-app", path),
             Dialog::CloudLocked { path, .. } => ("cloud-locked", path),
+            Dialog::CloudForget(path) => ("cloud-forget", path),
             Dialog::CloudDisconnect => ("cloud-disconnect", ""),
         }
     }
@@ -154,14 +157,23 @@ impl Dialog {
     pub(crate) fn is_cloud(&self) -> bool {
         matches!(
             self,
-            Dialog::CloudConflict(_) | Dialog::CloudUseMine(_) | Dialog::CloudCloseInApp(_) | Dialog::CloudLocked { .. } | Dialog::CloudDisconnect
+            Dialog::CloudConflict(_)
+                | Dialog::CloudUseMine(_)
+                | Dialog::CloudCloseInApp(_)
+                | Dialog::CloudLocked { .. }
+                | Dialog::CloudForget(_)
+                | Dialog::CloudDisconnect
         )
     }
 
     /// The cloud file a cloud prompt is about.
     pub(crate) fn cloud_path(&self) -> Option<&str> {
         match self {
-            Dialog::CloudConflict(path) | Dialog::CloudUseMine(path) | Dialog::CloudCloseInApp(path) | Dialog::CloudLocked { path, .. } => Some(path),
+            Dialog::CloudConflict(path)
+            | Dialog::CloudUseMine(path)
+            | Dialog::CloudCloseInApp(path)
+            | Dialog::CloudLocked { path, .. }
+            | Dialog::CloudForget(path) => Some(path),
             _ => None,
         }
     }

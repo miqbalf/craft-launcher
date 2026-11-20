@@ -4888,7 +4888,12 @@ fn top_folder() -> Vec<CloudEntry> {
 }
 
 fn status(path: &str, status: SyncStatus, detail: Option<&str>) -> Event {
-    Event::CloudFileStatus { path: path.into(), status, detail: detail.map(str::to_string) }
+    Event::CloudFileStatus { path: path.into(), status, detail: detail.map(str::to_string), forgettable: false }
+}
+
+/// A status after which the backend says Stop tracking loses nothing it could still upload.
+fn forgettable(path: &str, status: SyncStatus, detail: &str) -> Event {
+    Event::CloudFileStatus { path: path.into(), status, detail: Some(detail.to_string()), forgettable: true }
 }
 
 #[test]
@@ -5054,7 +5059,7 @@ fn locked_by_someone_offers_read_only_without_a_name() {
 }
 
 #[test]
-fn stop_tracking_is_offered_once_done_is_refused_and_keeps_the_copy() {
+fn stop_tracking_is_offered_only_when_forgettable_and_asks_first() {
     let (mut h, sent, inbox) = connected_with(top_folder());
     inbox.borrow_mut().push(status("/report.docx", SyncStatus::ReadOnly, None));
     h.run_steps(3);
@@ -5063,11 +5068,21 @@ fn stop_tracking_is_offered_once_done_is_refused_and_keeps_the_copy() {
     h.run_steps(3);
     assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudDone { path: "/report.docx".into() }));
     let kept = "This file was opened read-only, so your changes weren't saved to the cloud. They're kept at /cache/report.docx.";
-    inbox.borrow_mut().push(status("/report.docx", SyncStatus::ReadOnly, Some(kept)));
+    inbox.borrow_mut().push(forgettable("/report.docx", SyncStatus::ReadOnly, kept));
     h.run_steps(3);
     assert!(h.query_all_by_label_contains("They're kept at /cache/report.docx").next().is_some(), "the detail is shown");
     snapshot(&mut h, "cloud_open_panel");
     h.get_by_role_and_label(Role::Button, "Stop tracking (keep a local copy): report.docx").click();
+    h.run_steps(4);
+    assert!(h.query_all_by_label_contains("Your changes aren't in Nextcloud").next().is_some(), "the confirm says what is lost");
+    assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused(), "the safe answer has focus");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(4);
+    assert!(h.query_by_role_and_label(Role::Button, "Cancel").is_none(), "Enter cancels");
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::CloudForget { .. })), "nothing sent without the confirm");
+    h.get_by_role_and_label(Role::Button, "Stop tracking (keep a local copy): report.docx").click();
+    h.run_steps(4);
+    h.get_by_role_and_label(Role::Button, "Stop tracking").click();
     h.run_steps(3);
     assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudForget { path: "/report.docx".into() }));
     inbox.borrow_mut().push(status(
@@ -5078,6 +5093,44 @@ fn stop_tracking_is_offered_once_done_is_refused_and_keeps_the_copy() {
     h.run_steps(3);
     assert!(h.query_by_role_and_label(Role::Button, "Done: report.docx").is_none(), "a closed file leaves the panel");
     assert!(h.query_all_by_label_contains("/kept/report.docx").next().is_some(), "where the copy went is still said");
+}
+
+#[test]
+fn a_failed_upload_does_not_offer_stop_tracking() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::Saved, None));
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "Done: report.docx").click();
+    h.run_steps(3);
+    let why = "Couldn't reach your cloud server (connection refused). Your changes are kept here and uploaded when it works again.";
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::WaitingToUpload, Some(why)));
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "Done: report.docx");
+    assert!(h.query_by_label("Stop tracking (keep a local copy): report.docx").is_none(), "the edits can still go up");
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::CloudForget { .. })));
+}
+
+#[test]
+fn an_expired_sign_in_offers_reconnect() {
+    let (mut h, sent, inbox) = cloud_harness();
+    inbox.borrow_mut().push(Event::CloudConnected(cloud_account()));
+    open_cloud_page(&mut h);
+    let expired = artcraft_launcher_core::cloud::SIGN_IN_EXPIRED.to_string();
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Err(expired.clone()) });
+    inbox.borrow_mut().push(Event::CloudError(expired));
+    h.run_steps(3);
+    let reconnect: Vec<_> = h.query_all_by_role_and_label(Role::Button, "Reconnect").collect();
+    assert_eq!(reconnect.len(), 2, "in the account bar and beside the error");
+    reconnect.last().unwrap().click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudConnect { server: cloud_account().server }));
+    // While connected, the sign-in still shows its address and can be called off.
+    inbox.borrow_mut().push(Event::CloudLoginUrl("https://cloud.example.com/login/v2/flow/x".into()));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("login/v2/flow/x").next().is_some(), "the sign-in address is shown");
+    h.get_by_role_and_label(Role::Button, "Cancel").click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudCancelConnect));
 }
 
 #[test]

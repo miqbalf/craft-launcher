@@ -566,3 +566,9 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Install, update and open the Craft apps	Install, update and open the Craft apps
 	Cloud	Cloud
 	Open and save your files in the cloud	Open and save your files in the cloud
+# Cloud page (English until translated in storytold/craft-i18n).
+	Sign in to this server again	Sign in to this server again
+	Stop tracking {name}?	Stop tracking {name}?
+	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done.	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done.
+	Nothing is uploaded and nothing is deleted. The file in the cloud stays as it is.	Nothing is uploaded and nothing is deleted. The file in the cloud stays as it is.
+	Stop tracking	Stop tracking
