@@ -34,15 +34,15 @@ log = "0.4"
 # All date/time conversion goes through jiff (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 jiff = "0.2"
 # Feature flags (craft-libs#1118, merged in craft-libs#1119).
-craft-flags = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
+craft-flags = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
 # The agents switch and app list (Settings › AI agents), shared with the craft-ai-mcp gateway and
 # every Craft app. Pinned to the merge of storytold/craft-ai-integrations#197.
 craft-ai-agents = { git = "https://github.com/storytold/craft-ai-integrations", rev = "0d76ea02a06299a5a6eee1993863fbcafe9c2cc3" }
-craft-update = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
-craft-ui = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
-craft-nextcloud = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
-craft-cloud = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
-craft-suite-account = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "d4b05a2369612f389702605bd804f70c4cf4a849" }
+craft-update = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
+craft-ui = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
+craft-nextcloud = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
+craft-cloud = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
+craft-suite-account = { version = "=0.1.0", git = "https://github.com/miqbalf/craft-libs", rev = "63ac40b88fdbec2d8ecc3d1a1e3278c7e1b3be1f" }
 
 [profile.dev.package."*"]
 opt-level = 2
