@@ -498,8 +498,8 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Someone else is editing {name}.	Someone else is editing {name}.
 	{by} is editing {name}.	{by} is editing {name}.
 	{name} is saved to the cloud and closed.	{name} is saved to the cloud and closed.
-	Connect to cloud	Connect to cloud
-	Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.	Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.
+	Connect to your Nextcloud server	Connect to your Nextcloud server
+	Cloud files: open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced without asking you.	Cloud files: open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced without asking you.
 	Waiting for you to approve the sign-in in your browser…	Waiting for you to approve the sign-in in your browser…
 	If the browser didn't open, go to this address:	If the browser didn't open, go to this address:
 	Server address	Server address
@@ -542,7 +542,7 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	I've closed it	I've closed it
 	Their version replaces yours, which is kept as a backup	Their version replaces yours, which is kept as a backup
 	Reconnect	Reconnect
-	Uploads what is left, then closes the file here	Uploads what is left, then closes the file here
+	Close the document in its app first. Done uploads what's left and stops syncing the file.	Close the document in its app first. Done uploads what's left and stops syncing the file.
 	Stop tracking (keep a local copy)	Stop tracking (keep a local copy)
 	Stops saving this file to the cloud; your copy moves to the kept folder on this computer	Stops saving this file to the cloud; your copy moves to the kept folder on this computer
 	{name} was changed in the cloud too	{name} was changed in the cloud too
@@ -566,16 +566,23 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	You can open {file} read-only. Changes you make to it aren't saved to the cloud.	You can open {file} read-only. Changes you make to it aren't saved to the cloud.
 	Open read-only	Open read-only
 	Disconnect from {server}?	Disconnect from {server}?
-	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first; nothing in the cloud changes.	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first; nothing in the cloud changes.
-	These files are still open from the cloud. Choose Done on each one (or Stop tracking) first:	These files are still open from the cloud. Choose Done on each one (or Stop tracking) first:
+	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first (Show kept files opens it); nothing in the cloud changes.	The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first (Show kept files opens it); nothing in the cloud changes.
+	These files are still open from the cloud. Close each one first with the button its row offers: Done, Choose a version, Reconnect or Stop tracking.	These files are still open from the cloud. Close each one first with the button its row offers: Done, Choose a version, Reconnect or Stop tracking.
 	Finish or close your open cloud files first.	Finish or close your open cloud files first.
 	Apps	Apps
 	Install, update and open the Craft apps	Install, update and open the Craft apps
 	Cloud	Cloud
-	Open and save your files in the cloud	Open and save your files in the cloud
+	Cloud files: open and save your Nextcloud files in the Craft apps	Cloud files: open and save your Nextcloud files in the Craft apps
 # Cloud page (English until translated in storytold/craft-i18n).
 	Sign in to this server again	Sign in to this server again
 	Stop tracking {name}?	Stop tracking {name}?
-	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done.	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done.
+	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done, and Show kept files opens that folder.	Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done, and Show kept files opens that folder.
 	Nothing is uploaded and nothing is deleted. The file in the cloud stays as it is.	Nothing is uploaded and nothing is deleted. The file in the cloud stays as it is.
 	Stop tracking	Stop tracking
+	No Craft app opens this kind of file yet.	No Craft app opens this kind of file yet.
+	Opening files from the cloud isn't supported on this system yet.	Opening files from the cloud isn't supported on this system yet.
+	Results in this folder only	Results in this folder only
+	Show kept files	Show kept files
+	Backups and copies kept when you stopped tracking a file, on this computer	Backups and copies kept when you stopped tracking a file, on this computer
+	Your server couldn't search, so only the folder shown last was searched	Your server couldn't search, so only the folder shown last was searched
+	{name} is closed.	{name} is closed.

@@ -97,7 +97,13 @@ impl Backend for Fake {
         out
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { manage_apps: self.manage, reveal_label: "Show in Finder", self_update: self.manage, desktop_shortcuts: false }
+        Capabilities {
+            manage_apps: self.manage,
+            reveal_label: "Show in Finder",
+            self_update: self.manage,
+            desktop_shortcuts: false,
+            open_cloud_files: true,
+        }
     }
     fn platform(&self) -> Option<Platform> {
         Some(Platform { os: Os::MacOs, arch: Arch::Arm64 })
@@ -477,7 +483,7 @@ impl Backend for VersionsFake {
         self.launcher_kind
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { manage_apps: true, reveal_label: "Show in Finder", self_update: true, desktop_shortcuts: false }
+        Capabilities { manage_apps: true, reveal_label: "Show in Finder", self_update: true, desktop_shortcuts: false, open_cloud_files: true }
     }
     fn platform(&self) -> Option<Platform> {
         Some(self.platform)
@@ -4768,6 +4774,8 @@ type CloudRig = (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>
 struct InboxFake {
     inner: Fake,
     inbox: Inbox,
+    /// What `Capabilities::open_cloud_files` says.
+    opens_cloud: bool,
 }
 
 impl Backend for InboxFake {
@@ -4780,7 +4788,7 @@ impl Backend for InboxFake {
         out
     }
     fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+        Capabilities { open_cloud_files: self.opens_cloud, ..self.inner.capabilities() }
     }
     fn platform(&self) -> Option<Platform> {
         self.inner.platform()
@@ -4793,6 +4801,11 @@ impl Backend for InboxFake {
 /// The usual managing macOS fixture (WordCraft installed, DeckCraft not), with an inbox the test
 /// answers the UI's cloud commands through.
 fn cloud_harness() -> CloudRig {
+    cloud_harness_where(true)
+}
+
+/// [`cloud_harness`] on a system where cloud files can (`opens`) or can't be opened in an app.
+fn cloud_harness_where(opens: bool) -> CloudRig {
     artcraft_launcher_ui_egui::i18n::set_test_lang(artcraft_launcher_ui_egui::i18n::Lang::EN);
     let sent = Rc::new(RefCell::new(Vec::new()));
     let inbox: Inbox = Rc::default();
@@ -4807,6 +4820,7 @@ fn cloud_harness() -> CloudRig {
             clock: Rc::new(Cell::new(NOW)),
         },
         inbox: inbox.clone(),
+        opens_cloud: opens,
     });
     let harness = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1000.0)).build_ui_state(
         move |ui, state: &mut Option<LauncherUi>| {
@@ -4839,6 +4853,7 @@ fn cloud_entry(path: &str, is_dir: bool) -> CloudEntry {
         shared: false,
         locked_by: None,
         lock_by_app: false,
+        writable: true,
     }
 }
 
@@ -4860,6 +4875,7 @@ fn cloud_sent(sent: &RefCell<Vec<Command>>) -> Vec<Command> {
                     | Command::CloudDone { .. }
                     | Command::CloudResolve { .. }
                     | Command::CloudForget { .. }
+                    | Command::CloudRevealKept
                     | Command::Install { .. }
             )
         })
@@ -4879,7 +4895,7 @@ fn connected_with(entries: Vec<CloudEntry>) -> CloudRig {
     inbox.borrow_mut().push(Event::CloudConnected(cloud_account()));
     open_cloud_page(&mut h);
     assert!(cloud_sent(&sent).contains(&Command::CloudList { path: "/".into() }), "connecting lists the top folder: {:?}", cloud_sent(&sent));
-    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(entries) });
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(entries), folder_only: false });
     h.run_steps(3);
     (h, sent, inbox)
 }
@@ -4889,12 +4905,17 @@ fn top_folder() -> Vec<CloudEntry> {
 }
 
 fn status(path: &str, status: SyncStatus, detail: Option<&str>) -> Event {
-    Event::CloudFileStatus { path: path.into(), status, detail: detail.map(str::to_string), forgettable: false }
+    Event::CloudFileStatus { path: path.into(), status, detail: detail.map(str::to_string), forgettable: false, closed: false }
 }
 
 /// A status after which the backend says Stop tracking loses nothing it could still upload.
 fn forgettable(path: &str, status: SyncStatus, detail: &str) -> Event {
-    Event::CloudFileStatus { path: path.into(), status, detail: Some(detail.to_string()), forgettable: true }
+    Event::CloudFileStatus { path: path.into(), status, detail: Some(detail.to_string()), forgettable: true, closed: false }
+}
+
+/// The last status of a file that is no longer open from the cloud.
+fn closed(path: &str, status: SyncStatus, detail: Option<&str>) -> Event {
+    Event::CloudFileStatus { path: path.into(), status, detail: detail.map(str::to_string), forgettable: false, closed: true }
 }
 
 #[test]
@@ -4947,7 +4968,7 @@ fn docx_click_sends_cloud_open_wordcraft() {
     let jpg = h.get_by_role_and_label(Role::Button, "photo.jpg");
     assert!(jpg.accesskit_node().is_disabled());
     assert!(
-        jpg.accesskit_node().description().is_some_and(|d| d.contains("isn't supported for this app yet")),
+        jpg.accesskit_node().description().is_some_and(|d| d.contains("No Craft app opens this kind of file yet")),
         "{:?}",
         jpg.accesskit_node().description()
     );
@@ -5141,10 +5162,10 @@ fn stop_tracking_is_offered_only_when_forgettable_and_asks_first() {
     h.get_by_role_and_label(Role::Button, "Stop tracking").click();
     h.run_steps(3);
     assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudForget { path: "/report.docx".into() }));
-    inbox.borrow_mut().push(status(
+    inbox.borrow_mut().push(closed(
         "/report.docx",
         SyncStatus::ReadOnly,
-        Some("Closed. You stopped tracking this file; your copy is kept at /kept/report.docx"),
+        Some("You stopped tracking this file; your copy is kept at /kept/report.docx"),
     ));
     h.run_steps(3);
     assert!(h.query_by_role_and_label(Role::Button, "Done: report.docx").is_none(), "a closed file leaves the panel");
@@ -5172,7 +5193,7 @@ fn an_expired_sign_in_offers_reconnect() {
     inbox.borrow_mut().push(Event::CloudConnected(cloud_account()));
     open_cloud_page(&mut h);
     let expired = artcraft_launcher_core::cloud::SIGN_IN_EXPIRED.to_string();
-    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Err(expired.clone()) });
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Err(expired.clone()), folder_only: false });
     inbox.borrow_mut().push(Event::CloudError(expired));
     h.run_steps(3);
     let reconnect: Vec<_> = h.query_all_by_role_and_label(Role::Button, "Reconnect").collect();
@@ -5213,9 +5234,208 @@ fn disconnect_with_nothing_open_sends_it_after_confirming() {
     assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudDisconnect));
     // Answers still on their way after disconnecting are dropped.
     inbox.borrow_mut().push(Event::CloudDisconnected);
-    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(vec![cloud_entry("/late.docx", false)]) });
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(vec![cloud_entry("/late.docx", false)]), folder_only: false });
     inbox.borrow_mut().push(status("/late.docx", SyncStatus::Saved, None));
     h.run_steps(3);
     assert!(h.query_by_label("late.docx").is_none());
     h.get_by_role_and_label(Role::TextInput, "Server address");
+}
+
+/// The labels of the page's live regions.
+fn live_labels(h: &Harness<'_, Option<LauncherUi>>) -> Vec<String> {
+    h.query_all(egui_kittest::kittest::by())
+        .filter(|n| n.accesskit_node().live() != egui::accesskit::Live::Off)
+        .map(|n| n.accesskit_node().label().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn a_failed_open_leaves_no_row_behind_and_says_why() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::Opening, None));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("Opening…").next().is_some(), "the open shows while it runs");
+    inbox.borrow_mut().push(closed("/report.docx", SyncStatus::ReadOnly, Some("That file wasn't found in your cloud.")));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("Opening…").next().is_none(), "the row is gone");
+    assert!(h.query_all_by_label_contains("wasn't found in your cloud").next().is_some(), "the reason is shown");
+    h.get_by_role_and_label(Role::Button, "Disconnect").click();
+    h.run_steps(4);
+    let confirm = h.get_all_by_role_and_label(Role::Button, "Disconnect").last().unwrap();
+    assert!(!confirm.accesskit_node().is_disabled(), "nothing is left open to block disconnecting");
+    confirm.click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudDisconnect));
+}
+
+#[test]
+fn a_file_only_the_user_can_settle_offers_stop_tracking() {
+    for state in [SyncStatus::Conflict, SyncStatus::ReconnectNeeded, SyncStatus::CloseInAppFirst] {
+        let (mut h, _, inbox) = connected_with(top_folder());
+        inbox.borrow_mut().push(forgettable("/report.docx", state, "The server refused it."));
+        h.run_steps(3);
+        // A prompt may have opened for it; the row still offers the way out.
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.query_by_label("Stop tracking (keep a local copy): report.docx").is_some(), "{state:?}");
+    }
+}
+
+#[test]
+fn a_file_the_user_cannot_change_opens_read_only() {
+    let mut entry = cloud_entry("/report.docx", false);
+    entry.writable = false;
+    let (mut h, sent, _) = connected_with(vec![entry]);
+    h.get_by_role_and_label(Role::Button, "report.docx").click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudOpen { path: "/report.docx".into(), app: Some("wordcraft".into()), read_only: true }));
+}
+
+#[test]
+fn open_is_off_where_cloud_files_cannot_be_opened() {
+    let (mut h, sent, inbox) = cloud_harness_where(false);
+    inbox.borrow_mut().push(Event::CloudConnected(cloud_account()));
+    open_cloud_page(&mut h);
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(top_folder()), folder_only: false });
+    h.run_steps(3);
+    let row = h.get_by_role_and_label(Role::Button, "report.docx");
+    assert!(row.accesskit_node().is_disabled());
+    assert!(
+        row.accesskit_node().description().is_some_and(|d| d.contains("isn't supported on this system")),
+        "{:?}",
+        row.accesskit_node().description()
+    );
+    row.click();
+    h.run_steps(3);
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::CloudOpen { .. })));
+    h.get_by_role_and_label(Role::Button, "Drafts").click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudList { path: "/Drafts".into() }), "folders still browse");
+}
+
+#[test]
+fn closing_a_read_only_file_is_not_called_saved() {
+    let (mut h, _, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::ReadOnly, None));
+    h.run_steps(3);
+    inbox.borrow_mut().push(closed("/report.docx", SyncStatus::ReadOnly, None));
+    h.run_steps(3);
+    let live = live_labels(&h);
+    assert!(live.iter().any(|l| l.contains("report.docx")), "{live:?}");
+    assert!(!live.iter().any(|l| l.contains("saved to the cloud")), "{live:?}");
+}
+
+#[test]
+fn the_live_region_is_there_before_anything_changes() {
+    let (mut h, _, _) = cloud_harness();
+    open_cloud_page(&mut h);
+    let status = h.query_all_by_role(egui::accesskit::Role::Status).find(|n| n.accesskit_node().live() == egui::accesskit::Live::Polite);
+    assert!(status.is_some(), "an empty polite region waits for the first change");
+}
+
+#[test]
+fn the_same_change_twice_is_read_out_twice() {
+    let (mut h, _, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::WaitingToUpload, None));
+    h.run_steps(3);
+    let first: Vec<_> = live_labels(&h).into_iter().filter(|l| l.contains("report.docx")).collect();
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::WaitingToUpload, None));
+    h.run_steps(3);
+    let second: Vec<_> = live_labels(&h).into_iter().filter(|l| l.contains("report.docx")).collect();
+    assert!(!first.is_empty() && !second.is_empty() && first != second, "the region's text changes: {first:?} {second:?}");
+}
+
+#[test]
+fn a_change_while_on_the_apps_page_is_not_read_out_later() {
+    let (mut h, _, inbox) = cloud_harness();
+    inbox.borrow_mut().push(Event::CloudConnected(cloud_account()));
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::WaitingToUpload, None));
+    h.run_steps(4);
+    open_cloud_page(&mut h);
+    assert!(!live_labels(&h).iter().any(|l| l.contains("report.docx")), "{:?}", live_labels(&h));
+}
+
+#[test]
+fn show_kept_files_is_in_the_account_bar_and_the_disconnect_prompt() {
+    let (mut h, sent, _) = connected_with(top_folder());
+    h.get_by_role_and_label(Role::Button, "Show kept files").click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudRevealKept));
+    h.get_by_role_and_label(Role::Button, "Disconnect").click();
+    h.run_steps(4);
+    let buttons: Vec<_> = h.query_all_by_role_and_label(Role::Button, "Show kept files").collect();
+    assert_eq!(buttons.len(), 2, "also in the prompt");
+    buttons.last().unwrap().click();
+    h.run_steps(3);
+    let reveals = cloud_sent(&sent).iter().filter(|c| **c == Command::CloudRevealKept).count();
+    assert_eq!(reveals, 2);
+}
+
+#[test]
+fn refresh_keeps_focus_where_it_is() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    h.get_by_role_and_label(Role::Button, "Refresh the list").click();
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudList { path: "/".into() }));
+    inbox.borrow_mut().push(Event::CloudListed { path: "/".into(), entries: Ok(top_folder()), folder_only: false });
+    h.run_steps(3);
+    assert!(!h.get_by_role_and_label(Role::Button, "Drafts").is_focused(), "a refresh doesn't move focus to the first row");
+}
+
+#[test]
+fn a_status_that_no_longer_offers_stop_tracking_closes_its_confirm() {
+    let (mut h, _, inbox) = connected_with(top_folder());
+    inbox.borrow_mut().push(forgettable("/report.docx", SyncStatus::ReadOnly, "Changes kept here."));
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "Stop tracking (keep a local copy): report.docx").click();
+    h.run_steps(4);
+    assert!(h.query_by_label("Stop tracking report.docx?").is_some(), "the confirm is open");
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::Saved, None));
+    h.run_steps(4);
+    assert!(h.query_by_label("Stop tracking report.docx?").is_none(), "the out-of-date confirm closed");
+}
+
+#[test]
+fn only_a_failed_sign_in_stops_the_wait() {
+    let (mut h, _, inbox) = cloud_harness();
+    open_cloud_page(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Server address").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Server address").type_text("cloud.example.com");
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Button, "Connect").click();
+    h.run_steps(3);
+    let waiting = |h: &Harness<'_, Option<LauncherUi>>| h.query_all_by_label_contains("Waiting for you to approve").next().is_some();
+    assert!(waiting(&h));
+    inbox.borrow_mut().push(Event::CloudError("Couldn't show the kept files (no file manager).".into()));
+    h.run_steps(3);
+    assert!(waiting(&h), "another action's error doesn't end the sign-in");
+    inbox.borrow_mut().push(Event::CloudConnectFailed("That address doesn't look like a Nextcloud server.".into()));
+    h.run_steps(3);
+    assert!(!waiting(&h));
+    assert!(h.query_all_by_label_contains("doesn't look like a Nextcloud server").next().is_some(), "the reason is shown");
+}
+
+#[test]
+fn search_results_name_the_search_made_and_a_folder_only_fallback() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    h.get_by_role_and_label(Role::TextInput, "Search files").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Search files").type_text("beta");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::CloudSearch { query: "beta".into() }));
+    h.get_by_role_and_label(Role::TextInput, "Search files").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Search files").type_text("x");
+    h.run_steps(2);
+    inbox.borrow_mut().push(Event::CloudListed {
+        path: artcraft_launcher_core::cloud::SEARCH_PATH.into(),
+        entries: Ok(vec![cloud_entry("/beta.pdf", false)]),
+        folder_only: true,
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("Results for “beta”").is_some(), "the label names what was searched");
+    assert!(h.query_by_label("Results in this folder only").is_some());
 }

@@ -7,7 +7,7 @@
 //! Craft app opens yet is shown but can't be opened.
 
 use artcraft_launcher_core::cloud::{
-    CLOSED_DETAIL, CloudAccount, CloudEntry, ConflictChoice, SEARCH_PATH, SHARED_PATH, SIGN_IN_EXPIRED, SyncStatus, app_for, normalize_server,
+    CloudAccount, CloudEntry, ConflictChoice, SEARCH_PATH, SHARED_PATH, SIGN_IN_EXPIRED, SyncStatus, app_for, normalize_server,
 };
 use artcraft_launcher_core::protocol::{Command, Event};
 use egui::{Color32, CornerRadius, FontId, Id, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -53,6 +53,16 @@ pub(crate) struct OpenFile {
 pub(crate) struct Listing {
     pub key: String,
     pub entries: Option<Result<Vec<CloudEntry>, String>>,
+    /// For a search: what was searched for, as submitted (the field may have changed since).
+    pub query: String,
+    /// The server couldn't search, so the results come from the folder listed last only.
+    pub folder_only: bool,
+}
+
+impl Listing {
+    fn asked(key: &str) -> Self {
+        Self { key: key.to_string(), entries: None, query: String::new(), folder_only: false }
+    }
 }
 
 /// The Cloud page's state, fed by the backend's `Event::Cloud*`.
@@ -85,6 +95,9 @@ pub(crate) struct CloudState {
 
 /// How long a change stays in the live region.
 const ANNOUNCE_FOR: f64 = 10.0;
+/// Appended to (or dropped from) an announcement that repeats the one shown, so the live region's
+/// text changes and a screen reader reads it again. It takes no space.
+const REPEAT_MARK: char = '\u{200B}';
 /// Height of one row of the file list.
 const ROW_H: f32 = 40.0;
 
@@ -220,9 +233,21 @@ impl LauncherUi {
         self.caps.manage_apps
     }
 
-    /// Puts `text` in the live region, replacing what was there.
+    /// Puts `text` in the live region, replacing what was there. The region is on the Cloud page:
+    /// a change while another page shows isn't kept to be read out, stale, on a later visit.
     pub(crate) fn announce(&mut self, text: impl Into<String>) {
-        self.cloud.announcement = Some((text.into(), None));
+        if self.page != Page::Cloud {
+            self.cloud.announcement = None;
+            return;
+        }
+        let mut text = text.into();
+        if let Some((shown, _)) = &self.cloud.announcement
+            && shown.trim_end_matches(REPEAT_MARK) == text
+            && !shown.ends_with(REPEAT_MARK)
+        {
+            text.push(REPEAT_MARK);
+        }
+        self.cloud.announcement = Some((text, None));
     }
 
     /// The name of the Craft app `id` (catalog id) as shown.
@@ -262,7 +287,7 @@ impl LauncherUi {
                 self.cloud.form_error = None;
                 self.cloud.view = View::Files;
                 self.cloud.folder = self.start_folder();
-                self.cloud.listing = Some(Listing { key: self.cloud.folder.clone(), entries: None });
+                self.cloud.listing = Some(Listing::asked(&self.cloud.folder));
                 self.send(Command::CloudList { path: self.cloud.folder.clone() });
                 self.announce(text);
             }
@@ -275,21 +300,21 @@ impl LauncherUi {
                 }
                 self.announce(tl!("Disconnected from your cloud."));
             }
-            Event::CloudListed { path, entries } => {
+            Event::CloudListed { path, entries, folder_only } => {
                 if !connected {
                     return;
                 }
-                if let Some(listing) = self.cloud.listing.as_mut().filter(|l| l.key == path) {
-                    if let Err(e) = &entries {
-                        let text = msg(e);
-                        self.cloud.announcement = Some((text, None));
-                    }
-                    listing.entries = Some(entries);
+                let Some(listing) = self.cloud.listing.as_mut().filter(|l| l.key == path) else { return };
+                let failed = entries.as_ref().err().map(|e| msg(e));
+                listing.entries = Some(entries);
+                listing.folder_only = folder_only;
+                if let Some(text) = failed {
+                    self.announce(text);
                 }
             }
-            Event::CloudFileStatus { path, status, detail, forgettable } => {
+            Event::CloudFileStatus { path, status, detail, forgettable, closed } => {
                 if connected {
-                    self.on_file_status(path, status, detail, forgettable);
+                    self.on_file_status(path, status, detail, forgettable, closed);
                 }
             }
             Event::CloudLockedBy { path, by, app } => {
@@ -307,8 +332,10 @@ impl LauncherUi {
                 self.announce(text);
                 self.show_cloud_dialog(Dialog::CloudLocked { path, by, app });
             }
-            Event::CloudError(message) => {
-                // A sign-in ends with CloudConnected or an error: either way it no longer waits.
+            // Any other cloud action failed: a sign-in still waiting goes on waiting.
+            Event::CloudError(message) => self.toast(message, true),
+            Event::CloudConnectFailed(message) => {
+                // A sign-in ends with CloudConnected or this: either way it no longer waits.
                 self.cloud.waiting = false;
                 self.cloud.login_url = None;
                 if !connected {
@@ -321,23 +348,29 @@ impl LauncherUi {
         }
     }
 
-    fn on_file_status(&mut self, path: String, status: SyncStatus, detail: Option<String>, forgettable: bool) {
+    fn on_file_status(&mut self, path: String, status: SyncStatus, detail: Option<String>, forgettable: bool, closed: bool) {
         let name = file_name(&path).to_string();
-        if detail.as_deref().is_some_and(|d| d.starts_with(CLOSED_DETAIL)) {
+        if closed {
             self.cloud.open.retain(|f| f.path != path);
             if self.dialog.as_ref().is_some_and(|d| d.cloud_path() == Some(path.as_str())) {
                 self.dialog = None;
             }
             let text = match detail.as_deref() {
-                Some(d) if d != CLOSED_DETAIL => {
+                Some(d) => {
                     let note = format!("{name}: {}", msg(d));
                     self.cloud.closed.push(note.clone());
                     note
                 }
-                _ => fmt(tl!("{name} is saved to the cloud and closed."), &[("name", &name)]),
+                // Only an editable file whose changes went up is called saved.
+                None if status == SyncStatus::Saved => fmt(tl!("{name} is saved to the cloud and closed."), &[("name", &name)]),
+                None => fmt(tl!("{name} is closed."), &[("name", &name)]),
             };
             self.announce(text);
             return;
+        }
+        // Stop tracking is no longer the way out: its confirm is out of date.
+        if !forgettable && matches!(&self.dialog, Some(Dialog::CloudForget(p)) if *p == path) {
+            self.dialog = None;
         }
         let i = match self.cloud.open.iter().position(|f| f.path == path) {
             Some(i) => i,
@@ -371,26 +404,27 @@ impl LauncherUi {
         }
     }
 
-    /// Asks for the folder `path` and shows it.
-    fn go_to_folder(&mut self, path: &str) {
+    /// Asks for the folder `path` and shows it. `moved`: the user went there (not a refresh), so
+    /// focus goes to its first row once it is listed.
+    fn go_to_folder(&mut self, path: &str, moved: bool) {
         self.cloud.view = View::Files;
         self.cloud.folder = path.to_string();
         self.settings.cloud_folder = path.to_string();
-        self.cloud.listing = Some(Listing { key: path.to_string(), entries: None });
-        self.cloud.focus_first_row = true;
+        self.cloud.listing = Some(Listing::asked(path));
+        self.cloud.focus_first_row |= moved;
         self.act_command(Command::CloudList { path: path.to_string() });
     }
 
-    /// Shows `view`, asking the backend for what it lists.
-    fn show_view(&mut self, view: View) {
+    /// Shows `view`, asking the backend for what it lists. `moved` as for [`Self::go_to_folder`].
+    fn show_view(&mut self, view: View, moved: bool) {
         match view {
             View::Files => {
                 let folder = if self.cloud.folder.is_empty() { "/".to_string() } else { self.cloud.folder.clone() };
-                self.go_to_folder(&folder);
+                self.go_to_folder(&folder, moved);
             }
             View::Shared => {
                 self.cloud.view = View::Shared;
-                self.cloud.listing = Some(Listing { key: SHARED_PATH.to_string(), entries: None });
+                self.cloud.listing = Some(Listing::asked(SHARED_PATH));
                 self.act_command(Command::CloudShared);
             }
             View::Recent => {
@@ -408,7 +442,7 @@ impl LauncherUi {
             return;
         }
         self.cloud.view = View::Search;
-        self.cloud.listing = Some(Listing { key: SEARCH_PATH.to_string(), entries: None });
+        self.cloud.listing = Some(Listing { query: query.clone(), ..Listing::asked(SEARCH_PATH) });
         self.act_command(Command::CloudSearch { query });
     }
 
@@ -445,7 +479,9 @@ impl LauncherUi {
     }
 
     /// One line at the top of the page that says what just changed, also read out by screen
-    /// readers (a polite live region). Its height is always kept, so nothing jumps.
+    /// readers (a polite live region). The region is always there, empty when nothing changed,
+    /// so a screen reader is watching it before the first change; its height is always kept, so
+    /// nothing jumps.
     fn cloud_live_line(&mut self, ui: &mut Ui, t: &Tokens) {
         let now = ui.input(|i| i.time);
         if let Some((_, until)) = &mut self.cloud.announcement {
@@ -456,21 +492,20 @@ impl LauncherUi {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
         }
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-        if let Some((text, _)) = &self.cloud.announcement {
-            let text = text.clone();
-            let line = egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center));
-            let resp = ui.scope_builder(line, |ui| ui.add(egui::Label::new(RichText::new(&text).size(12.0).color(t.muted)).truncate())).inner;
-            live_region(ui, resp.id, &text);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        let text = self.cloud.announcement.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        if !text.is_empty() {
+            paint_cut(ui, rect.left(), rect.center().y, rect.width(), &text, FontId::new(12.0, theme::medium()), t.muted);
         }
+        live_region(ui, resp.id, &text);
     }
 
-    /// Connect to cloud: the server address and the sign-in in the browser.
+    /// Connect to your Nextcloud server: the server address and the sign-in in the browser.
     fn connect_form(&mut self, ui: &mut Ui, t: &Tokens) {
         ui.add_space(16.0);
-        ui.label(widgets::heading(tl!("Connect to cloud"), theme::SHEET_TITLE, t.ink_strong));
+        ui.label(widgets::heading(tl!("Connect to your Nextcloud server"), theme::SHEET_TITLE, t.ink_strong));
         ui.add_space(6.0);
-        ui.label(RichText::new(tl!("Open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced.")).color(t.muted));
+        ui.label(RichText::new(tl!("Cloud files: open your Nextcloud files in the Craft apps. Saves go back to your server, and a newer version saved by someone else is never replaced without asking you.")).color(t.muted));
         ui.add_space(18.0);
         if self.cloud.waiting {
             self.sign_in_waiting(ui, t);
@@ -551,6 +586,7 @@ impl LauncherUi {
                 if widgets::button(ui, tl!("Disconnect"), Kind::Secondary, 0.0).clicked() {
                     self.show_cloud_dialog(Dialog::CloudDisconnect);
                 }
+                self.show_kept_button(ui);
                 if !self.cloud.waiting
                     && widgets::button(ui, tl!("Reconnect"), Kind::Secondary, 0.0).on_hover_text(tl!("Sign in to this server again")).clicked()
                 {
@@ -558,6 +594,16 @@ impl LauncherUi {
                 }
             });
         });
+    }
+
+    /// Show kept files: the folder of copies the launcher kept on this computer, in the file manager.
+    fn show_kept_button(&mut self, ui: &mut Ui) {
+        if widgets::button(ui, tl!("Show kept files"), Kind::Secondary, 0.0)
+            .on_hover_text(tl!("Backups and copies kept when you stopped tracking a file, on this computer"))
+            .clicked()
+        {
+            self.act_command(Command::CloudRevealKept);
+        }
     }
 
     /// Files | Shared with me | Recent, the breadcrumbs, the search field and Refresh.
@@ -570,17 +616,17 @@ impl LauncherUi {
                 (View::Recent, widgets::Cell { label: tl!("Recent"), tip: tl!("Files you opened from the launcher"), count: None }),
             ];
             if widgets::cells(ui, &mut chosen, &options) {
-                self.show_view(chosen);
+                self.show_view(chosen, true);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let loading = self.cloud.listing.as_ref().is_some_and(|l| l.entries.is_none());
                 if crate::bar::refresh_button(ui, tl!("Refresh the list"), loading).clicked() {
-                    self.show_view(self.cloud.view);
+                    self.refresh();
                 }
                 ui.add_space(4.0);
                 if self.cloud.view == View::Search && widgets::glyph_button(ui, widgets::Glyph::Close, tl!("Clear search")).clicked() {
                     self.cloud.query.clear();
-                    self.show_view(View::Files);
+                    self.show_view(View::Files, true);
                 }
                 let field = ui
                     .add(
@@ -607,10 +653,29 @@ impl LauncherUi {
                 widgets::hud(ui, tl!("Opened from the launcher, newest first"), t.muted);
             }
             View::Search => {
-                let text = fmt(tl!("Results for “{query}”"), &[("query", self.cloud.query.trim())]);
+                let (query, folder_only) = self.cloud.listing.as_ref().map_or((String::new(), false), |l| (l.query.clone(), l.folder_only));
+                let text = fmt(tl!("Results for “{query}”"), &[("query", &query)]);
                 widgets::hud(ui, &text, t.muted);
+                if folder_only {
+                    widgets::hud(ui, " · ", t.faint);
+                    widgets::hud(ui, tl!("Results in this folder only"), t.ink)
+                        .on_hover_text(tl!("Your server couldn't search, so only the folder shown last was searched"));
+                }
             }
         });
+    }
+
+    /// Asks again for what the page shows, keeping focus where it is.
+    fn refresh(&mut self) {
+        if self.cloud.view == View::Search {
+            // The search that is shown, not what the field holds now.
+            if let Some(query) = self.cloud.listing.as_ref().map(|l| l.query.clone()).filter(|q| !q.is_empty()) {
+                self.cloud.listing = Some(Listing { query: query.clone(), ..Listing::asked(SEARCH_PATH) });
+                self.act_command(Command::CloudSearch { query });
+            }
+            return;
+        }
+        self.show_view(self.cloud.view, false);
     }
 
     fn breadcrumbs(&mut self, ui: &mut Ui, t: &Tokens) {
@@ -627,7 +692,7 @@ impl LauncherUi {
             }
         }
         if let Some(path) = go {
-            self.go_to_folder(&path);
+            self.go_to_folder(&path, true);
         }
     }
 
@@ -656,7 +721,7 @@ impl LauncherUi {
                         self.reconnect();
                     }
                 } else if widgets::button(ui, tl!("Try again"), Kind::Secondary, 0.0).clicked() {
-                    self.show_view(self.cloud.view);
+                    self.refresh();
                 }
                 return;
             }
@@ -707,7 +772,8 @@ impl LauncherUi {
     fn entry_row(&mut self, ui: &mut Ui, t: &Tokens, entry: &CloudEntry, recent: bool) -> Option<Id> {
         let app = (!entry.is_dir).then(|| app_for(&entry.name)).flatten();
         let installed = app.is_some_and(|a| self.is_installed(a));
-        let openable = entry.is_dir || installed;
+        let opens_here = self.caps.open_cloud_files;
+        let openable = entry.is_dir || (installed && opens_here);
         let app_name = app.map(|a| self.app_name(a));
         let kind_text = if entry.is_dir {
             tl!("Folder").to_string()
@@ -728,6 +794,9 @@ impl LauncherUi {
         if entry.shared {
             marks.push(tl!("Shared").to_string());
         }
+        if !entry.is_dir && !entry.writable {
+            marks.push(tl!("Read-only").to_string());
+        }
         if let Some(by) = &entry.locked_by {
             marks.push(if entry.lock_by_app {
                 tl!("Locked by an app").to_string()
@@ -741,8 +810,10 @@ impl LauncherUi {
         facts.extend([size.clone(), when.clone()].into_iter().filter(|s| !s.is_empty()));
         facts.extend(marks.iter().cloned());
         let why_not = match (entry.is_dir, app, installed) {
-            (true, _, _) | (false, Some(_), true) => None,
-            (false, None, _) => Some(tl!("Opening from the cloud isn't supported for this app yet.").to_string()),
+            (true, _, _) => None,
+            (false, None, _) => Some(tl!("No Craft app opens this kind of file yet.").to_string()),
+            (false, Some(_), true) if opens_here => None,
+            (false, Some(_), true) => Some(tl!("Opening files from the cloud isn't supported on this system yet.").to_string()),
             (false, Some(_), false) => {
                 Some(fmt(tl!("{app} isn't installed. Install it to open this file."), &[("app", app_name.as_deref().unwrap_or_default())]))
             }
@@ -808,9 +879,10 @@ impl LauncherUi {
         }
         if resp.clicked() {
             if entry.is_dir {
-                self.go_to_folder(&entry.path);
+                self.go_to_folder(&entry.path, true);
             } else if let Some(app) = app {
-                self.open_entry(entry, app, false);
+                // A file this user may not change opens read-only: its saves would be refused.
+                self.open_entry(entry, app, !entry.writable);
             }
         }
         Some(resp.id)
@@ -857,6 +929,7 @@ impl LauncherUi {
                 shared: false,
                 locked_by: None,
                 lock_by_app: false,
+                writable: true,
             };
             let (icon, _) = ui.allocate_exact_size(vec2(24.0, theme::CONTROL_H), Sense::hover());
             let color = app.and_then(|a| self.entry(a)).map_or(t.muted, |e| t.app_ink(e.app));
@@ -913,24 +986,25 @@ impl LauncherUi {
                     self.reconnect();
                 }
             }
-            SyncStatus::Opening | SyncStatus::Uploading => {}
+            SyncStatus::Opening | SyncStatus::Uploading => return,
             SyncStatus::Saved | SyncStatus::WaitingToUpload | SyncStatus::ReadOnly => {
                 let label = tl!("Done");
                 if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)
-                    .on_hover_text(tl!("Uploads what is left, then closes the file here"))
+                    .on_hover_text(tl!("Close the document in its app first. Done uploads what's left and stops syncing the file."))
                     .clicked()
                 {
                     self.act_command(Command::CloudDone { path: file.path.clone() });
                 }
-                if file.forgettable {
-                    let label = tl!("Stop tracking (keep a local copy)");
-                    if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)
-                        .on_hover_text(tl!("Stops saving this file to the cloud; your copy moves to the kept folder on this computer"))
-                        .clicked()
-                    {
-                        self.show_cloud_dialog(Dialog::CloudForget(file.path.clone()));
-                    }
-                }
+            }
+        }
+        // The way out when Done can't close it, offered only when the backend says so.
+        if file.forgettable {
+            let label = tl!("Stop tracking (keep a local copy)");
+            if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)
+                .on_hover_text(tl!("Stops saving this file to the cloud; your copy moves to the kept folder on this computer"))
+                .clicked()
+            {
+                self.show_cloud_dialog(Dialog::CloudForget(file.path.clone()));
             }
         }
     }
@@ -1104,7 +1178,7 @@ impl LauncherUi {
         let name = file_name(path);
         Self::prompt_title(ui, &t, &fmt(tl!("Stop tracking {name}?"), &[("name", name)]));
         let warning = tl!(
-            "Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done."
+            "Your changes aren't in Nextcloud. They'll only be kept in the launcher's kept folder on this computer; the launcher says where once it's done, and Show kept files opens that folder."
         );
         ui.add(egui::Label::new(RichText::new(warning).color(t.ink)).wrap());
         ui.add_space(6.0);
@@ -1138,7 +1212,7 @@ impl LauncherUi {
         if open.is_empty() {
             ui.add(
                 egui::Label::new(
-                    RichText::new(tl!("The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first; nothing in the cloud changes."))
+                    RichText::new(tl!("The launcher forgets this sign-in and clears its downloaded copies. Anything left there is moved to the kept folder on this computer first (Show kept files opens it); nothing in the cloud changes."))
                         .color(t.muted),
                 )
                 .wrap(),
@@ -1146,7 +1220,7 @@ impl LauncherUi {
         } else {
             ui.add(
                 egui::Label::new(
-                    RichText::new(tl!("These files are still open from the cloud. Choose Done on each one (or Stop tracking) first:")).color(t.muted),
+                    RichText::new(tl!("These files are still open from the cloud. Close each one first with the button its row offers: Done, Choose a version, Reconnect or Stop tracking.")).color(t.muted),
                 )
                 .wrap(),
             );
@@ -1163,6 +1237,7 @@ impl LauncherUi {
             let cancel = widgets::button(ui, tl!("Cancel"), Kind::Secondary, 0.0);
             self.focus_default(&cancel);
             close |= cancel.clicked();
+            self.show_kept_button(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let allowed = open.is_empty();
                 let resp = ui.add_enabled_ui(allowed, |ui| widgets::button(ui, tl!("Disconnect"), Kind::Danger, 0.0)).inner;

@@ -205,7 +205,11 @@ impl LauncherUi {
                             ),
                             (
                                 crate::cloud::Page::Cloud,
-                                widgets::Cell { label: tl!("Cloud"), tip: tl!("Open and save your files in the cloud"), count: None },
+                                widgets::Cell {
+                                    label: tl!("Cloud"),
+                                    tip: tl!("Cloud files: open and save your Nextcloud files in the Craft apps"),
+                                    count: None,
+                                },
                             ),
                         ];
                         widgets::cells(ui, &mut self.page, &options);
