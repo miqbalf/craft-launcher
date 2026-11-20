@@ -207,6 +207,12 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Ok(_) => {}
             Err(e) => return self.emit(Event::CloudError(format!("Couldn't read the list of open cloud files ({e}), so nothing was removed."))),
         }
+        // Nothing the server may not have is deleted: whatever is still in the cache is kept.
+        if let Err(e) = self.sweep_cache(&id) {
+            return self.emit(Event::CloudError(format!(
+                "Couldn't keep a file left among the downloaded copies, so nothing was removed and you're still connected: {e}"
+            )));
+        }
         let mut failed = Vec::new();
         if let Err(e) = self.tokens.remove(&token_handle(&record.server, &record.login)) {
             failed.push(format!("the saved sign-in ({e})"));

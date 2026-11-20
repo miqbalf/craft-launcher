@@ -513,13 +513,48 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             match self.keep(&account.id, &key, &c.local, "saved after closing") {
                 Ok(at) => format!("Closed. A save made while it was closing wasn't uploaded; it is kept at {}", at.display()),
                 Err(e) => {
-                    format!("Closed. A save made while it was closing wasn't uploaded and couldn't be kept ({e}); it is at {}", c.local.display())
+                    // It can't be moved aside, so it stays open: watched and uploaded like any
+                    // other save (If-Match still guards it), and Disconnect still refuses.
+                    book.list.push(Checkout { lock: None, status: SyncStatus::WaitingToUpload, ..c });
+                    self.save_book(book);
+                    return self.status(
+                        &key,
+                        SyncStatus::WaitingToUpload,
+                        Some(format!("A save made while the file was closing couldn't be moved aside ({e}), so the file stays open and that save will be uploaded.")),
+                    );
                 }
             }
         } else {
             CLOSED_DETAIL.to_string()
         };
         self.status(&key, SyncStatus::Saved, Some(detail));
+    }
+
+    /// Moves every regular file still in `account`'s cache to the kept folder, so removing the
+    /// cache deletes no user bytes. Symlinks are skipped, never followed. Stops at the first file
+    /// that can't be moved, and says which.
+    pub(super) fn sweep_cache(&self, account: &str) -> Result<(), String> {
+        let cache = self.cache_dir(account)?;
+        // Missing, or a link (removed as a link, never followed): nothing of ours inside.
+        if !std::fs::symlink_metadata(&cache).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        let mut pending = vec![cache.clone()];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| format!("{} couldn't be read ({e})", dir.display()))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                if meta.is_dir() {
+                    pending.push(path);
+                } else if meta.is_file() {
+                    let relative = path.strip_prefix(&cache).map_err(|_| format!("{} is outside the cache", path.display()))?;
+                    let server: String = relative.components().map(|c| format!("/{}", c.as_os_str().to_string_lossy())).collect();
+                    self.keep(account, &server, &path, "left in cache").map_err(|e| format!("{} ({e})", path.display()))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Removes a fully synced working copy, unless a save lands while it is removed: it is first
@@ -564,7 +599,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 
     /// Moves `local` (a file of `account`'s `path`) to where kept copies live, outside the
     /// account's cache. Returns where it went.
-    fn keep(&self, account: &str, path: &str, local: &Path, label: &str) -> Result<PathBuf, String> {
+    pub(super) fn keep(&self, account: &str, path: &str, local: &Path, label: &str) -> Result<PathBuf, String> {
         let root = self.cache_dir(account).map(|_| self.paths.cloud_root().join("kept").join(account))?;
         let at = checkout::kept_place(&root, path, label)?;
         std::fs::rename(local, &at).map_err(|e| e.to_string())?;

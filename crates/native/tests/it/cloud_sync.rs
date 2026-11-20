@@ -757,3 +757,54 @@ fn connecting_another_account_is_refused_while_files_are_open() {
     rig.settle();
     assert_eq!(dav.remote(FILE).unwrap(), b"still alice's file");
 }
+
+fn cache_file(rig: &Rig, relative: &str) -> PathBuf {
+    rig.paths.cloud_root().join(accounts::handle(SERVER, "alice")).join(relative)
+}
+
+#[test]
+fn disconnect_moves_stray_cache_files_to_kept() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let stray = cache_file(&rig, "Docs/stray.docx");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"untracked bytes").unwrap();
+    rig.service.disconnect();
+    assert!(disconnected(&rig), "{:?}", rig.events());
+    assert!(!stray.exists());
+    assert_eq!(kept_with(&rig, b"untracked bytes").len(), 1, "the stray file is kept, bytes intact");
+}
+
+#[test]
+fn disconnect_refuses_when_a_stray_file_cannot_be_kept() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let stray = cache_file(&rig, "Docs/stray.docx");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"untracked bytes").unwrap();
+    // A file where the account's kept folder must go: nothing can be kept.
+    let kept = rig.paths.cloud_root().join("kept");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join(accounts::handle(SERVER, "alice")), b"in the way").unwrap();
+
+    rig.service.disconnect();
+    assert!(!disconnected(&rig), "{:?}", rig.events());
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(m) if m.contains("stray.docx"))), "{:?}", rig.events());
+    assert_eq!(std::fs::read(&stray).unwrap(), b"untracked bytes");
+    assert!(rig.service.account().is_some(), "still connected");
+}
+
+#[test]
+fn done_keeps_watching_a_late_save_it_cannot_move_aside() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    let rig = rig(dav.clone());
+    let local = rig.open(FILE);
+    let kept = rig.paths.cloud_root().join("kept");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join(accounts::handle(SERVER, "alice")), b"in the way").unwrap();
+    let late = local.clone();
+    dav.during_unlock(move || std::fs::write(&late, b"saved during unlock").unwrap());
+    rig.service.done(FILE);
+    assert_ne!(rig.status(FILE), Some(SyncStatus::Saved), "not shown as safely saved");
+    rig.advance(Duration::from_secs(60));
+    rig.settle();
+    assert_eq!(dav.remote(FILE).unwrap(), b"saved during unlock", "the late save is uploaded after all");
+}
