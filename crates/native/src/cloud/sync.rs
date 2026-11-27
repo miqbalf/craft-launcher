@@ -115,7 +115,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         Some(guard)
     }
 
-    fn error(&self, message: impl Into<String>) {
+    pub(super) fn error(&self, message: impl Into<String>) {
         self.emit(Event::CloudError(message.into()));
     }
 
