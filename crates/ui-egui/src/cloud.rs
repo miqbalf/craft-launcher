@@ -122,6 +122,7 @@ pub(crate) fn status_label(status: SyncStatus) -> &'static str {
         SyncStatus::Conflict => tl!("Conflict"),
         SyncStatus::ReadOnly => tl!("Read-only"),
         SyncStatus::CloseInAppFirst => tl!("Close it in the app first"),
+        SyncStatus::Live => tl!("Live"),
     }
 }
 
@@ -930,6 +931,7 @@ impl LauncherUi {
                 locked_by: None,
                 lock_by_app: false,
                 writable: true,
+                file_id: None,
             };
             let (icon, _) = ui.allocate_exact_size(vec2(24.0, theme::CONTROL_H), Sense::hover());
             let color = app.and_then(|a| self.entry(a)).map_or(t.muted, |e| t.app_ink(e.app));
@@ -942,7 +944,7 @@ impl LauncherUi {
             }
             ui.add_space(14.0);
             let tone = match file.status {
-                SyncStatus::Saved => t.good,
+                SyncStatus::Saved | SyncStatus::Live => t.good,
                 SyncStatus::Conflict | SyncStatus::ReconnectNeeded => t.bad,
                 SyncStatus::WaitingToUpload | SyncStatus::CloseInAppFirst | SyncStatus::ReadOnly => t.warn,
                 SyncStatus::Opening | SyncStatus::Uploading => t.accent_ink,
@@ -986,7 +988,8 @@ impl LauncherUi {
                     self.reconnect();
                 }
             }
-            SyncStatus::Opening | SyncStatus::Uploading => return,
+            // A live file is saved by the server and closes with its app: nothing to press.
+            SyncStatus::Opening | SyncStatus::Uploading | SyncStatus::Live => return,
             SyncStatus::Saved | SyncStatus::WaitingToUpload | SyncStatus::ReadOnly => {
                 let label = tl!("Done");
                 if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)

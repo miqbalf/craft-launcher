@@ -118,6 +118,8 @@ pub(super) struct Book {
     pub list: Vec<Checkout>,
     /// Keyed by [`rt_key`]: two accounts may have the same path open.
     pub runtime: HashMap<(String, String), Runtime>,
+    /// The files open for live editing. Not saved: their apps can't be followed across a restart.
+    pub live: Vec<super::live::LiveSession>,
 }
 
 impl Book {
@@ -129,7 +131,7 @@ impl Book {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(format!("couldn't read {} ({e})", file.display())),
         };
-        Ok(Self { file, list, runtime: HashMap::new() })
+        Ok(Self { file, list, runtime: HashMap::new(), live: Vec::new() })
     }
 
     /// Writes the book atomically (a private temporary file renamed into place, mode 0600).
@@ -148,13 +150,14 @@ impl Book {
         self.list.iter().position(|c| c.account == account && c.path == path)
     }
 
+    /// Whether a file of `account` is open, checked out or live.
     pub fn has_account(&self, account: &str) -> bool {
-        self.list.iter().any(|c| c.account == account)
+        self.list.iter().any(|c| c.account == account) || self.live.iter().any(|l| l.account == account)
     }
 
     /// Whether a file of an account other than `account` is open.
     pub fn has_other_than(&self, account: &str) -> bool {
-        self.list.iter().any(|c| c.account != account)
+        self.list.iter().any(|c| c.account != account) || self.live.iter().any(|l| l.account != account)
     }
 
     /// Whether `local` would be the same file on disk as some checkout's working copy.

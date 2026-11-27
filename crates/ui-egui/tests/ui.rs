@@ -4854,6 +4854,7 @@ fn cloud_entry(path: &str, is_dir: bool) -> CloudEntry {
         locked_by: None,
         lock_by_app: false,
         writable: true,
+        file_id: None,
     }
 }
 
@@ -5438,4 +5439,19 @@ fn search_results_name_the_search_made_and_a_folder_only_fallback() {
     h.run_steps(3);
     assert!(h.query_by_label("Results for “beta”").is_some(), "the label names what was searched");
     assert!(h.query_by_label("Results in this folder only").is_some());
+}
+
+#[test]
+fn a_live_file_shows_live_with_nothing_to_press_until_its_app_closes() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    let detail = "Open live in WordCraft: changes are saved to the cloud as you type, and others' changes show as they make them.";
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::Live, Some(detail)));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("Live").next().is_some(), "the row says it is live");
+    assert!(h.query_all_by_label_contains("saved to the cloud as you type").next().is_some(), "and how it saves");
+    assert!(h.query_by_role_and_label(Role::Button, "Done: report.docx").is_none(), "the server saves: there is nothing to upload or close");
+    inbox.borrow_mut().push(closed("/report.docx", SyncStatus::Live, Some("The live session ended when the app closed.")));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("live session ended").next().is_some(), "the end is said");
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::CloudDone { .. })));
 }

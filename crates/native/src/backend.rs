@@ -264,6 +264,19 @@ fn open_in_app(shared: &Shared, app: &str, file: &std::path::Path) -> Result<(),
     install::open_file(def, &installed, file)
 }
 
+/// Starts the installed catalog app `app` for a live session of the cloud file `file`.
+fn open_live_in_app(
+    shared: &Shared,
+    app: &str,
+    session: &std::path::Path,
+    file: &std::path::Path,
+) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let def = CraftApp::by_id(app).ok_or_else(|| "Live editing isn't supported for this app yet.".to_string())?;
+    let installed = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app).cloned();
+    let installed = installed.ok_or_else(|| format!("{} isn't installed. Install it from the Apps page, then open the file again.", def.name))?;
+    install::open_live(def, &installed, session, file)
+}
+
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
@@ -319,10 +332,11 @@ impl NativeBackend {
             std::thread::spawn(work);
         });
         let cloud = http.as_ref().map(|h| {
-            let (sink, apps) = (shared.clone(), shared.clone());
+            let (sink, apps, live_apps) = (shared.clone(), shared.clone(), shared.clone());
             Arc::new(
                 CloudService::new(&paths, craft_suite_account::Keychain, Transport::new(h), move |event| sink.emit(event))
-                    .with_launcher(move |app, file| open_in_app(&apps, app, file)),
+                    .with_launcher(move |app, file| open_in_app(&apps, app, file))
+                    .with_live_launcher(move |app, session, file| open_live_in_app(&live_apps, app, session, file)),
             )
         });
         if let Some(cloud) = &cloud {

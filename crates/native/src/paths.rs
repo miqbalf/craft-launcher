@@ -58,6 +58,12 @@ impl Paths {
         self.data.join("cloud")
     }
 
+    /// Live editing sessions: a session file per open file (`<id>.json`) and a folder holding
+    /// its working copy (`<id>/`): `<data>/live`.
+    pub fn live_root(&self) -> PathBuf {
+        self.data.join("live")
+    }
+
     pub fn manifest(&self) -> PathBuf {
         self.data.join("installed.json")
     }

@@ -71,7 +71,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             display: record.display,
         };
         let dav = DavAccount::new(record.server, record.login, token.expose());
-        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: cloud.clone(), dav });
+        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: cloud.clone(), dav, password: token });
         Some(cloud)
     }
 
@@ -197,7 +197,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
         let account = CloudAccount { id: handle(base, login), server: base.to_string(), login: login.to_string(), display: login.to_string() };
         let dav = DavAccount::new(base, login, password);
-        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(Session { account: account.clone(), dav });
+        *self.session.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Session { account: account.clone(), dav, password: Secret::new(password) });
         self.forget_listings();
         Ok(account)
     }

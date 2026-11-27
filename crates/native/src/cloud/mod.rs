@@ -12,10 +12,13 @@
 
 mod account;
 mod checkout;
+mod live;
 mod sync;
 pub mod transport;
 
-use std::collections::HashSet;
+pub use live::{LiveProcess, SESSION_VERSION, TICKET_PATH, relay_address, relay_reachable, resolve_relay};
+
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError};
@@ -25,7 +28,7 @@ use artcraft_launcher_core::cloud::{CloudAccount, CloudEntry};
 use artcraft_launcher_core::protocol::Event;
 use craft_nextcloud::http::Http;
 use craft_nextcloud::{Account as DavAccount, Error as DavError, dav};
-use craft_suite_account::TokenStore;
+use craft_suite_account::{Secret, TokenStore};
 
 use crate::paths::Paths;
 
@@ -42,6 +45,10 @@ type Opener = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 type Launcher = Box<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 type WallClock = Box<dyn Fn() -> jiff::Timestamp + Send + Sync>;
+/// Starts an app for a live session: `(app id, session file, working copy)`.
+type LiveLauncher = Box<dyn Fn(&str, &Path, &Path) -> Result<Box<dyn LiveProcess>, String> + Send + Sync>;
+/// Whether a relay URL accepts connections.
+type RelayProbe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 /// Shows a folder in the file manager.
 type Revealer = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
@@ -49,6 +56,8 @@ type Revealer = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 struct Session {
     account: CloudAccount,
     dav: DavAccount,
+    /// The app password, for the calls `craft-nextcloud` doesn't make (the live ticket).
+    password: Secret,
 }
 
 /// The cloud connection of this launcher.
@@ -76,6 +85,10 @@ pub struct CloudService<S: TokenStore, H: Http> {
     before_book: Box<dyn Fn() + Send + Sync>,
     /// Paths the last listings showed as not writable for this user: they open read-only.
     not_writable: Mutex<HashSet<String>>,
+    /// The server's file ids of the paths the last listings showed, which live tickets name.
+    file_ids: Mutex<HashMap<String, u64>>,
+    live_launcher: LiveLauncher,
+    relay_probe: RelayProbe,
     /// The open files. `None` until first read from disk. Held for the whole of each sync step, so
     /// an open, a poll, a Done, a resolve and a disconnect never interleave on one file.
     book: Mutex<Option<checkout::Book>>,
@@ -106,6 +119,9 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             reveal: Box::new(crate::process::reveal),
             before_book: Box::new(|| {}),
             not_writable: Mutex::new(HashSet::new()),
+            file_ids: Mutex::new(HashMap::new()),
+            live_launcher: Box::new(|_, _, _| Err("Live editing isn't supported on this system yet".to_string())),
+            relay_probe: Box::new(relay_reachable),
             book: Mutex::new(None),
         }
     }
@@ -142,6 +158,21 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self
     }
 
+    /// Replaces how an app is started for a live session (the backend starts installed apps
+    /// with `--live-session`; tests record the call and say when the app quits).
+    #[must_use]
+    pub fn with_live_launcher(mut self, launch: impl Fn(&str, &Path, &Path) -> Result<Box<dyn LiveProcess>, String> + Send + Sync + 'static) -> Self {
+        self.live_launcher = Box::new(launch);
+        self
+    }
+
+    /// Replaces the check that a live session's relay can be reached (tests answer it).
+    #[must_use]
+    pub fn with_relay_probe(mut self, probe: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.relay_probe = Box::new(probe);
+        self
+    }
+
     /// Replaces the clock the watcher's waits are measured with (tests move it by hand).
     #[must_use]
     pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
@@ -156,7 +187,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self
     }
 
-    /// Replaces how often and how long a sign-in waits for the browser.
+    /// Replaces how often and how long a sign-in waits for the browser. `poll_every` is also the
+    /// wait before a live ticket the server called busy (503) is asked for again.
     #[must_use]
     pub fn with_timing(mut self, poll_every: Duration, give_up_after: Duration) -> Self {
         self.poll_every = poll_every;
@@ -213,8 +245,29 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self.not_writable.lock().unwrap_or_else(PoisonError::into_inner).contains(path)
     }
 
-    /// Remembers which of `entries` this user may not change.
+    /// The server's id of `path`, as the last listings gave it.
+    fn listed_file_id(&self, path: &str) -> Option<u64> {
+        self.file_ids.lock().unwrap_or_else(PoisonError::into_inner).get(path).copied()
+    }
+
+    /// The server, login and app password of the connected account.
+    fn session_credentials(&self) -> Option<(String, String, Secret)> {
+        self.account()?;
+        let session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        session.as_ref().map(|s| (s.account.server.clone(), s.account.login.clone(), s.password.clone()))
+    }
+
+    /// Remembers which of `entries` this user may not change, and their file ids.
     fn note_writable(&self, entries: &[CloudEntry]) {
+        {
+            let mut ids = self.file_ids.lock().unwrap_or_else(PoisonError::into_inner);
+            for e in entries.iter().filter(|e| !e.is_dir) {
+                match e.file_id {
+                    Some(id) => ids.insert(e.path.clone(), id),
+                    None => ids.remove(&e.path),
+                };
+            }
+        }
         let mut set = self.not_writable.lock().unwrap_or_else(PoisonError::into_inner);
         for e in entries.iter().filter(|e| !e.is_dir) {
             if e.writable {
@@ -229,6 +282,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     fn forget_listings(&self) {
         *self.last_listed.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.not_writable.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.file_ids.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
 
     /// The lock holder the last folder listing showed for `path`: `(name, held by an app)`. The
@@ -314,6 +368,8 @@ fn entry(e: craft_cloud::Entry) -> CloudEntry {
         locked_by: e.lock.as_ref().map(|l| l.name.clone().or_else(|| l.id.clone()).unwrap_or_default()),
         lock_by_app: e.lock.as_ref().is_some_and(|l| l.app),
         writable: e.writable,
+        // Nextcloud gives `oc:fileid` (or a share's `item_source`) as the room; a path fallback is no id.
+        file_id: e.room.parse().ok(),
     }
 }
 
