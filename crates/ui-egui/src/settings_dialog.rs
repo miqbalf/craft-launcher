@@ -54,13 +54,13 @@ impl LauncherUi {
         ui.set_max_height(size.y);
         let hero_h = sheet::hero(
             ui,
-            Some(crate::icons::artcraft_mark()),
+            Some(crate::icons::udincraft_mark()),
             tl!("Settings"),
-            &format!("ArtCraft Launcher {}", env!("CARGO_PKG_VERSION")),
+            &format!("udinCraft Launcher {}", env!("CARGO_PKG_VERSION")),
             |_| {},
         );
 
-        let quit_width = widgets::button_width(ui, tl!("Quit ArtCraft Launcher"), 0.0);
+        let quit_width = widgets::button_width(ui, tl!("Quit udinCraft Launcher"), 0.0);
         let done_width = widgets::button_width(ui, tl!("Done"), 90.0);
         let stack_actions = self.caps.manage_apps && quit_width + done_width + ui.spacing().item_spacing.x + 48.0 > size.x;
         let footer_h = if stack_actions { 2.0 * theme::CONTROL_H + ui.spacing().item_spacing.y } else { theme::CONTROL_H } + 32.0;
@@ -82,7 +82,7 @@ impl LauncherUi {
         egui::Frame::new().inner_margin(egui::Margin::symmetric(theme::PAD as i8, 16)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             let quit = |ui: &mut Ui, host: &mut dyn Host| {
-                if self.caps.manage_apps && widgets::button(ui, tl!("Quit ArtCraft Launcher"), Kind::Secondary, 0.0).clicked() {
+                if self.caps.manage_apps && widgets::button(ui, tl!("Quit udinCraft Launcher"), Kind::Secondary, 0.0).clicked() {
                     host.quit();
                 }
             };
@@ -223,6 +223,14 @@ impl LauncherUi {
                 self.version_lock(ui, launcher_id);
             });
             self.launcher_version_notes(ui);
+            // Fork-only (udinCraft): say where this build's own updates come from.
+            if !artcraft_launcher_core::catalog::SELF_UPDATE_FROM_UPSTREAM {
+                use artcraft_launcher_core::catalog::FORK_RELEASES_URL;
+                note(ui, tl!("Updates for this build come from the fork."));
+                if ui.link(tl!("The fork's releases")).on_hover_text(FORK_RELEASES_URL).clicked() {
+                    widgets::open_external_link(ui.ctx(), FORK_RELEASES_URL);
+                }
+            }
         });
     }
 
@@ -344,11 +352,11 @@ impl LauncherUi {
                     "When on, opening the launcher from the menu bar brings its window to the desktop you're on. When off, macOS switches you to the desktop the window was on."
                 ));
                 ui.add_enabled_ui(host.has_tray() && self.settings.close_to_tray, |ui| {
-                    ui.checkbox(&mut self.settings.hide_from_dock_when_hidden, tl!("Hide ArtCraft Launcher from the Dock while in the background"));
+                    ui.checkbox(&mut self.settings.hide_from_dock_when_hidden, tl!("Hide udinCraft Launcher from the Dock while in the background"));
                 });
             }
             if let Some(mut on) = host.login_item()
-                && ui.checkbox(&mut on, tl!("Start ArtCraft Launcher when I log in")).changed()
+                && ui.checkbox(&mut on, tl!("Start udinCraft Launcher when I log in")).changed()
                 && let Err(e) = host.set_login_item(on)
             {
                 self.toast_from_ui(fmt(tl!("Couldn't change the login item: {e}"), &[("e", &e)]), true);
@@ -361,6 +369,11 @@ impl LauncherUi {
     fn settings_community(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
         sheet::panel(ui, tl!("Community"), |ui| {
+            // Fork-only (udinCraft): credit upstream in plain text, linking its repository.
+            let upstream = artcraft_launcher_core::catalog::UPSTREAM_URL;
+            if ui.link(tl!("Based on ArtCraft Launcher by the ArtCraft team")).on_hover_text(upstream).clicked() {
+                widgets::open_external_link(ui.ctx(), upstream);
+            }
             ui.label(RichText::new(tl!("Questions, ideas and news from the ArtCraft team")).color(t.muted));
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {

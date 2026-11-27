@@ -89,7 +89,7 @@ struct Shared {
     /// A detection pass is running; another request waits for the next one.
     detecting: AtomicBool,
     last_check: Mutex<Option<i64>>,
-    /// The newer ArtCraft Launcher release, once a check has found one, with the repo that check
+    /// The newer udinCraft Launcher release, once a check has found one, with the repo that check
     /// read it from (the feed's rename, if any): its download links must be that repo's.
     launcher_release: Mutex<Option<(Release, String)>>,
     /// How this launcher is installed, when it can replace itself. Worked out on the check thread
@@ -521,7 +521,7 @@ impl NativeBackend {
             restarting
         };
         if restarting {
-            let result = Err("ArtCraft Launcher is restarting to finish its update. Try again once it's back.".into());
+            let result = Err("udinCraft Launcher is restarting to finish its update. Try again once it's back.".into());
             self.shared.emit(Event::JobFinished { app: app.id.to_string(), result });
             return None;
         }
@@ -660,7 +660,7 @@ impl NativeBackend {
         let refuse = || {
             self.shared.emit(Event::JobFinished {
                 app: id.clone(),
-                result: Err("this copy of ArtCraft Launcher can't update itself; download the new version instead".into()),
+                result: Err("this copy of udinCraft Launcher can't update itself; download the new version instead".into()),
             });
         };
         if self.shared.self_install.get().cloned().flatten().is_none() || self.platform.is_none() {
@@ -1072,7 +1072,7 @@ fn restart_blocked(mut busy: Vec<&str>) -> String {
         _ => (busy.join(", "), "were", "them"),
     };
     format!(
-        "ArtCraft Launcher didn't restart to update: {names} {were} still installing. Answer or close any password prompt, \
+        "udinCraft Launcher didn't restart to update: {names} {were} still installing. Answer or close any password prompt, \
          let {them} finish or cancel {them}, then press Update and restart again."
     )
 }
@@ -1287,6 +1287,10 @@ fn check_app(
 /// Offers the launcher's own update when its answer is a newer release than the running one,
 /// keeping `repo`, the repo it was read from, for the download's link check.
 fn launcher_update(paths: &Paths, latest: Option<LatestRelease>, repo: &str, shared: &Arc<Shared>) {
+    // Fork-only (udinCraft): upstream's launcher releases are never offered in place of this build.
+    if !artcraft_launcher_core::catalog::SELF_UPDATE_FROM_UPSTREAM {
+        return;
+    }
     let Some(LatestRelease::Found(r)) = latest else { return };
     let (Some(newest), Some(current)) = (r.version.as_ref(), crate::self_update::current_version()) else { return };
     if version::is_newer(newest, &current) && !crate::self_update::just_updated_to(paths, &r) {

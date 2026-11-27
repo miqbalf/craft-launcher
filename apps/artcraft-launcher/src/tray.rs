@@ -27,13 +27,13 @@ pub struct Tray {
 }
 
 fn load_icon() -> Result<tray_icon::Icon, String> {
-    // The ArtCraft "A" mark (an ArtCraft trademark, not MIT/Apache: docs/brand/LICENSE-brand.txt).
-    // macOS tints the black mark to the menu bar's colours as a template image; elsewhere the
-    // blue mark is shown as supplied.
+    // The udinCraft mark in colour, as supplied (the owner's brand, not MIT/Apache:
+    // docs/brand/LICENSE-brand.txt). It is a filled tile, so it is never a macOS template image
+    // (macOS would draw a template as a plain silhouette); 44 px is 22 pt @2x for the menu bar.
     let bytes: &[u8] = if cfg!(target_os = "macos") {
-        include_bytes!("../../../docs/brand/artcraft-mark-black-44.png")
+        include_bytes!("../../../docs/brand/udincraft-mark-44.png")
     } else {
-        include_bytes!("../../../docs/brand/artcraft-mark-64.png")
+        include_bytes!("../../../docs/brand/udincraft-mark-64.png")
     };
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).map_err(|e| e.to_string())?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -46,20 +46,24 @@ fn load_icon() -> Result<tray_icon::Icon, String> {
 /// Windows and macOS keep tray-icon's defaults: there the title is drawn next to the icon (macOS)
 /// or unsupported (Windows), and the id never reaches the user.
 fn identity(builder: TrayIconBuilder) -> TrayIconBuilder {
-    if cfg!(any(target_os = "macos", target_os = "windows")) { builder } else { builder.with_id("artcraft-launcher").with_title("ArtCraft Launcher") }
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        builder
+    } else {
+        builder.with_id("artcraft-launcher").with_title("udinCraft Launcher")
+    }
 }
 
 impl Tray {
     /// Creates the tray icon. `wake` repaints the UI so it sees the action, even when hidden.
     /// `on_quit` runs when Quit is picked, before the UI can see it: the UI may never get to.
     pub fn new(wake: impl Fn() + Send + Sync + Clone + 'static, on_quit: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
-        let show = MenuItem::new(i18n::t("Show ArtCraft Launcher"), true, None);
+        let show = MenuItem::new(i18n::t("Show udinCraft Launcher"), true, None);
         let check = MenuItem::new(i18n::t("Check for Updates"), true, None);
         use artcraft_launcher_core::catalog::{GITHUB_URL, WEBSITE_URL};
         let website = MenuItem::new(i18n::t("Visit getartcraft.com"), true, None);
         let github = MenuItem::new(i18n::t("ArtCraft on GitHub"), true, None);
         let discord = MenuItem::new(i18n::t("Join the ArtCraft Discord"), true, None);
-        let quit = MenuItem::new(i18n::t("Quit ArtCraft Launcher"), true, None);
+        let quit = MenuItem::new(i18n::t("Quit udinCraft Launcher"), true, None);
         let menu = Menu::new();
         menu.append_items(&[&show, &check, &PredefinedMenuItem::separator(), &website, &github, &discord, &PredefinedMenuItem::separator(), &quit])
             .map_err(|e| e.to_string())?;
@@ -67,12 +71,10 @@ impl Tray {
         let discord_id = discord.id().clone();
         let image = load_icon()?;
         let builder = identity(TrayIconBuilder::new()).with_menu(Box::new(menu));
-        // macOS draws the icon as a template image (recoloured for light and dark menu bars).
-        #[cfg(target_os = "macos")]
-        let builder = builder.with_icon_templated(image);
-        #[cfg(not(target_os = "macos"))]
+        // The colour mark is shown as it is on every system (see `load_icon`).
         let builder = builder.with_icon(image);
-        let icon = builder.with_menu_on_left_click(cfg!(target_os = "macos")).with_tooltip("ArtCraft Launcher").build().map_err(|e| e.to_string())?;
+        let icon =
+            builder.with_menu_on_left_click(cfg!(target_os = "macos")).with_tooltip("udinCraft Launcher").build().map_err(|e| e.to_string())?;
         let (tx, rx): (Sender<TrayAction>, Receiver<TrayAction>) = channel();
         let (show_id, check_id, quit_id) = (show.id().clone(), check.id().clone(), quit.id().clone());
         {
@@ -107,12 +109,12 @@ impl Tray {
             }
         }));
         let labels = vec![
-            (show, "Show ArtCraft Launcher"),
+            (show, "Show udinCraft Launcher"),
             (check, "Check for Updates"),
             (website, "Visit getartcraft.com"),
             (github, "ArtCraft on GitHub"),
             (discord, "Join the ArtCraft Discord"),
-            (quit, "Quit ArtCraft Launcher"),
+            (quit, "Quit udinCraft Launcher"),
         ];
         Ok(Self { icon, show: show_id, check: check_id, quit: quit_id, rx, tooltip: String::new(), language: String::new(), labels })
     }
@@ -136,9 +138,9 @@ impl Tray {
             self.language = lang.code().to_string();
         }
         let tip = if count == 0 {
-            "ArtCraft Launcher".to_string()
+            "udinCraft Launcher".to_string()
         } else {
-            i18n::trn(lang, count as u64, "ArtCraft Launcher · {n} update available", "ArtCraft Launcher · {n} updates available")
+            i18n::trn(lang, count as u64, "udinCraft Launcher · {n} update available", "udinCraft Launcher · {n} updates available")
         };
         if tip != self.tooltip {
             let _ = self.icon.set_tooltip(Some(&tip));

@@ -1,4 +1,4 @@
-# Ukrainian (uk) catalog for ArtCraft Launcher.
+# Ukrainian (uk) catalog for udinCraft Launcher.
 # Format: context<TAB>source<TAB>translation
 # Empty context = plain UI string (tl!, t).
 # @id = command-id keyed (tr_id).
@@ -6,11 +6,11 @@
 # @msg = status/error message template (message, msg).
 # Other context = disambiguation for tr_ctx.
 #
-# Clean-room: written from the meaning of ArtCraft Launcher's English labels in clear,
+# Clean-room: written from the meaning of udinCraft Launcher's English labels in clear,
 # idiomatic Ukrainian for users of creative software.
 #
 # Coverage: the whole interface — every menu string and tl! literal (complete_menus = true).
-# Left in English on purpose: product name "ArtCraft Launcher" (and its "Launcher" tag), suite
+# Left in English on purpose: product name "udinCraft Launcher" (and its "Launcher" tag), suite
 # name "Craft App Suite",
 # app names (PhotoCraft, LightCraft, FilmCraft, DesignCraft, VectorCraft, PdfCraft, EffectCraft,
 # WordCraft, DeckCraft, GridCraft, CADCraft, SoundCraft, FigCraft, Craft Anything, TextureCraft,
@@ -51,8 +51,8 @@
 	Open	Відкрити
 	Open {version}	Відкрити {version}
 	Open {installed} without updating. {latest} stays available.	Відкрити {installed} без оновлення. Версія {latest} залишиться доступною.
-	{latest} is out, but ArtCraft Launcher can't install it over this copy.	Версія {latest} уже вийшла, але ArtCraft Launcher не може встановити її поверх цієї копії.
-	ArtCraft Launcher can't install version {version} over this copy.	ArtCraft Launcher не може встановити версію {version} поверх цієї копії.
+	{latest} is out, but udinCraft Launcher can't install it over this copy.	Версія {latest} уже вийшла, але udinCraft Launcher не може встановити її поверх цієї копії.
+	udinCraft Launcher can't install version {version} over this copy.	udinCraft Launcher не може встановити версію {version} поверх цієї копії.
 	Download for {os}	Завантажити для {os}
 	Download	Завантажити
 	Coming soon	Незабаром
@@ -85,7 +85,7 @@
 	{name} wasn't opened: a quote in its launch options isn't closed.	{name} не відкрито: у параметрах запуску не закрито лапку.
 	Save	Зберегти
 	All releases	Усі випуски
-	ArtCraft Launcher {version} is available.	Доступний ArtCraft Launcher {version}.
+	udinCraft Launcher {version} is available.	Доступний udinCraft Launcher {version}.
 	Dismiss	Закрити
 	Update and restart	Оновити й перезапустити
 	A new version is available. Would you like to relaunch with the updated version?	Доступна нова версія. Перезапустити з оновленою версією?
@@ -96,7 +96,7 @@
 	Released {date}	Випущено {date}
 	Open on GitHub	Відкрити на GitHub
 	Close	Закрити
-	ArtCraft Launcher {version}	ArtCraft Launcher {version}
+	udinCraft Launcher {version}	udinCraft Launcher {version}
 	Only when I ask	Лише за моїм запитом
 	Automatically download and install updates	Автоматично завантажувати й встановлювати оновлення
 	Ask for permission once when updating all apps	Запитувати дозвіл один раз під час оновлення всіх застосунків
@@ -109,15 +109,15 @@
 	Updates always use the format an app was installed with.	Оновлення завжди використовують формат, у якому застосунок було встановлено.
 	Running in the background	Робота у фоновому режимі
 	Keep running in the tray when the window is closed	Продовжувати роботу в треї після закриття вікна
-	Hide ArtCraft Launcher from the Dock while in the background	Приховувати ArtCraft Launcher з Dock під час роботи у фоновому режимі
-	ArtCraft Launcher is still running	ArtCraft Launcher усе ще працює
+	Hide udinCraft Launcher from the Dock while in the background	Приховувати udinCraft Launcher з Dock під час роботи у фоновому режимі
+	udinCraft Launcher is still running	udinCraft Launcher усе ще працює
 	It's in the tray: open it or quit it from the tray icon, or turn this off in the settings.	Він у треї: відкрийте або закрийте його через значок у треї або вимкніть це в налаштуваннях.
 	Show the window on the current desktop	Показувати вікно на поточному робочому столі
-	Start ArtCraft Launcher when I log in	Запускати ArtCraft Launcher під час входу в систему
+	Start udinCraft Launcher when I log in	Запускати udinCraft Launcher під час входу в систему
 	Community	Спільнота
 	Questions, ideas and news from the ArtCraft team	Запитання, ідеї та новини від команди ArtCraft
 	Appearance	Зовнішній вигляд
-	Quit ArtCraft Launcher	Вийти з ArtCraft Launcher
+	Quit udinCraft Launcher	Вийти з udinCraft Launcher
 	Done	Готово
 	Uninstall {name}?	Видалити {name}?
 	The app will be moved to the Trash. Your documents and settings stay.	Застосунок буде переміщено в Кошик. Ваші документи та налаштування залишаться.
@@ -160,7 +160,7 @@
 	Open link	Відкрити посилання
 	Update	Оновити
 	{name} icon	Значок {name}
-	Loading ArtCraft Launcher…	Завантаження ArtCraft Launcher…
+	Loading udinCraft Launcher…	Завантаження udinCraft Launcher…
 	Cancel update	Скасувати оновлення
 	Stop waiting; the update can be started again later	Припинити чекати; оновлення можна буде запустити знову пізніше
 	Download again	Завантажити ще раз
@@ -243,7 +243,7 @@ month	Dec	груд.
 	Version {version} installed	Версія {version} встановлена
 	Version {latest}	Версія {latest}
 	No release published yet	Випуск ще не опубліковано
-	ArtCraft Launcher	ArtCraft Launcher
+	udinCraft Launcher	udinCraft Launcher
 	App	Застосунок
 	Latest	Остання
 	Released	Випущено
@@ -276,7 +276,7 @@ month	Dec	груд.
 	Full changelog	Повний список змін
 	link	посилання
 	No apps match	Немає відповідних застосунків
-	Open ArtCraft Launcher to update.	Відкрийте ArtCraft Launcher, щоб оновити.
+	Open udinCraft Launcher to update.	Відкрийте udinCraft Launcher, щоб оновити.
 	{name} {v} is available	Доступне оновлення {name} {v}
 	{count} updates are available	Доступні оновлення ({count})
 	These notes weren't fetched (GitHub's request limit was reached). They're on the release page.	Ці примітки не вдалося отримати (вичерпано ліміт запитів GitHub). Вони є на сторінці випуску.
@@ -333,7 +333,7 @@ filter	Installed	Встановлені
 @id	launcher.notes	Що нового
 @id	launcher.dismiss	Закрити
 @id	settings.open	Налаштування
-@id	settings.quit	Вийти з ArtCraft Launcher
+@id	settings.quit	Вийти з udinCraft Launcher
 @id	view.grid	Сітка
 @id	view.table	Таблиця
 @id	filter.all	Усі
@@ -356,11 +356,11 @@ filter	Installed	Встановлені
 @id	linux.preferred_kind	Встановлювати нові застосунки як
 @id	tray.close_to_tray	Продовжувати роботу в треї після закриття вікна
 @id	tray.show_on_current_desktop	Показувати вікно на поточному робочому столі
-@id	tray.login_item	Запускати ArtCraft Launcher під час входу в систему
+@id	tray.login_item	Запускати udinCraft Launcher під час входу в систему
 @id	appearance.theme	Зовнішній вигляд
 
 # Tray (menu bar) menu and tooltip
-	Show ArtCraft Launcher	Показати ArtCraft Launcher
+	Show udinCraft Launcher	Показати udinCraft Launcher
 	Check for Updates	Перевірити оновлення
 	Visit getartcraft.com	Відкрити getartcraft.com
 	ArtCraft on GitHub	ArtCraft на GitHub
@@ -379,7 +379,7 @@ filter	Installed	Встановлені
 	Next picture (→)	Наступне зображення (→)
 	Loading pictures…	Завантаження зображень…
 	Pictures couldn't be loaded. Reopen this page to try again.	Не вдалося завантажити зображення. Відкрийте цю сторінку ще раз.
-@plural	ArtCraft Launcher · {n} update available|ArtCraft Launcher · {n} updates available	ArtCraft Launcher · {n} оновлення|ArtCraft Launcher · {n} оновлення|ArtCraft Launcher · {n} оновлень
+@plural	udinCraft Launcher · {n} update available|udinCraft Launcher · {n} updates available	udinCraft Launcher · {n} оновлення|udinCraft Launcher · {n} оновлення|udinCraft Launcher · {n} оновлень
 	Download size: {size}	Розмір завантаження: {size}
 	Install folder	Папка встановлення
 	Default install folder	Папка встановлення за замовчуванням
@@ -393,7 +393,7 @@ filter	Installed	Встановлені
 @msg	couldn't use install folder {path}: {reason}	не вдалося використати папку встановлення {path}: {reason}
 @msg	this release has no AppImage for a custom install folder	у цьому випуску немає AppImage для власної папки встановлення
 @msg	custom install folders aren't supported on this system	ця система не підтримує власні папки встановлення
-@msg	{path} already exists and wasn't installed by ArtCraft Launcher	{path} уже існує і не був встановлений через ArtCraft Launcher
+@msg	{path} already exists and wasn't installed by udinCraft Launcher	{path} уже існує і не був встановлений через udinCraft Launcher
 @msg	couldn't move {path} to Trash ({reason}). Remove it in Finder instead.	не вдалося перемістити {path} у Кошик ({reason}). Натомість видаліть його у Finder.
 @msg	Desktop shortcut created for {name}	Ярлик на робочому столі для {name} створено
 @msg	Couldn't create the desktop shortcut: {e}	Не вдалося створити ярлик на робочому столі: {e}
@@ -568,3 +568,9 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Backups and copies kept when you stopped tracking a file, on this computer	Backups and copies kept when you stopped tracking a file, on this computer
 	Your server couldn't search, so only the folder shown last was searched	Your server couldn't search, so only the folder shown last was searched
 	{name} is closed.	{name} is closed.
+
+# Fork-only (udinCraft): the header logo's name, the launcher's own updates, and the upstream credit.
+	udinCraft	udinCraft
+	Updates for this build come from the fork.	Оновлення цієї збірки надходять із форку.
+	The fork's releases	Випуски форку
+	Based on ArtCraft Launcher by the ArtCraft team	Засновано на ArtCraft Launcher від команди ArtCraft

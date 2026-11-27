@@ -107,14 +107,14 @@ Copy-Item (Join-Path $Bin $GatewayExe) $Stage
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage $GatewayExe)
 
 # ---- MSI ---------------------------------------------------------------------------------------
-# The setup wizard's art, drawn here (System.Drawing) in getartcraft.com's style so the MSI shows
-# ArtCraft rather than WiX's stock bitmaps. Both must be 24-bit BMPs:
+# The setup wizard's art, drawn here (System.Drawing) so the MSI shows udinCraft rather than WiX's
+# stock bitmaps. Both must be 24-bit BMPs:
 #   - dialog, 493x312: the Welcome and Finish pages' backdrop. Their text sits on the right, so
-#     that stays white; the left panel is ours: the blue ArtCraft mark, the white wordmark, a mono
+#     that stays white; the left panel is ours: the udinCraft mark, the white logo, a mono
 #     "Launcher" label and the Craft apps' icons in a hairline grid.
 #   - banner, 493x58: across the top of the inner pages. The page title is drawn over its left
 #     side, so that stays white; the right end is a dark cell with the mark.
-# The ArtCraft mark and wordmark are drawn as supplied (docs/brand/LICENSE-brand.txt).
+# The udinCraft mark and logo are drawn as supplied (docs/brand/LICENSE-brand.txt).
 function New-InstallerArt([string] $BannerOut, [string] $DialogOut) {
   Add-Type -AssemblyName System.Drawing
   $ink = [System.Drawing.ColorTranslator]::FromHtml('#121316')
@@ -125,7 +125,7 @@ function New-InstallerArt([string] $BannerOut, [string] $DialogOut) {
   $apps = 'photocraft', 'vectorcraft', 'filmcraft', 'lightcraft', 'pdfcraft', 'effectcraft',
     'anicraft', 'designcraft', 'figcraft', 'wordcraft', 'soundcraft', 'deckcraft', 'cadcraft', 'gridcraft', 'craft-anything', 'texturecraft', 'materialcraft'
   $mark = [System.Drawing.Image]::FromFile((Join-Path $Root 'assets\app-icon\hicolor\256x256\apps\ai.storyteller.artcraft-launcher.png'))
-  $wordmark = [System.Drawing.Image]::FromFile((Join-Path $Root 'docs\brand\artcraft-logo-white.png'))
+  $wordmark = [System.Drawing.Image]::FromFile((Join-Path $Root 'docs\brand\udincraft-logo-white.png'))
   $icons = $apps | ForEach-Object { [System.Drawing.Image]::FromFile((Join-Path $Root "assets\app-icons\$_.png")) }
   # The site's label face; GDI+ draws a variable font at its default instance (Regular).
   $fonts = New-Object System.Drawing.Text.PrivateFontCollection

@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -19.42 136.34 136.34" role="img" aria-label="ArtCraft">
-  <title>ArtCraft</title>
-  <path fill="#4e7bfb" d="M104.28,49.49L81.55,0h-31.23l-3.17,4.76L14.75,53.63,0,75.85l21.55,21.55,63.79-36.94,16.99,37.04,14.01-21.74-12.06-26.27ZM32.89,65.66l32.42-48.87,10.91,23.77-43.32,25.09Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="udinCraft">
+  <title>udinCraft</title>
+  <rect width="128" height="128" rx="28" fill="#0F766E"/>
+  <path d="M30 36V68a21 21 0 0 0 42 0V36" fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M96 23L107 34L96 45L85 34Z" fill="#F59E0B"/>
 </svg>

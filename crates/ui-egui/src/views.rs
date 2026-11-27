@@ -138,7 +138,7 @@ fn update_split<'a>(ui: &Ui, place: Place, main_w: f32, open: &'a str, update: &
 /// Why a newer release noted beside an installed copy isn't offered as an update: `newer` from
 /// [`LauncherUi::out_of_reach`].
 fn out_of_reach_tip(newer: Option<String>) -> Option<String> {
-    Some(fmt(tl!("{latest} is out, but ArtCraft Launcher can't install it over this copy."), &[("latest", &newer?)]))
+    Some(fmt(tl!("{latest} is out, but udinCraft Launcher can't install it over this copy."), &[("latest", &newer?)]))
 }
 
 /// The width of the main button: what's left of `width` beside the square `⋯` menu.
@@ -180,10 +180,13 @@ impl LauncherUi {
             if bar == TitleBar::MacOs {
                 ui.add_space(TRAFFIC_LIGHTS_W);
             }
-            // The ArtCraft wordmark exactly as supplied, in its own cell.
-            let logo = vec2(14.0 * crate::icons::ARTCRAFT_LOGO_ASPECT, 14.0);
+            // The udinCraft logo exactly as supplied, in its own cell. It is taller than a bare
+            // wordmark because the mark sits beside the name.
+            let logo = vec2(24.0 * crate::icons::UDINCRAFT_LOGO_ASPECT, 24.0);
             let (cell, _) = ui.allocate_exact_size(vec2(logo.x + 40.0, h), Sense::hover());
-            egui::Image::new(crate::icons::artcraft_logo(t.dark)).alt_text(tl!("ArtCraft")).paint_at(ui, Rect::from_center_size(cell.center(), logo));
+            egui::Image::new(crate::icons::udincraft_logo(t.dark))
+                .alt_text(tl!("udinCraft"))
+                .paint_at(ui, Rect::from_center_size(cell.center(), logo));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if bar == TitleBar::Custom {
                     widgets::window_buttons(ui, h);
@@ -244,7 +247,7 @@ impl LauncherUi {
         }
     }
 
-    /// A banner over the toolbar when a newer ArtCraft Launcher release is known: either the
+    /// A banner over the toolbar when a newer udinCraft Launcher release is known: either the
     /// update-in-place controls, or a plain link when this build can't update itself.
     fn launcher_update_banner(&mut self, ui: &mut Ui, t: &Tokens, r: &artcraft_launcher_core::Release) {
         egui::Frame::new()
@@ -256,7 +259,7 @@ impl LauncherUi {
                     widgets::tag(ui, tl!("Update"), t.accent, Color32::WHITE);
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(fmt(tl!("ArtCraft Launcher {version} is available."), &[("version", &r.version_label())]))
+                        RichText::new(fmt(tl!("udinCraft Launcher {version} is available."), &[("version", &r.version_label())]))
                             .family(theme::medium())
                             .color(t.ink_strong),
                     );

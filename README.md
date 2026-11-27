@@ -1,17 +1,22 @@
 <p align="center">
-  <a href="https://getartcraft.com/">
+  <a href="https://github.com/miqbalf/craft-launcher">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/udincraft-logo-white.svg">
+      <img alt="udinCraft" src="docs/brand/udincraft-logo.svg" width="200">
     </picture>
   </a>
 </p>
 
 <p align="center">
-  <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.artcraft-launcher.png" width="128" height="128" alt="ArtCraft Launcher icon: a blue stylised letter A">
+  <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.artcraft-launcher.png" width="128" height="128" alt="udinCraft Launcher icon: a white letter u and an amber diamond on a teal tile">
 </p>
 
-<h1 align="center">ArtCraft Launcher</h1>
+<h1 align="center">udinCraft Launcher</h1>
+
+<p align="center">
+  <a href="https://github.com/miqbalf/craft-launcher">udinCraft Launcher on GitHub</a> ·
+  <a href="https://github.com/storytold/craft-launcher">Based on ArtCraft Launcher by the ArtCraft team</a>
+</p>
 
 <p align="center">
   <b>One place to install, update and open every app in the Craft App Suite, rebuilt in pure Rust.</b><br>
@@ -34,15 +39,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/storytold/craft-launcher/releases/latest"><b>Download ArtCraft Launcher</b></a> ·
+  <a href="https://github.com/miqbalf/craft-launcher/releases"><b>udinCraft Launcher releases</b></a> ·
+  <a href="https://github.com/storytold/craft-launcher/releases/latest">Upstream ArtCraft Launcher</a> ·
   <a href="https://getartcraft.com/">ArtCraft</a> ·
   <a href="https://getartcraft.com/apps">The Craft App Suite</a>
 </p>
-
-> [!NOTE]
-> **ArtCraft is a community of artists from all walks of life.** Painters, photographers,
-> filmmakers, illustrators, designers, animators, hobbyists, and people who picked up a pencil
-> last week. If you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
 <p align="center">
   <a href="#what-it-does">What it does</a> ·
@@ -60,6 +61,23 @@
   <img src="docs/screenshots/artcraft-launcher-table.png" alt="The same apps in the table view (light theme), with columns for each app's status, installed and latest versions, and release date" width="900"><br>
   <sub>Switch between the grid and a sortable table.</sub>
 </p>
+
+## Fork notes
+
+This is udinCraft Launcher, the owner's fork of ArtCraft Launcher by the ArtCraft team. It is not
+an ArtCraft product. Most of this README describes the upstream launcher; this fork adds:
+
+- **Cloud files:** a Cloud page that signs in to a self-hosted file server, browses its folders and
+  opens a file in the matching Craft app as a local working copy. Saves go back to the server, with
+  locks and conflict checks.
+- **A Craft-defaults script** for macOS (`packaging/macos/set-craft-defaults.sh`) that makes the
+  installed Craft apps the default apps for the file types they open.
+- **Its own updates:** this build never offers the upstream launcher's releases in its place.
+  Updates for this build come from the fork's releases. The Craft apps still update from their
+  own repositories.
+
+The bundle id, the program, crate and package names, the data folder and the saved-sign-in
+service keep upstream's names, so an installed copy and its settings keep working.
 
 ## What it does
 
@@ -333,8 +351,9 @@ lot from them. Thank you to their authors:
 
 ## License and credits
 
-ArtCraft Launcher is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-Copyright (c) 2026 ArtCraft Team and the ArtCraft Launcher contributors. Required notices are in [NOTICE](NOTICE).
+udinCraft Launcher, like ArtCraft Launcher, is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Copyright (c) 2026 ArtCraft Team and the ArtCraft Launcher contributors. udinCraft changes: Copyright (c) 2026 miqbalf.
+Required notices are in [NOTICE](NOTICE).
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
@@ -342,14 +361,17 @@ with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 The app icons of the Craft apps (`assets/app-icons/`) are each app's own icon, copied unmodified
 from its repository and licensed like that app (MIT OR Apache-2.0).
 
-**The ArtCraft name, logo and "A" mark are not licensed under MIT or Apache-2.0.** They (everything
+**The udinCraft name, logo and mark are not licensed under MIT or Apache-2.0.** They (everything
 in [`docs/brand/`](docs/brand/), plus the app icon in [`assets/app-icon/`](assets/app-icon/), the
-logo in the launcher's header and the "A" tray icon)
-are trademarks of the ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and ArtCraft Launcher, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+logo in the launcher's header, the tray icon and the macOS disk-image background) belong to
+miqbalf and may be used only unmodified, and only as part of this repository and udinCraft
+Launcher, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt). Forks and modified
+versions must remove them.
+
+udinCraft Launcher is based on [ArtCraft Launcher](https://github.com/storytold/craft-launcher) by
+the ArtCraft team. It is not an ArtCraft product; ArtCraft and its marks belong to the ArtCraft Team.
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <a href="https://github.com/miqbalf/craft-launcher"><img alt="udinCraft" src="docs/brand/udincraft-mark.svg" width="28"></a><br>
+  <sub>udinCraft Launcher. Based on ArtCraft Launcher by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>

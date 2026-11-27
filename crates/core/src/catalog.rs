@@ -187,6 +187,16 @@ pub const LAUNCHER: CraftApp = app(
 
 /// The launcher's own repo, checked so it can say when a newer launcher is out.
 pub const LAUNCHER_REPO: &str = "storytold/craft-launcher";
+
+/// Fork-only (udinCraft): whether the launcher offers [`LAUNCHER_REPO`]'s releases as its own
+/// update. It doesn't: those are upstream's builds, without this fork's features (the Cloud page),
+/// so installing one would replace this build with a different app. Updates for this build come
+/// from the fork ([`FORK_RELEASES_URL`]). The Craft apps' updates are unchanged.
+pub const SELF_UPDATE_FROM_UPSTREAM: bool = false;
+/// Fork-only (udinCraft): where this build's releases are published.
+pub const FORK_RELEASES_URL: &str = "https://github.com/miqbalf/craft-launcher/releases";
+/// Fork-only (udinCraft): the upstream launcher this build is based on.
+pub const UPSTREAM_URL: &str = "https://github.com/storytold/craft-launcher";
 /// The launcher's own asset stem.
 pub const LAUNCHER_ID: &str = "artcraft-launcher";
 

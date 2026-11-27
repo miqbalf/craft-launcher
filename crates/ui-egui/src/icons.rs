@@ -49,18 +49,18 @@ fn desaturate(pixels: &mut [u8]) {
     }
 }
 
-/// The ArtCraft wordmark, as supplied: dark ink for light backgrounds, white for dark ones.
-/// An ArtCraft trademark, not covered by the MIT/Apache license (`docs/brand/LICENSE-brand.txt`).
-pub fn artcraft_logo(dark_background: bool) -> ImageSource<'static> {
+/// The udinCraft logo (mark and wordmark), as supplied: for light backgrounds, or the white one for
+/// dark ones. The owner's brand, not covered by the MIT/Apache license (`docs/brand/LICENSE-brand.txt`).
+pub fn udincraft_logo(dark_background: bool) -> ImageSource<'static> {
     if dark_background {
-        egui::include_image!("../../../docs/brand/artcraft-logo-white.svg")
+        egui::include_image!("../../../docs/brand/udincraft-logo-white.svg")
     } else {
-        egui::include_image!("../../../docs/brand/artcraft-logo.svg")
+        egui::include_image!("../../../docs/brand/udincraft-logo.svg")
     }
 }
 
-/// The ArtCraft wordmark's width / height (its SVG view box: 1038.05 × 108).
-pub const ARTCRAFT_LOGO_ASPECT: f32 = 1038.05 / 108.0;
+/// The udinCraft logo's width / height (its SVG view box: 656.10 × 136).
+pub const UDINCRAFT_LOGO_ASPECT: f32 = 656.10 / 136.0;
 
 /// A social service's logo (Simple Icons, white, for tinting), by its name in `catalog::SOCIAL`.
 pub fn social(service: &str) -> Option<ImageSource<'static>> {
@@ -77,9 +77,9 @@ pub fn social(service: &str) -> Option<ImageSource<'static>> {
     })
 }
 
-/// The ArtCraft "A" mark in blue, as supplied: the launcher's app icon and getartcraft.com's favicon.
-pub fn artcraft_mark() -> ImageSource<'static> {
-    egui::include_image!("../../../docs/brand/artcraft-mark.svg")
+/// The udinCraft mark in colour, as supplied: the launcher's app icon.
+pub fn udincraft_mark() -> ImageSource<'static> {
+    egui::include_image!("../../../docs/brand/udincraft-mark.svg")
 }
 
 #[cfg(test)]

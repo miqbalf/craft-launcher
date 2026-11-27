@@ -14,11 +14,11 @@ section: utils
 priority: optional
 maintainer: ${ARTCRAFT_LAUNCHER_MAINTAINER}
 vendor: Learning Machines LLC
-homepage: https://github.com/storytold/craft-launcher
+homepage: https://github.com/miqbalf/craft-launcher
 license: MIT OR Apache-2.0
 description: |-
   Install, update and launch the Craft App Suite.
-  ArtCraft Launcher lists PhotoCraft, LightCraft, FilmCraft, DesignCraft,
+  udinCraft Launcher (based on ArtCraft Launcher by the ArtCraft team) lists PhotoCraft, LightCraft, FilmCraft, DesignCraft,
   VectorCraft, PdfCraft, EffectCraft, WordCraft, DeckCraft, GridCraft, CADCraft,
   SoundCraft and FigCraft, installs the right build for this computer and keeps
   them up to date from GitHub releases. It can live in the system tray.

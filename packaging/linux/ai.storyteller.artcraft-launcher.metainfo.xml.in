@@ -5,14 +5,15 @@
   <id>ai.storyteller.artcraft-launcher</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>ArtCraft Launcher</name>
+  <name>udinCraft Launcher</name>
   <summary>Install, update and launch the Craft App Suite</summary>
   <developer id="ai.storyteller">
     <name>Learning Machines LLC</name>
   </developer>
   <description>
     <p>
-      ArtCraft Launcher lists every app in the Craft App Suite (PhotoCraft, LightCraft, FilmCraft,
+      udinCraft Launcher, based on ArtCraft Launcher by the ArtCraft team, lists every app in the
+      Craft App Suite (PhotoCraft, LightCraft, FilmCraft,
       DesignCraft, VectorCraft, PdfCraft, EffectCraft, WordCraft, DeckCraft, GridCraft, CADCraft,
       SoundCraft and FigCraft), installs the right build for your computer, and keeps them up to date.
     </p>
@@ -25,10 +26,10 @@
   <launchable type="desktop-id">ai.storyteller.artcraft-launcher.desktop</launchable>
   <icon type="stock">ai.storyteller.artcraft-launcher</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
-  <url type="homepage">https://getartcraft.com/apps</url>
-  <url type="bugtracker">https://github.com/storytold/craft-launcher/issues</url>
-  <url type="help">https://github.com/storytold/craft-launcher</url>
-  <url type="contact">https://discord.gg/artcraft</url>
+  <url type="homepage">https://github.com/miqbalf/craft-launcher</url>
+  <url type="bugtracker">https://github.com/miqbalf/craft-launcher/issues</url>
+  <url type="help">https://github.com/miqbalf/craft-launcher</url>
+  <url type="contact">https://github.com/miqbalf/craft-launcher/issues</url>
   <categories>
     <category>Utility</category>
     <category>PackageManager</category>

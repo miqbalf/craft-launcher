@@ -212,16 +212,16 @@ pub fn claim(wake: Wake) -> Instance {
                 // again because the proven launcher may have quit and something else taken the port.
                 Instance::Secondary
             } else {
-                log::warn!("whatever holds the launcher's port didn't prove it is ArtCraft Launcher and kept the port; starting anyway");
+                log::warn!("whatever holds the launcher's port didn't prove it is udinCraft Launcher and kept the port; starting anyway");
                 Instance::Primary(channel().1)
             }
         }
         Ok(Answer::Unrelated) => {
-            log::warn!("something on the launcher's port didn't prove it is this account's ArtCraft Launcher; starting anyway");
+            log::warn!("something on the launcher's port didn't prove it is this account's udinCraft Launcher; starting anyway");
             Instance::Primary(channel().1)
         }
         Ok(Answer::Legacy) => {
-            log::warn!("an older ArtCraft Launcher is running and can't be asked to quit; starting anyway");
+            log::warn!("an older udinCraft Launcher is running and can't be asked to quit; starting anyway");
             Instance::Primary(channel().1)
         }
         // The port is taken by something else: run anyway rather than refuse to start.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Regenerate every app and tray icon from the ArtCraft "A" mark in docs/brand/, rendered exactly as
-# supplied. The mark is an ArtCraft trademark, NOT MIT/Apache: docs/brand/LICENSE-brand.txt.
+# Regenerate every app and tray icon from the udinCraft mark in docs/brand/, rendered exactly as
+# supplied. The mark is the owner's brand, NOT MIT/Apache: docs/brand/LICENSE-brand.txt.
 #
-# - App icon (Dock, taskbar, Start menu, Linux menus, installers): the blue mark, which is also
-#   getartcraft.com's favicon.
-# - Tray: the black mark as the macOS menu-bar template; the blue mark on Windows, Linux and BSD.
+# - App icon (Dock, taskbar, Start menu, Linux menus, installers): the colour mark.
+# - Tray: the colour mark on every system. It is a filled tile, so it can't be a macOS template
+#   image (macOS would draw it as a plain silhouette).
 #
 # Needs: resvg (brew install resvg / cargo install resvg). The .ico and .icns are packed by
 # `cargo xtask ico` / `cargo xtask icns`, so this runs on any OS. The outputs are committed, so
@@ -15,19 +15,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR="$ROOT/assets/app-icon"
 BRAND="$ROOT/docs/brand"
-SVG="$BRAND/artcraft-mark.svg"
+SVG="$BRAND/udincraft-mark.svg"
 ID="ai.storyteller.artcraft-launcher"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 command -v resvg >/dev/null || { echo "error: resvg not found (brew install resvg)" >&2; exit 1; }
 
-# The mark's artwork is untouched. macOS icons get a little more transparent margin (Apple's
-# 824/1024 icon grid) by widening the view box around it; everything else uses the file as is.
-BOX='viewBox="-10 -19.42 136.34 136.34"'
+# The mark's artwork is untouched. macOS icons get transparent margin (Apple's 824/1024 icon grid:
+# 128 * 1024 / 824 = 159.07) by widening the view box around it; everything else uses the file as is.
+BOX='viewBox="0 0 128 128"'
 grep -q "$BOX" "$SVG" || { echo "error: expected $BOX in $SVG" >&2; exit 1; }
 MAC="$TMP/mac.svg"
-sed "s/$BOX/viewBox=\"-17.5 -26.92 151.34 151.34\"/" "$SVG" >"$MAC"
+sed "s/$BOX/viewBox=\"-15.53 -15.53 159.07 159.07\"/" "$SVG" >"$MAC"
 FLAT="$SVG"
 
 render() {
@@ -62,8 +62,8 @@ for s in 16 32 64 128 256 512 1024; do
 done
 (cd "$ROOT" && cargo run -q -p xtask -- icns "$DIR/artcraft-launcher.icns" "${ICNS_PNGS[@]}")
 
-# Tray icons: the black mark is the macOS menu-bar template (44 px = 22 pt @2x; macOS tints it);
-# the blue one is for the Windows notification area and Linux/BSD status notifiers.
-render "$BRAND/artcraft-mark-black.svg" 44 "$BRAND/artcraft-mark-black-44.png"
-render "$BRAND/artcraft-mark.svg" 64 "$BRAND/artcraft-mark-64.png"
+# Tray icons: 44 px (22 pt @2x) for the macOS menu bar, 64 px for the Windows notification area
+# and Linux/BSD status notifiers.
+render "$SVG" 44 "$BRAND/udincraft-mark-44.png"
+render "$SVG" 64 "$BRAND/udincraft-mark-64.png"
 echo "icons written to $DIR"
