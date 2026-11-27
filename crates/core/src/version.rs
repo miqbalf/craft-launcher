@@ -10,6 +10,10 @@ pub use semver::Version;
 /// some platforms report. Build metadata is kept but never affects ordering.
 pub fn parse(text: &str) -> Option<Version> {
     let t = text.trim();
+    // Fork-only (udinCraft): `udincraft-v0.18.1-20261127` is version 0.18.1 (see [`udincraft_tag`]).
+    if t.starts_with(UDINCRAFT_TAG_PREFIX) {
+        return udincraft_tag(t).map(|(v, _)| v);
+    }
     let t = t.strip_prefix("artcraft-v").unwrap_or(t);
     let t = t.strip_prefix(['v', 'V']).unwrap_or(t);
     if t.is_empty() || t.len() > 64 {
@@ -31,6 +35,28 @@ pub fn parse(text: &str) -> Option<Version> {
         return Version::parse(&format!("{core}.0{rest}")).ok();
     }
     None
+}
+
+/// Fork-only (udinCraft): the tag prefix of the udinCraft forks' own releases,
+/// `udincraft-v<version>-<YYYYMMDD>` (the release workflow's `udincraft-release.yml`).
+pub const UDINCRAFT_TAG_PREFIX: &str = "udincraft-v";
+
+/// Reads a udinCraft release tag, `udincraft-v<version>-<YYYYMMDD>`: the app's version (the
+/// Cargo version it was built at, which the app reports too) and the build date, which only breaks
+/// a tie between two builds of the same version. `None` for any other tag, so upstream's `v0.19.1`
+/// is never a udinCraft release.
+pub fn udincraft_tag(tag: &str) -> Option<(Version, u32)> {
+    let rest = tag.trim().strip_prefix(UDINCRAFT_TAG_PREFIX)?;
+    let (version, date) = rest.rsplit_once('-')?;
+    let plausible = date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && matches!(&date[4..6], "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11" | "12")
+        && (1..=31).contains(&date[6..].parse::<u8>().ok()?);
+    if !plausible || version.len() > 64 {
+        return None;
+    }
+    let version = Version::parse(version).ok().filter(|v| v.build.is_empty())?;
+    Some((version, date.parse().ok()?))
 }
 
 /// Reads a version as a system package manager reports it, dropping what the packaging adds:
@@ -145,6 +171,29 @@ mod tests {
         for bad in ["", "v", "latest", "1", "1.x.0", "0.5.", &"9".repeat(80)] {
             assert_eq!(parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn reads_udincraft_tags_as_their_version_with_the_date_apart() {
+        assert_eq!(udincraft_tag("udincraft-v0.18.1-20261127"), Some((Version::new(0, 18, 1), 20_261_127)));
+        assert_eq!(v("udincraft-v0.18.1-20261127"), Version::new(0, 18, 1));
+        assert!(is_stable(&v("udincraft-v0.18.1-20261127")), "the date is not a pre-release");
+        assert_eq!(v("udincraft-v0.19.0-rc.1-20261201").to_string(), "0.19.0-rc.1");
+        for bad in [
+            "udincraft-v0.18.1",
+            "udincraft-v0.18.1-2026112",
+            "udincraft-v0.18.1-20261327",
+            "udincraft-v0.18.1-20261100",
+            "udincraft-v0.18-20261127",
+            "udincraft-v0.18.1+abc-20261127",
+            "udincraft-vx-20261127",
+            "udincraft-0.18.1-20261127",
+        ] {
+            assert_eq!(udincraft_tag(bad), None, "{bad}");
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+        // Upstream's tags are versions, but never udinCraft releases.
+        assert_eq!(udincraft_tag("v0.19.1"), None);
     }
 
     #[test]

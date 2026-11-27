@@ -249,7 +249,9 @@ async fn picture(url: &str) -> Result<Vec<u8>, PictureError> {
 
 /// The latest release; `Err(Some(reset))` when rate-limited, `Err(None)` on other failures.
 async fn latest(repo: &str, prereleases: bool) -> Result<LatestRelease, Option<i64>> {
-    let url = if prereleases {
+    // Fork-only (udinCraft): a fork's list is read, and only its `udincraft-v*` releases count.
+    let udincraft = catalog::udincraft_repo(repo);
+    let url = if prereleases || udincraft {
         format!("https://api.github.com/repos/{repo}/releases?per_page=30")
     } else {
         format!("https://api.github.com/repos/{repo}/releases/latest")
@@ -271,7 +273,9 @@ async fn latest(repo: &str, prereleases: bool) -> Result<LatestRelease, Option<i
         _ => return Err(None),
     }
     let text = JsFuture::from(resp.text().map_err(|_| None)?).await.map_err(|_| None)?.as_string().ok_or(None)?;
-    let found: Option<Release> = if prereleases {
+    let found: Option<Release> = if udincraft {
+        release::parse_udincraft_release_list(&text, repo, prereleases).map_err(|_| None)?
+    } else if prereleases {
         release::parse_github_release_list(&text, repo, true).map_err(|_| None)?
     } else {
         Some(release::parse_github_release(&text, repo).map_err(|_| None)?)

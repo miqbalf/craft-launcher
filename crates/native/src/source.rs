@@ -16,8 +16,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
+use artcraft_launcher_core::catalog::udincraft_repo;
 use artcraft_launcher_core::protocol::{LatestRelease, Source};
 use artcraft_launcher_core::release::{self, Release};
+use artcraft_launcher_core::version;
 use serde::{Deserialize, Serialize};
 
 use crate::http::{Fetched, Http};
@@ -122,7 +124,9 @@ impl GitHubSource {
     }
 
     fn ask_api(&self, repo: &str, prereleases: bool) -> Result<Option<Answer>, String> {
-        let url = if prereleases {
+        // Fork-only (udinCraft): a fork's `releases/latest` could be any tag, so its list is read
+        // and only `udincraft-v*` releases count (see [`read_release_list`]).
+        let url = if prereleases || udincraft_repo(repo) {
             format!("https://api.github.com/repos/{repo}/releases?per_page=30")
         } else {
             format!("https://api.github.com/repos/{repo}/releases/latest")
@@ -132,11 +136,7 @@ impl GitHubSource {
             |release: Option<Release>| Answer { latest: release.map_or(LatestRelease::None, LatestRelease::Found), source: Source::GitHubApi };
         match self.http.get_api(&url, saved.as_ref().and_then(|e| e.etag.as_deref()))? {
             Fetched::Body { text, etag } => {
-                let release = if prereleases {
-                    release::parse_github_release_list(&text, repo, true)?
-                } else {
-                    Some(release::parse_github_release(&text, repo)?)
-                };
+                let release = read_release_list(&text, repo, prereleases)?;
                 self.store(repo, Entry { etag, release: release.clone(), prereleases, fetched_at: crate::now() });
                 Ok(Some(found(release)))
             }
@@ -192,6 +192,11 @@ impl GitHubSource {
             // confident "Coming soon" on every card, so let the saved answer stand in instead.
             return Err("the latest-release redirect went somewhere that isn't github.com's".into());
         };
+        // Fork-only (udinCraft): only a `udincraft-v*` release is one of the fork's builds.
+        // Another latest tag says nothing about them, so the saved answer stands in.
+        if udincraft_repo(repo) && version::udincraft_tag(&tag).is_none() {
+            return Err(format!("the latest release of {repo} ({tag}) isn't a udinCraft release"));
+        }
         if let Some(e) = self.entry(repo, false)
             && let Some(r) = e.release.as_ref().filter(|r| r.tag == tag)
         {
@@ -201,9 +206,29 @@ impl GitHubSource {
         // Not `note_pages_error`: this one redirects to GitHub's asset CDN, so its failure says
         // nothing about whether github.com itself can be reached for the next app.
         let sums = self.http.get_text(&sums_url)?.map(|t| release::parse_sha256sums(&t)).unwrap_or_default();
+        // Fork-only (udinCraft): a udinCraft release without its sums is no release to install.
+        if udincraft_repo(repo) && sums.is_empty() {
+            return Err(format!("{tag} of {repo} publishes no SHA256SUMS.txt"));
+        }
         let r = release::release_from_sums(repo, &tag, &sums);
         self.store(repo, Entry { etag: None, release: Some(r.clone()), prereleases: false, fetched_at: crate::now() });
         Ok(Answer { latest: LatestRelease::Found(r), source: Source::GitHubPages })
+    }
+}
+
+/// Reads the API's answer for `repo`: `GET /releases` (a list) when `prereleases` or for a
+/// udinCraft fork, else `GET /releases/latest`.
+///
+/// Fork-only (udinCraft): a fork's list counts only its `udincraft-v<version>-<YYYYMMDD>`
+/// releases that publish `SHA256SUMS.txt` ([`release::parse_udincraft_release_list`]). With none
+/// yet, the answer is "no release", never an upstream build.
+fn read_release_list(text: &str, repo: &str, prereleases: bool) -> Result<Option<Release>, String> {
+    if udincraft_repo(repo) {
+        release::parse_udincraft_release_list(text, repo, prereleases)
+    } else if prereleases {
+        release::parse_github_release_list(text, repo, true)
+    } else {
+        Some(release::parse_github_release(text, repo)).transpose()
     }
 }
 
@@ -277,6 +302,8 @@ impl ReleaseSource for GitHubSource {
         }
         let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
         let list = match self.http.get_api(&url, None)? {
+            // Fork-only (udinCraft): only the fork's own builds can be chosen.
+            Fetched::Body { text, .. } if udincraft_repo(repo) => release::parse_udincraft_releases(&text, repo)?,
             Fetched::Body { text, .. } => release::parse_github_versions(&text, repo)?,
             Fetched::NotFound => Vec::new(),
             Fetched::RateLimited { reset } => {
@@ -299,7 +326,10 @@ impl ReleaseSource for GitHubSource {
 
     fn newest_tag(&self, repo: &str) -> Option<String> {
         match self.http.redirect_target(&format!("https://github.com/{repo}/releases/latest")) {
-            Ok(location) => location.as_deref().and_then(|l| release::tag_from_redirect(l, repo)),
+            Ok(location) => location
+                .as_deref()
+                .and_then(|l| release::tag_from_redirect(l, repo))
+                .filter(|tag| !udincraft_repo(repo) || version::udincraft_tag(tag).is_some()),
             Err(e) => {
                 log::debug!("{repo}: couldn't read the latest-release redirect: {e}");
                 None
@@ -331,6 +361,7 @@ impl ReleaseSource for GitHubSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use artcraft_launcher_core::platform::{Arch, Os, Platform, pick_asset};
     use std::cell::Cell;
 
     const REPO: &str = "storytold/photocraft";
@@ -462,6 +493,74 @@ mod tests {
         assert!(source.pages_quiet());
         let err = source.ask_pages(REPO).unwrap_err();
         assert!(err.contains("couldn't be reached a moment ago"), "{err}");
+    }
+
+    const UDIN: &str = "miqbalf/wordcraft";
+    const HASH: &str = "8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1";
+
+    /// GitHub's answer for a release of [`UDIN`] tagged `tag`, with RL1's file names.
+    fn udin_release(tag: &str, version: &str) -> String {
+        let dl = format!("https://github.com/{UDIN}/releases/download/{tag}");
+        format!(
+            r#"{{"tag_name":"{tag}","draft":false,"prerelease":false,"html_url":"https://github.com/{UDIN}/releases/tag/{tag}",
+            "assets":[{{"name":"wordcraft-{version}-macos-universal.dmg","size":1,"browser_download_url":"{dl}/wordcraft-{version}-macos-universal.dmg","digest":"sha256:{HASH}"}},
+                      {{"name":"wordcraft-{version}-linux-x86_64.AppImage","size":1,"browser_download_url":"{dl}/wordcraft-{version}-linux-x86_64.AppImage"}},
+                      {{"name":"wordcraft-{version}-windows-x64-portable.zip","size":1,"browser_download_url":"{dl}/wordcraft-{version}-windows-x64-portable.zip"}},
+                      {{"name":"SHA256SUMS.txt","size":1,"browser_download_url":"{dl}/SHA256SUMS.txt"}}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_udincraft_fork_answers_only_with_its_udincraft_releases() {
+        // An upstream-style release on the fork (newer by version) and two udinCraft builds.
+        let list = format!(
+            "[{},{},{}]",
+            udin_release("v0.19.1", "0.19.1"),
+            udin_release("udincraft-v0.18.1-20261128", "0.18.1"),
+            udin_release("udincraft-v0.18.0-20261120", "0.18.0")
+        );
+        let r = read_release_list(&list, UDIN, false).unwrap().unwrap();
+        assert_eq!(r.tag, "udincraft-v0.18.1-20261128");
+        assert_eq!(r.version, Some(artcraft_launcher_core::version::Version::new(0, 18, 1)));
+        // Its files are the fork's, and the installer finds one for every desktop system.
+        let stems = ["wordcraft"];
+        for platform in [
+            Platform { os: Os::MacOs, arch: Arch::Arm64 },
+            Platform { os: Os::Linux, arch: Arch::X64 },
+            Platform { os: Os::Windows, arch: Arch::X64 },
+        ] {
+            let (asset, _) = pick_asset(&r, &stems, platform, platform.default_kinds()).unwrap_or_else(|| panic!("{platform:?}"));
+            assert!(asset.url.starts_with("https://github.com/miqbalf/wordcraft/releases/download/udincraft-v0.18.1-20261128/"), "{}", asset.url);
+        }
+        // No udinCraft release yet: no release, not the upstream-style one.
+        assert_eq!(read_release_list(&format!("[{}]", udin_release("v0.19.1", "0.19.1")), UDIN, false).unwrap(), None);
+        assert_eq!(read_release_list("[]", UDIN, false).unwrap(), None);
+        // Upstream apps are read as before.
+        let upstream = udin_release("v0.6.0", "0.6.0").replace(UDIN, REPO).replace("wordcraft-", "photocraft-");
+        assert_eq!(read_release_list(&upstream, REPO, false).unwrap().unwrap().tag, "v0.6.0");
+    }
+
+    /// Read-only, against the real GitHub: run with `cargo test -p artcraft-launcher-native --lib
+    /// -- --ignored live_udincraft`. Each fork answers with a udinCraft release or, before the
+    /// first one is published, with "no release": never an upstream build, never a failure.
+    #[test]
+    #[ignore = "asks the real GitHub API"]
+    fn live_udincraft_forks_answer_with_their_own_release_or_none_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = GitHubSource::new(Http::new().unwrap(), dir.path().join("releases.json"));
+        for repo in ["miqbalf/wordcraft", artcraft_launcher_core::catalog::LAUNCHER_REPO] {
+            let answer = source.latest(repo, false);
+            match &answer.latest {
+                LatestRelease::None => println!("{repo}: no udinCraft release yet ({:?})", answer.source),
+                LatestRelease::Found(r) => {
+                    println!("{repo}: {} ({:?})", r.tag, answer.source);
+                    assert!(version::udincraft_tag(&r.tag).is_some(), "{repo}: {}", r.tag);
+                    assert!(r.assets.iter().all(|a| a.url.starts_with(&format!("https://github.com/{repo}/releases/download/"))));
+                }
+                LatestRelease::Failed(why) => panic!("{repo}: {why}"),
+            }
+            assert!(source.newest_tag(repo).is_none_or(|tag| version::udincraft_tag(&tag).is_some()));
+        }
     }
 
     #[test]

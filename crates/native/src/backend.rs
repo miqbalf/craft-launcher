@@ -277,9 +277,6 @@ fn open_live_in_app(
     install::open_live(def, &installed, session, file)
 }
 
-/// Why the launcher doesn't install or update a udinCraft app, followed by where its releases are.
-const UDINCRAFT_UPDATES: &str = "Updates come from udinCraft";
-
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
@@ -522,12 +519,6 @@ impl NativeBackend {
         let uninstall = matches!(work, Work::Uninstall);
         let app = CraftApp::by_id(app_id)?;
         if self.platform.is_some_and(|p| !app.runs_on(p.os)) {
-            return None;
-        }
-        // Fork-only (udinCraft): its upstream release would replace the fork's build, so it is
-        // never installed from here, by a click or by automation. Removing it still works.
-        if !uninstall && let Some(releases) = artcraft_launcher_core::catalog::udincraft_releases(app.id) {
-            self.shared.emit(Event::Notice { app: app.id.to_string(), result: Err(format!("{UDINCRAFT_UPDATES}: {releases}")) });
             return None;
         }
         log::info!("{}: starting {} job", app.name, if uninstall { "uninstall" } else { "install/update" });
@@ -1310,15 +1301,16 @@ fn check_app(
 /// Offers the launcher's own update when its answer is a newer release than the running one,
 /// keeping `repo`, the repo it was read from, for the download's link check.
 fn launcher_update(paths: &Paths, latest: Option<LatestRelease>, repo: &str, shared: &Arc<Shared>) {
-    // Fork-only (udinCraft): upstream's launcher releases are never offered in place of this build.
-    if !artcraft_launcher_core::catalog::SELF_UPDATE_FROM_UPSTREAM {
+    // Fork-only (udinCraft): upstream's launcher releases are never offered in place of this
+    // build; the fork's own `udincraft-v*` releases are.
+    if !artcraft_launcher_core::catalog::SELF_UPDATE_FROM_UPSTREAM && !artcraft_launcher_core::catalog::udincraft_repo(repo) {
         return;
     }
     let Some(LatestRelease::Found(r)) = latest else { return };
     let (Some(newest), Some(current)) = (r.version.as_ref(), crate::self_update::current_version()) else { return };
     if version::is_newer(newest, &current) && !crate::self_update::just_updated_to(paths, &r) {
         shared.self_install.get_or_init(crate::self_update::current);
-        shared.self_updating.get_or_init(crate::self_update::is_self_updating);
+        shared.self_updating.get_or_init(crate::self_update::fork_updates_itself);
         *shared.launcher_release.lock().unwrap_or_else(PoisonError::into_inner) = Some((r.clone(), repo.to_string()));
         shared.emit(Event::LauncherUpdate(r));
     }
@@ -2806,7 +2798,9 @@ mod tests {
     /// held, not run, so this checks the order of the steps and doesn't race threads: starting
     /// each job as soon as it is prepared would find only the first app in line.
     #[test]
-    fn udincraft_apps_are_never_installed_from_upstream() {
+    fn udincraft_apps_install_and_update_like_any_other_app() {
+        // Their releases are the forks' own now (see `udincraft_apps_ask_only_their_fork`), so
+        // an install or update job starts as for every other app.
         let Some(platform) = native_platform() else { return };
         let dir = tempfile::tempdir().unwrap();
         let mut backend = backend(dir.path(), platform, None);
@@ -2815,27 +2809,54 @@ mod tests {
             let started = started.clone();
             Arc::new(move |_work| *started.lock().unwrap() += 1)
         };
-        let udin: Vec<String> = artcraft_launcher_core::catalog::UDINCRAFT_APPS.iter().map(|id| id.to_string()).collect();
-        backend.install_all(&udin);
-        assert!(!backend.start_job("wordcraft", Work::Install(None)));
-        assert!(!backend.start_job("gridcraft", Work::Replace("/x".to_string())));
-        assert_eq!(*started.lock().unwrap(), 0, "no install or update job for a udinCraft app");
-        let told = backend
-            .shared
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, Event::Notice { app, result: Err(m) } if app == "wordcraft" && m.contains("miqbalf/wordcraft/releases")));
-        assert!(told, "the user is told where its updates come from");
-        // Another catalog app still installs from upstream.
-        let other = artcraft_launcher_core::SUITE
-            .iter()
-            .find(|app| app.runs_on(platform.os) && !artcraft_launcher_core::catalog::from_udincraft(app.id))
-            .map(|app| app.id)
-            .unwrap();
-        assert!(backend.start_job(other, Work::Install(None)));
-        assert_eq!(*started.lock().unwrap(), 1);
+        assert!(backend.start_job("wordcraft", Work::Install(None)));
+        assert!(backend.start_job("gridcraft", Work::Replace("/x".to_string())));
+        assert_eq!(*started.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn udincraft_apps_ask_only_their_fork() {
+        /// GitHub, recording which repos it was asked about.
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<String>>);
+        impl ReleaseSource for Recorder {
+            fn latest(&self, repo: &str, _pre: bool) -> Answer {
+                self.0.lock().unwrap().push(repo.to_string());
+                let found =
+                    Release { tag: "udincraft-v0.18.1-20261127".into(), version: version::parse("udincraft-v0.18.1-20261127"), ..Release::default() };
+                Answer { latest: LatestRelease::Found(found), source: Source::GitHubApi }
+            }
+            fn cached(&self, _repo: &str, _pre: bool) -> Option<LatestRelease> {
+                None
+            }
+            fn rate_limited_until(&self) -> Option<i64> {
+                None
+            }
+            fn save(&self) {}
+            fn newest_tag(&self, repo: &str) -> Option<String> {
+                self.0.lock().unwrap().push(format!("redirect {repo}"));
+                Some("v9.9.9".into())
+            }
+        }
+        // A fresh feed that has upstream's WordCraft 0.19.1 and the launcher.
+        let feed = Feed::parse(
+            r#"{"release_info":{"apps":{
+              "wordcraft":{"repo":"storytold/wordcraft","app_last_fetched":"2026-10-09T13:00:00Z","latest_release":{"tag":"v0.19.1","assets":[]}},
+              "artcraft-launcher":{"repo":"storytold/craft-launcher","app_last_fetched":"2026-10-09T13:00:00Z","latest_release":{"tag":"v0.20.0","assets":[]}}}}}"#,
+        )
+        .unwrap();
+        let github = Recorder::default();
+        for (app, repo) in [(CraftApp::by_id("wordcraft").unwrap(), "miqbalf/wordcraft"), (&LAUNCHER, "miqbalf/craft-launcher")] {
+            for force in [false, true] {
+                let (latest, origin, used) = latest_for(app, Some(&feed), LOADED, &github, &shared(), false, force, NOW);
+                assert!(matches!(latest, Some(LatestRelease::Found(ref r)) if r.tag == "udincraft-v0.18.1-20261127"), "{latest:?}");
+                assert_eq!((origin, used), (Origin::GitHub, Some(Source::GitHubApi)));
+                assert_eq!(feed_repo(Some(&feed), app), repo);
+            }
+        }
+        let asked = github.0.lock().unwrap().clone();
+        assert!(asked.iter().all(|r| r.starts_with("miqbalf/")), "only the forks are asked: {asked:?}");
+        assert_eq!(asked.len(), 4);
     }
 
     #[test]
@@ -2843,13 +2864,7 @@ mod tests {
         let Some(platform) = native_platform() else { return };
         let dir = tempfile::tempdir().unwrap();
         let mut backend = backend(dir.path(), platform, None);
-        // udinCraft apps are never installed from here (see `udincraft_apps_are_never_installed_from_upstream`).
-        let ids: Vec<&str> = artcraft_launcher_core::SUITE
-            .iter()
-            .filter(|app| app.runs_on(platform.os) && !artcraft_launcher_core::catalog::from_udincraft(app.id))
-            .map(|app| app.id)
-            .take(3)
-            .collect();
+        let ids: Vec<&str> = artcraft_launcher_core::SUITE.iter().filter(|app| app.runs_on(platform.os)).map(|app| app.id).take(3).collect();
         assert_eq!(ids.len(), 3);
         type Held = Vec<Box<dyn FnOnce() + Send>>;
         let held: Arc<Mutex<Held>> = Arc::default();

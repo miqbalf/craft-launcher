@@ -360,11 +360,21 @@ mod tests {
     #[test]
     fn website_fixture_verifies_with_the_actual_pinned_public_key() {
         let catalog = VerifiedCatalog::verify(WEBSITE, SIGNATURE).unwrap();
-        assert_eq!(catalog.records.len(), SUITE.len());
-        assert_eq!(catalog.rejected_entries, 0);
+        // Fork-only (udinCraft): upstream's signed records of the udinCraft apps name
+        // storytold's repos, so they don't match the pinned fork entries and are dropped; the
+        // bundled entries (miqbalf/<id>) stand in for them.
+        let udincraft = crate::catalog::UDINCRAFT_APPS.len();
+        assert_eq!(catalog.records.len(), SUITE.len() - udincraft);
+        assert_eq!(catalog.rejected_entries, udincraft);
         for record in &catalog.records {
+            assert!(!crate::catalog::from_udincraft(&record.id), "{}", record.id);
             let bundled = SUITE.iter().find(|app| app.id == record.id).unwrap();
             assert_eq!(record.repo, bundled.repo);
+        }
+        let snapshot = catalog.into_snapshot(HashMap::new());
+        for id in crate::catalog::UDINCRAFT_APPS {
+            let app = snapshot.apps.iter().find(|a| a.id == id).unwrap();
+            assert_eq!(app.repo, format!("miqbalf/{id}"), "a signed upstream catalog can't send {id} back to storytold");
         }
     }
 

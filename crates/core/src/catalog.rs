@@ -73,8 +73,12 @@ impl CraftApp {
     }
 
     /// Whether the launcher installs this app from a `kind` package.
+    ///
+    /// Fork-only (udinCraft): a udinCraft app's macOS build carries no Developer ID (the fork's
+    /// builds are signed ad hoc), yet it installs: it is checked against its release's
+    /// `SHA256SUMS.txt` and its own signature's integrity instead (see [`UDINCRAFT_APPS`]).
     pub fn installs(&self, kind: crate::PackageKind) -> bool {
-        kind != crate::PackageKind::Dmg || self.mac_team.is_some()
+        kind != crate::PackageKind::Dmg || self.mac_team.is_some() || from_udincraft(self.id)
     }
 
     /// Whether this app runs on the given operating system.
@@ -182,28 +186,42 @@ pub const LAUNCHER: CraftApp = app(
     "ArtCraft Launcher",
     "Installs and updates the Craft App Suite",
     [[0x0b, 0x0b, 0x0c], [0x0b, 0x0b, 0x0c], [0xf2, 0xf1, 0xee]],
-    "storytold/craft-launcher",
+    "miqbalf/craft-launcher",
 );
 
-/// The launcher's own repo, checked so it can say when a newer launcher is out.
-pub const LAUNCHER_REPO: &str = "storytold/craft-launcher";
+/// The launcher's own repo, checked so it can say when a newer launcher is out. Fork-only
+/// (udinCraft): the fork's, whose `udincraft-v*` releases are this build's updates.
+pub const LAUNCHER_REPO: &str = "miqbalf/craft-launcher";
 
-/// Fork-only (udinCraft): whether the launcher offers [`LAUNCHER_REPO`]'s releases as its own
-/// update. It doesn't: those are upstream's builds, without this fork's features (the Cloud page),
-/// so installing one would replace this build with a different app. Updates for this build come
-/// from the fork ([`FORK_RELEASES_URL`]). The Craft apps' updates are unchanged.
+/// Fork-only (udinCraft): whether the launcher offers upstream's (`storytold/craft-launcher`)
+/// releases as its own update. It doesn't: those are upstream's builds, without this fork's
+/// features (the Cloud page), so installing one would replace this build with a different app.
+/// Updates for this build come from the fork's own `udincraft-v*` releases ([`LAUNCHER_REPO`]).
 pub const SELF_UPDATE_FROM_UPSTREAM: bool = false;
 /// Fork-only (udinCraft): where this build's releases are published.
 pub const FORK_RELEASES_URL: &str = "https://github.com/miqbalf/craft-launcher/releases";
+/// Fork-only (udinCraft): the GitHub account of the udinCraft forks.
+pub const UDINCRAFT_OWNER: &str = "miqbalf";
 /// Fork-only (udinCraft, owner 2026-11-27): the apps whose builds come from the udinCraft forks
-/// (Cloud files, live editing, the udinCraft marks). The launcher never installs or updates them
-/// from their upstream releases, which would replace the fork's build with a different app; it
-/// points to [`udincraft_releases`] instead. Every other catalog app updates from upstream.
+/// (Cloud files, live editing, the udinCraft marks). Their catalog entries point at the forks
+/// (`miqbalf/<id>`), so the launcher installs and updates them only from the forks' own
+/// `udincraft-v<version>-<YYYYMMDD>` releases, checked against each release's `SHA256SUMS.txt`;
+/// never from upstream's, which would replace the fork's build with a different app. Every other
+/// catalog app keeps its upstream repo and updates.
 pub const UDINCRAFT_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
 
 /// Whether `id` is a udinCraft app (see [`UDINCRAFT_APPS`]).
 pub fn from_udincraft(id: &str) -> bool {
     UDINCRAFT_APPS.contains(&id)
+}
+
+/// Fork-only (udinCraft): whether `repo` is a udinCraft fork whose releases the launcher reads:
+/// a [`UDINCRAFT_APPS`] app's or the launcher's own ([`LAUNCHER_REPO`]). Only `udincraft-v*` tags
+/// count as releases there, and the release feed never speaks for them.
+pub fn udincraft_repo(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else { return false };
+    owner.eq_ignore_ascii_case(UDINCRAFT_OWNER)
+        && (UDINCRAFT_APPS.iter().any(|id| name.eq_ignore_ascii_case(id)) || name.eq_ignore_ascii_case("craft-launcher"))
 }
 
 /// Where a udinCraft app's releases are published, for [`UDINCRAFT_APPS`] only.
@@ -272,10 +290,38 @@ mod tests {
             // `Craft Anything` is `craft-anything`.
             assert_eq!(a.name.to_lowercase().replace(' ', "-"), a.id);
             match a.kind {
+                // Fork-only (udinCraft): the udinCraft apps come from the forks.
+                AppKind::Official if from_udincraft(a.id) => assert_eq!(a.repo, format!("miqbalf/{}", a.id)),
                 AppKind::Official => assert_eq!(a.repo, format!("storytold/{}", a.id)),
                 AppKind::Community => assert!(!a.repo.starts_with("storytold/"), "{} is community", a.id),
             }
         }
+    }
+
+    #[test]
+    fn udincraft_apps_and_the_launcher_come_from_the_forks() {
+        for id in UDINCRAFT_APPS {
+            let app = CraftApp::by_id(id).unwrap();
+            assert_eq!(app.repo, format!("miqbalf/{id}"));
+            assert!(udincraft_repo(app.repo), "{id}");
+            assert_eq!(app.releases_url(), udincraft_releases(id).unwrap());
+            // Signed ad hoc, so no Developer ID team, yet the DMG installs (checked by its sums).
+            assert_eq!(app.mac_team, None, "{id}");
+            assert!(app.installs(crate::PackageKind::Dmg), "{id}");
+            // The install identity stays the app's own, so an existing copy is found and updated.
+            assert_eq!(app.bundle_id(), format!("ai.storyteller.{id}"));
+        }
+        assert_eq!(LAUNCHER.repo, LAUNCHER_REPO);
+        assert!(udincraft_repo(LAUNCHER_REPO));
+        // Everything else keeps upstream: no other app reads the forks.
+        for app in SUITE.iter().filter(|a| !from_udincraft(a.id)) {
+            assert!(!udincraft_repo(app.repo), "{}", app.id);
+            assert!(!app.repo.starts_with("miqbalf/"), "{}", app.id);
+        }
+        for repo in ["storytold/wordcraft", "miqbalf/photocraft", "miqbalf", "miqbalf/wordcraft/x", "someone/wordcraft"] {
+            assert!(!udincraft_repo(repo), "{repo}");
+        }
+        assert!(udincraft_repo("MiqbalF/WordCraft"));
     }
 
     #[test]
@@ -290,7 +336,7 @@ mod tests {
         assert_eq!(sc.website(), "https://solidcraft.io");
         assert!(sc.installs(crate::PackageKind::Dmg) && sc.installs(crate::PackageKind::Msi) && sc.installs(crate::PackageKind::Flatpak));
         assert_eq!(sc.mac_team, Some("G5QA5U5X2S"));
-        assert_eq!(CraftApp::by_id("gridcraft").unwrap().mac_team, Some(ARTCRAFT_TEAM_ID));
+        assert_eq!(CraftApp::by_id("photocraft").unwrap().mac_team, Some(ARTCRAFT_TEAM_ID));
     }
 
     #[test]

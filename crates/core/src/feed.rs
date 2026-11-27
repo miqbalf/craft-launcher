@@ -159,6 +159,12 @@ impl Feed {
 
     /// What the feed says about `app` at `now`.
     pub fn answer(&self, app: &CraftApp, now: i64) -> FeedAnswer {
+        // Fork-only (udinCraft): the feed lists upstream's releases. A udinCraft app (and the
+        // launcher) reads only its fork's `udincraft-v*` releases on GitHub, whatever the feed or a
+        // local mirror says about it.
+        if crate::catalog::udincraft_repo(app.repo) {
+            return FeedAnswer::AskGitHub;
+        }
         let Some(entry) = self.apps.get(app.id) else { return FeedAnswer::AskGitHub };
         let Some(fetched_at) = entry.fetched_at else { return FeedAnswer::AskGitHub };
         // A timestamp from the future (clock skew) counts as just now; one too old doesn't count.
@@ -476,6 +482,27 @@ mod tests {
 
     fn app(id: &str) -> &'static CraftApp {
         CraftApp::by_id(id).unwrap()
+    }
+
+    #[test]
+    fn the_feed_never_speaks_for_a_udincraft_app() {
+        // Upstream's fresh WordCraft entry, with and without its repo named, even from a mirror.
+        let entry = |repo: &str| {
+            format!(
+                r#"{{"release_info":{{"apps":{{"wordcraft":{{{repo}"app_last_fetched":"2026-10-09T13:00:00Z",
+                "latest_release":{{"tag":"v0.19.1","assets":[{{"name":"wordcraft-0.19.1-macos-universal.dmg","size_bytes":1,
+                "download_url":"https://github.com/storytold/wordcraft/releases/download/v0.19.1/wordcraft-0.19.1-macos-universal.dmg","sha256":"{HASH}"}}]}}}},
+                "artcraft-launcher":{{{repo}"app_last_fetched":"2026-10-09T13:00:00Z","latest_release":{{"tag":"v0.20.0"}}}}}}}}}}"#
+            )
+        };
+        for repo in [r#""repo":"storytold/wordcraft","#, ""] {
+            let feed = Feed::parse(&entry(repo)).unwrap();
+            assert_eq!(feed.answer(app("wordcraft"), NOW), FeedAnswer::AskGitHub, "{repo}");
+            assert_eq!(feed.answer(&LAUNCHER, NOW), FeedAnswer::AskGitHub, "{repo}");
+            let mirrored = feed.with_mirror("http://127.0.0.1:8080/");
+            assert_eq!(mirrored.answer(app("wordcraft"), NOW), FeedAnswer::AskGitHub, "{repo}");
+        }
+        assert_eq!(Feed::default().repo_for(app("wordcraft")), "miqbalf/wordcraft");
     }
 
     #[test]

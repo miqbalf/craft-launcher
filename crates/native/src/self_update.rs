@@ -30,6 +30,26 @@ pub fn is_self_updating() -> bool {
     craft_update::self_update::is_self_updating(&craft_update::suite::LAUNCHER)
 }
 
+/// Fork-only (udinCraft): whether this copy installs the fork's own release ([`LAUNCHER_REPO`]'s
+/// `udincraft-v*`) itself, rather than offering its download.
+///
+/// craft-update's swap checks the new copy the way upstream signs it: on macOS a Developer ID
+/// signature from ArtCraft's team, on Windows an Authenticode signature like this copy's. The
+/// fork's builds carry neither (macOS ad hoc, Windows unsigned), so there the update would only
+/// fail after its download; it is offered as a download of the fork's release instead. On Linux
+/// (an AppImage or a standalone copy) nothing is signed, and the download is checked against the
+/// release's checksums, so the copy updates itself.
+///
+/// [`LAUNCHER_REPO`]: artcraft_launcher_core::catalog::LAUNCHER_REPO
+pub fn fork_updates_itself() -> bool {
+    fork_installs_on(Platform::current().map(|p| p.os)) && is_self_updating()
+}
+
+/// [`fork_updates_itself`]'s rule for one operating system.
+fn fork_installs_on(os: Option<artcraft_launcher_core::Os>) -> bool {
+    os == Some(artcraft_launcher_core::Os::Linux)
+}
+
 fn to_update_paths(paths: &Paths) -> craft_update::Paths {
     craft_update::Paths { data: paths.data.clone(), cache: paths.cache.clone() }
 }
@@ -173,6 +193,35 @@ pub fn finish(args: &[OsString]) -> Option<Result<(), String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fork-only (udinCraft): only Linux copies install the fork's unsigned release themselves;
+    /// macOS and Windows offer its download.
+    #[test]
+    fn the_fork_installs_its_own_launcher_release_only_on_linux() {
+        use artcraft_launcher_core::Os;
+        assert!(fork_installs_on(Some(Os::Linux)));
+        for os in [Some(Os::MacOs), Some(Os::Windows), Some(Os::FreeBsd), None] {
+            assert!(!fork_installs_on(os), "{os:?}");
+        }
+    }
+
+    /// Fork-only (udinCraft): the fork's launcher release passes craft-update's link check when it
+    /// carries the fork's repo, as the launcher's update check hands it over.
+    #[test]
+    fn the_forks_launcher_release_passes_the_link_check() {
+        let app = &craft_update::suite::LAUNCHER;
+        let repo = artcraft_launcher_core::catalog::LAUNCHER_REPO;
+        let tag = "udincraft-v0.19.3-20261201";
+        let r = artcraft_launcher_core::release::release_from_sums(
+            repo,
+            tag,
+            &[("a".repeat(64), "artcraft-launcher-0.19.3-linux-x86_64.AppImage".into())],
+        );
+        assert_eq!(r.version, Some(Version::new(0, 19, 3)));
+        let carried = to_update_release(&r, repo);
+        assert_eq!(carried.version, Some(Version::new(0, 19, 3)), "the version comes from the launcher, not craft-update's tag reading");
+        assert!(craft_update::install::check_download_link(app, &carried, &carried.assets[0]).is_ok());
+    }
 
     /// craft-update downloads only links in the repository the release was read from: a release
     /// read from the repository the feed renamed the launcher's to passes when it carries that

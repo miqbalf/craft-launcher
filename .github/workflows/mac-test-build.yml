@@ -34,6 +34,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Cloud tests on macOS
         run: cargo test -p artcraft-launcher-native --test it cloud
+      # udinCraft updates (UR1): the macOS-only install checks (the ad hoc fork build's verifier
+      # and its install path) compile and pass only here.
+      - name: udinCraft update tests on macOS
+        run: |
+          cargo clippy --locked -p artcraft-launcher-core -p artcraft-launcher-native --all-targets -- -D warnings
+          cargo test --locked -p artcraft-launcher-core -- udincraft
+          cargo test --locked -p artcraft-launcher-native --lib -- udincraft macos_verify macos_checks
       - name: Package (universal, ad-hoc signed, not notarized)
         run: packaging/macos/package.sh --arch universal
       - name: Zip the app too
