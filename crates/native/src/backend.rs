@@ -1706,6 +1706,16 @@ impl Backend for NativeBackend {
                     self.shared.emit(Event::JobFinished { app, result: Err(e) });
                 }
             }
+            Command::OpenLocal { app, path } => {
+                let Some(def) = CraftApp::by_id(&app) else { return };
+                let result = match self.installed(&app) {
+                    Some(inst) => install::open_local(def, &inst, &self.paths, std::path::Path::new(&path)),
+                    None => Err(format!("{} isn't installed. Install it from the list.", def.name)),
+                };
+                if let Err(e) = result {
+                    self.shared.emit(Event::JobFinished { app, result: Err(e) });
+                }
+            }
             Command::Reveal { app } => {
                 if let Some(inst) = self.installed(&app) {
                     let path = std::path::PathBuf::from(&inst.location);

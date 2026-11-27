@@ -1273,6 +1273,18 @@ fn drive_accesskit_click(
     time: f64,
     two_passes: bool,
 ) {
+    drive_accesskit_click_on(launcher, ctx, target, time, two_passes, &mut NoHost);
+}
+
+/// [`drive_accesskit_click`] with the shell's side played by `host`.
+fn drive_accesskit_click_on(
+    launcher: &mut LauncherUi,
+    ctx: &egui::Context,
+    target: (egui::accesskit::NodeId, egui::accesskit::TreeId),
+    time: f64,
+    two_passes: bool,
+    host: &mut dyn Host,
+) {
     let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1180.0, 1200.0));
     let mut priming = ctx.run_ui(egui::RawInput { screen_rect: Some(screen_rect), time: Some(time), ..Default::default() }, |_| {});
     priming.textures_delta.clear();
@@ -1292,8 +1304,8 @@ fn drive_accesskit_click(
             // Drawing directly in root_ui addresses different nodes than the captured tree.
             root.scope_builder(egui::UiBuilder::new(), |ui| {
                 egui::Frame::central_panel(ui.style()).outer_margin(8.0).inner_margin(0.0).show(ui, |ui| {
-                    launcher.logic(&ui.ctx().clone(), &mut NoHost);
-                    launcher.ui(ui, &mut NoHost);
+                    launcher.logic(&ui.ctx().clone(), host);
+                    launcher.ui(ui, host);
                 });
             });
         });
@@ -5483,4 +5495,137 @@ fn udincraft_apps_never_offer_an_upstream_update_or_install() {
         Command::InstallAll { apps } => apps.iter().any(|a| udin(a)),
         _ => false,
     }));
+}
+
+/// The shell's file picker, scripted: each pick answers the next queued path (none: cancelled),
+/// and every type list it was shown is kept.
+#[derive(Clone, Default)]
+struct FilePicker {
+    answers: Rc<RefCell<Vec<String>>>,
+    shown: Rc<RefCell<Vec<Vec<artcraft_launcher_ui_egui::FileFilter>>>>,
+}
+impl Host for FilePicker {
+    fn pick_file(&mut self, filters: &[artcraft_launcher_ui_egui::FileFilter]) -> Option<String> {
+        self.shown.borrow_mut().push(filters.to_vec());
+        let mut answers = self.answers.borrow_mut();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    }
+}
+
+/// The usual fixture (WordCraft installed, PdfCraft not) with `picker` as the shell.
+fn local_file_harness(picker: FilePicker) -> (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>) {
+    artcraft_launcher_ui_egui::i18n::set_test_lang(artcraft_launcher_ui_egui::i18n::Lang::EN);
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut backend = Some(Fake {
+        events: events(),
+        sent: sent.clone(),
+        manage: true,
+        pictures: Rc::default(),
+        asked: Vec::new(),
+        downloads: Default::default(),
+        clock: Rc::new(Cell::new(NOW)),
+    });
+    let mut host = picker;
+    let harness = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1200.0)).build_ui_state(
+        move |ui, state: &mut Option<LauncherUi>| {
+            if let Some(backend) = backend.take() {
+                *state = Some(LauncherUi::new(ui.ctx(), Box::new(backend), Settings { notify: false, ..Default::default() }));
+            }
+            if let Some(launcher) = state {
+                launcher.logic(ui.ctx(), &mut host);
+                launcher.ui(ui, &mut host);
+            }
+        },
+        None,
+    );
+    (harness, sent)
+}
+
+fn local_opens(sent: &RefCell<Vec<Command>>) -> Vec<(String, String)> {
+    sent.borrow()
+        .iter()
+        .filter_map(|c| match c {
+            Command::OpenLocal { app, path } => Some((app.clone(), path.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// "Open local file…" in the header asks the shell for a file, offering every supported type
+/// first, and opens the pick in the installed app its type belongs to, whatever its letter case.
+#[test]
+fn open_local_file_opens_the_pick_in_its_installed_app() {
+    let picker = FilePicker::default();
+    picker.answers.borrow_mut().push("/home/a/Report.DOCX".into());
+    let (mut h, sent) = local_file_harness(picker.clone());
+    h.run_steps(8);
+    snapshot(&mut h, "open-local-file-header");
+    h.get_by_role_and_label(Role::Button, "Open local file…").click();
+    h.run_steps(3);
+    assert_eq!(local_opens(&sent), vec![("wordcraft".to_string(), "/home/a/Report.DOCX".to_string())]);
+    let shown = picker.shown.borrow().clone();
+    assert_eq!(shown.len(), 1, "one click, one picker");
+    let (first, rest) = shown[0].split_first().expect("the picker gets types");
+    assert_eq!(first.name, "All supported");
+    for filter in rest {
+        assert!(filter.extensions.iter().all(|e| first.extensions.contains(e)), "{} is inside All supported", filter.name);
+    }
+    for ext in ["docx", "xlsx", "xls", "pptx", "pdf"] {
+        assert!(first.extensions.contains(&ext), "All supported offers .{ext}");
+    }
+    // A cancelled picker opens nothing.
+    h.get_by_role_and_label(Role::Button, "Open local file…").click();
+    h.run_steps(3);
+    assert_eq!(local_opens(&sent).len(), 1);
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Launch { .. })), "a local open is not a plain launch");
+    h.check_accessibility();
+}
+
+/// A file whose app isn't installed starts nothing, says so, and shows that app's details, where
+/// it can be installed.
+#[test]
+fn open_local_file_for_an_app_not_installed_says_so_and_shows_it() {
+    let picker = FilePicker::default();
+    picker.answers.borrow_mut().push("/home/a/scan.pdf".into());
+    let (mut h, sent) = local_file_harness(picker);
+    h.run_steps(8);
+    let before = h.query_all_by_label("PdfCraft").count();
+    h.get_by_role_and_label(Role::Button, "Open local file…").click();
+    h.run_steps(10);
+    assert!(local_opens(&sent).is_empty(), "{:?}", sent.borrow());
+    h.get_by_label_contains("PdfCraft isn't installed. Install it from the list.");
+    assert!(h.query_all_by_label("PdfCraft").count() > before, "PdfCraft's details are shown too");
+}
+
+/// A type no Craft app opens starts nothing and says so.
+#[test]
+fn open_local_file_refuses_an_unsupported_type() {
+    let picker = FilePicker::default();
+    picker.answers.borrow_mut().push("/home/a/photo.jpg".into());
+    let (mut h, sent) = local_file_harness(picker);
+    h.run_steps(8);
+    sent.borrow_mut().clear();
+    h.get_by_role_and_label(Role::Button, "Open local file…").click();
+    h.run_steps(3);
+    assert!(local_opens(&sent).is_empty());
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Launch { .. })), "{:?}", sent.borrow());
+    h.get_by_label_contains("photo.jpg isn't a type the Craft apps open.");
+}
+
+/// The picker blocks, so a click repeated on a discarded pass of the same frame must not open it
+/// a second time, nor open the file twice.
+#[test]
+fn open_local_file_picks_once_across_a_discarded_pass() {
+    let picker = FilePicker::default();
+    picker.answers.borrow_mut().extend(["/home/a/Letter.docx".to_string(), "/home/a/other.docx".to_string()]);
+    let (mut h, sent) = local_file_harness(picker.clone());
+    h.run_steps(8);
+    let target = accesskit_target(&h, "Open local file…");
+    let ctx = h.ctx.clone();
+    let mut launcher = h.state_mut().take().expect("the harness built the launcher");
+    sent.borrow_mut().clear();
+    let mut host = picker.clone();
+    drive_accesskit_click_on(&mut launcher, &ctx, target, 100.0, true, &mut host);
+    assert_eq!(picker.shown.borrow().len(), 1, "one frame, one picker");
+    assert_eq!(local_opens(&sent), vec![("wordcraft".to_string(), "/home/a/Letter.docx".to_string())]);
 }

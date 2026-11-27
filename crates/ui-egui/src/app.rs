@@ -61,6 +61,11 @@ pub trait Host {
     fn pick_folder(&mut self, _initial: Option<&str>) -> Option<String> {
         None
     }
+    /// Asks for one file on this computer, offering `filters` (the first is the one shown
+    /// first). `None` when the person cancels, or where there is no file picker (the web build).
+    fn pick_file(&mut self, _filters: &[FileFilter]) -> Option<String> {
+        None
+    }
     /// The folder a new install of this format goes inside when the person hasn't chosen one, so
     /// the install-folder field can show that folder instead of only saying "System default".
     /// `arch` is the package's architecture when the release names one. `None` when this host
@@ -74,6 +79,25 @@ pub trait Host {
     }
     /// Quit the launcher for real (not just hide to the tray).
     fn quit(&mut self) {}
+}
+
+/// One entry of a file picker's type list: its name and the extensions (lowercase, no dot) it
+/// shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFilter {
+    pub name: String,
+    pub extensions: Vec<&'static str>,
+}
+
+/// The picker's types for "Open local file…": every supported type first, then one entry per app.
+fn local_file_filters() -> Vec<FileFilter> {
+    use artcraft_launcher_core::local_file::{LOCAL_TYPES, all_extensions};
+    let mut filters = vec![FileFilter { name: tl!("All supported").to_string(), extensions: all_extensions().collect() }];
+    filters.extend(LOCAL_TYPES.iter().map(|(app, exts)| FileFilter {
+        name: artcraft_launcher_core::CraftApp::by_id(app).map_or(*app, |a| a.name).to_string(),
+        extensions: exts.to_vec(),
+    }));
+    filters
 }
 
 pub(crate) struct Toast {
@@ -100,6 +124,9 @@ pub(crate) enum UiAction {
     Launch(String),
     /// Re-run the manual update check, clearing the auto-update back-off.
     CheckNow,
+    /// "Open local file…": ask the host for a file once this pass is done (see
+    /// [`LauncherUi::open_local_file`]).
+    PickLocalFile,
     /// A message a UI interaction asked to show.
     Toast {
         text: String,
@@ -252,6 +279,8 @@ pub struct LauncherUi {
     pub(crate) discord_url: &'static str,
     /// UI actions drawn in this pass, not sent yet.
     pending: Vec<UiAction>,
+    /// "Open local file…" was clicked this frame: the picker opens after the pass.
+    pick_local_file: bool,
     /// The `egui::Context::cumulative_frame_nr` those actions belong to.
     frame: Option<u64>,
     /// UI actions this visible frame has already sent, so a discarded pass cannot repeat them.
@@ -360,6 +389,7 @@ impl LauncherUi {
             auto_update_attempted: std::collections::BTreeSet::new(),
             discord_url: artcraft_launcher_core::catalog::DISCORD_URL,
             pending: Vec::new(),
+            pick_local_file: false,
             frame: None,
             flushed: Vec::new(),
             pending_toasts: Vec::new(),
@@ -484,6 +514,7 @@ impl LauncherUi {
                     self.last_detect = self.backend.now();
                 }
                 UiAction::Toast { text, error } => self.queue_toast(text.clone(), *error),
+                UiAction::PickLocalFile => self.pick_local_file = true,
             }
             self.flushed.push(action.clone());
         }
@@ -1022,6 +1053,14 @@ impl LauncherUi {
         self.details_drawer(&ctx);
         self.dialogs(&ctx, host);
         self.flush_actions();
+        // The picker blocks, so it opens after the pass, once per click: a repeated pass of the
+        // same frame never flushes the click's action again.
+        if std::mem::take(&mut self.pick_local_file) {
+            if let Some(path) = host.pick_file(&local_file_filters()) {
+                self.open_local_file(&path);
+            }
+            self.flush_actions();
+        }
         self.draw_toasts(&ctx);
         if host.title_bar() == TitleBar::Custom {
             crate::widgets::window_edges(&ctx);
@@ -1117,6 +1156,36 @@ impl LauncherUi {
         list = pinned;
         list.append(&mut rest);
         list.into_iter().map(|(_, e)| e.app.id).collect()
+    }
+
+    /// "Open local file…" was clicked: the picker opens once this pass is done.
+    pub(crate) fn pick_local_file_from_ui(&mut self) {
+        self.act(UiAction::PickLocalFile);
+    }
+
+    /// Opens `path`, a file on this computer, in the installed Craft app for its type. A type no
+    /// app opens, or an app that isn't installed, starts nothing and says why; for the latter the
+    /// Apps page shows that app's details, where it can be installed.
+    pub(crate) fn open_local_file(&mut self, path: &str) {
+        let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+        let Some(app) = artcraft_launcher_core::local_file::app_for(path) else {
+            let text = crate::i18n::fmt(
+                tl!("{name} isn't a type the Craft apps open. Choose a document, spreadsheet, presentation or PDF."),
+                &[("name", &name)],
+            );
+            self.toast_from_ui(text, true);
+            return;
+        };
+        if !self.is_installed(app) {
+            let app_name = self.entry(app).map_or(app, |e| e.app.name).to_string();
+            self.toast_from_ui(crate::i18n::fmt(tl!("{app} isn't installed. Install it from the list."), &[("app", &app_name)]), true);
+            self.page = crate::cloud::Page::Apps;
+            if artcraft_launcher_core::details::AppDetails::by_id(app).is_some() {
+                self.detail = Some(app.to_string());
+            }
+            return;
+        }
+        self.act_command(Command::OpenLocal { app: app.to_string(), path: path.to_string() });
     }
 
     /// Opens an app with its launch flags, and counts it for "Frequently used".

@@ -196,6 +196,17 @@ impl LauncherUi {
                 if widgets::nav_icon(ui, widgets::Glyph::Settings, tl!("Settings"), h, false).clicked() {
                     self.dialog = Some(Dialog::Settings);
                 }
+                // A file on this computer, opened in its Craft app: beside Settings, on every page.
+                if self.caps.manage_apps {
+                    ui.add_space(8.0);
+                    if widgets::button(ui, tl!("Open local file…"), Kind::Secondary, 0.0)
+                        .on_hover_text(tl!("Open a document, spreadsheet, presentation or PDF from this computer in its Craft app"))
+                        .clicked()
+                    {
+                        self.pick_local_file_from_ui();
+                    }
+                    ui.add_space(8.0);
+                }
                 // The controls reserve their actual widths before the secondary text gets space.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // Apps | Cloud beside the logo. Drawn after the window's own buttons, so Tab
