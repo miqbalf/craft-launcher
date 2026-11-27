@@ -441,6 +441,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// One pass of the watcher: refreshes locks that are due and uploads saves that have settled.
     /// Only the connected account's files are touched.
     pub fn tick(&self) {
+        // Grammar and AI for every Craft app, open cloud files or not.
+        self.tick_assist();
         let mut guard = self.lock_book();
         let Ok(book) = self.book(&mut guard) else { return };
         if book.list.is_empty() && book.live.is_empty() {

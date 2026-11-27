@@ -260,6 +260,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// Drops the signed-in account from memory: the watcher and every action see no account.
     fn forget_session(&self) {
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        // The apps' grammar and AI sign-in goes with it.
+        self.remove_assist_file();
         self.forget_listings();
     }
 

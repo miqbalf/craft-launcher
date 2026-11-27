@@ -64,6 +64,16 @@ impl Paths {
         self.data.join("live")
     }
 
+    /// The apps' grammar and AI sign-in (DG1): `<data>/assist`.
+    pub fn assist_root(&self) -> PathBuf {
+        self.data.join("assist")
+    }
+
+    /// The account-wide assist token file the Craft apps read: `<data>/assist/assist.json`.
+    pub fn assist_file(&self) -> PathBuf {
+        self.assist_root().join("assist.json")
+    }
+
     pub fn manifest(&self) -> PathBuf {
         self.data.join("installed.json")
     }

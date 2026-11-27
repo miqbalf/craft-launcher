@@ -242,7 +242,7 @@ pub(super) fn fetch_base<H: Http>(http: &H, base: &Base, login: &str, password: 
 }
 
 /// The value of a Basic `Authorization` header.
-fn basic(login: &str, password: &str) -> String {
+pub(super) fn basic(login: &str, password: &str) -> String {
     format!("Basic {}", base64(format!("{login}:{password}").as_bytes()))
 }
 
@@ -352,6 +352,9 @@ struct SessionRecord<'a> {
     /// The room's starting bytes (`url` absolute, `sha256`), for GridCraft and DeckCraft rooms.
     #[serde(skip_serializing_if = "Option::is_none")]
     base: Option<&'a Base>,
+    /// The grammar and AI token (DG1), renewed with the ticket; none from an older server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assist: Option<super::assist::AssistRecord<'a>>,
 }
 
 /// A file open in its app for live editing. Kept with the open files, in memory only: its app
@@ -421,7 +424,7 @@ fn new_slot(root: &Path, name: &str) -> Result<Slot, String> {
 }
 
 /// Creates `dir` readable by this user only (on Unix).
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(super) fn private_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
     #[cfg(unix)]
     {
@@ -469,6 +472,18 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let Some((server, login, password)) = self.session_credentials() else { return Err(TicketError::Status(401)) };
         let asked_at = (self.wall)();
         request_ticket(&self.http(), &server, &login, password.expose(), file_id).map(|t| Ticket { asked_at, ..t })
+    }
+
+    /// A fresh assist token for a session file: none when the server offers none (an older
+    /// Craft Office), which changes nothing else about the live session.
+    fn session_assist(&self) -> Option<super::assist::AssistToken> {
+        match self.assist_token() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::info!("no grammar and AI sign-in for a live session ({e})");
+                None
+            }
+        }
     }
 
     /// The server's id of the file at `path`: from the last listings, else from a listing of its
@@ -566,7 +581,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             return LiveOpen::Failed;
         }
         let read_only = read_only || ticket.read_only;
-        if let Err(e) = write_session(&slot.session_file, &account.server, file_id, path, &ticket, read_only) {
+        let assist = self.session_assist();
+        if let Err(e) = write_session(&slot.session_file, &account.server, file_id, path, &ticket, read_only, assist.as_ref()) {
             cleanup(&slot);
             self.closed(path, SyncStatus::ReadOnly, Some(format!("Couldn't prepare the live session ({e}).")));
             return LiveOpen::Failed;
@@ -643,7 +659,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     fn renew(&self, l: &mut LiveSession, now: Instant) {
         let result = self.ticket(l.file_id).and_then(|t| {
             let read_only = l.forced_read_only || t.read_only;
-            write_session(&l.session_file, &l.server, l.file_id, &l.path, &t, read_only)
+            let assist = self.session_assist();
+            write_session(&l.session_file, &l.server, l.file_id, &l.path, &t, read_only, assist.as_ref())
                 .map_err(|_| TicketError::Malformed("the session file couldn't be written"))
                 .map(|()| (t, read_only))
         });
@@ -838,13 +855,21 @@ fn fallback_reason(session: &Path) -> Option<String> {
 
 /// When a ticket that lasts `expires_in` seconds is renewed: at four fifths of its life (480 s
 /// of 600, as the web editor does), early enough that a reconnect never meets an expired one.
-fn refresh_after(expires_in: u64) -> Duration {
+pub(super) fn refresh_after(expires_in: u64) -> Duration {
     Duration::from_secs(expires_in.saturating_mul(4) / 5).max(MIN_REFRESH)
 }
 
 /// Writes the session file atomically (a private temporary file renamed into place, mode 0600),
 /// so the app never reads half of it.
-fn write_session(file: &Path, server: &str, file_id: u64, path: &str, t: &Ticket, read_only: bool) -> Result<(), String> {
+fn write_session(
+    file: &Path,
+    server: &str,
+    file_id: u64,
+    path: &str,
+    t: &Ticket,
+    read_only: bool,
+    assist: Option<&super::assist::AssistToken>,
+) -> Result<(), String> {
     let now = t.asked_at;
     let lasts = i64::try_from(t.expires_in).unwrap_or(i64::MAX);
     let expires_at = now.checked_add(jiff::SignedDuration::from_secs(lasts)).unwrap_or(now);
@@ -862,6 +887,7 @@ fn write_session(file: &Path, server: &str, file_id: u64, path: &str, t: &Ticket
         saver: t.saver,
         app: &t.app,
         base: t.base.as_ref(),
+        assist: assist.map(super::assist::AssistToken::record),
     };
     let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     crate::paths::write_atomic(file, &bytes)
