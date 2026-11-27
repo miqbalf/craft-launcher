@@ -101,7 +101,7 @@ Not run: `cargo xtask wasm` (core, ui-egui and web are unchanged).
 ## Prod test (workspace.treeo.id)
 
 Setup:
-- A temporary user, `dl1-test-20261127`, was made with `occ user:add --password-from-env`. The
+- A temporary user was made with `occ user:add --password-from-env`. The
   password was random, kept in mode-600 files, and passed on stdin over ssh and `docker exec -i`.
   It never appeared in argv.
 - The user was deleted afterwards (`occ user:delete`, then a check that no dl1 user is left). The
@@ -120,12 +120,12 @@ Results:
 
 | Step | Result |
 |---|---|
-| status.php check, Login Flow v2, polling, app password | OK. `CloudConnected login=dl1-test-20261127` |
+| status.php check, Login Flow v2, polling, app password | OK. `CloudConnected` with the temporary login |
 | List `/`, list `/DL1` | OK |
 | Search "sample" (WebDAV SEARCH) | OK, 4 hits, server-side (`folder_only=false`) |
 | Shared with me (OCS) | OK, empty |
 | Open .docx / .xlsx / .pptx / .pdf | Opened in wordcraft / gridcraft / deckcraft / pdfcraft. Working copy in `cloud/<account>/DL1/…` |
-| Lock while open | files_lock 35.0.1 is enabled on prod. Every open file showed as locked. The holder showed as raw XML before the fix and as `dl1-test-20261127` after it |
+| Lock while open | files_lock 35.0.1 is enabled on prod. Every open file showed as locked. The holder showed as raw XML before the fix and as the temporary login name after it |
 | Save goes back (If-Match PUT) | All 5 went Uploading → Saved. The server copies held the saved part or marker |
 | Another client writing while the file is open | Refused with HTTP 423 because of the launcher's lock. So no conflict can happen on prod while a file is checked out (see Concerns) |
 | Done | All 5 closed (`closed=true`). The listing showed them unlocked. The local cache held only `checkouts.json` and `recent.json` |
