@@ -277,6 +277,9 @@ fn open_live_in_app(
     install::open_live(def, &installed, session, file)
 }
 
+/// Why the launcher doesn't install or update a udinCraft app, followed by where its releases are.
+const UDINCRAFT_UPDATES: &str = "Updates come from udinCraft";
+
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
@@ -519,6 +522,12 @@ impl NativeBackend {
         let uninstall = matches!(work, Work::Uninstall);
         let app = CraftApp::by_id(app_id)?;
         if self.platform.is_some_and(|p| !app.runs_on(p.os)) {
+            return None;
+        }
+        // Fork-only (udinCraft): its upstream release would replace the fork's build, so it is
+        // never installed from here, by a click or by automation. Removing it still works.
+        if !uninstall && let Some(releases) = artcraft_launcher_core::catalog::udincraft_releases(app.id) {
+            self.shared.emit(Event::Notice { app: app.id.to_string(), result: Err(format!("{UDINCRAFT_UPDATES}: {releases}")) });
             return None;
         }
         log::info!("{}: starting {} job", app.name, if uninstall { "uninstall" } else { "install/update" });
@@ -2797,11 +2806,50 @@ mod tests {
     /// held, not run, so this checks the order of the steps and doesn't race threads: starting
     /// each job as soon as it is prepared would find only the first app in line.
     #[test]
+    fn udincraft_apps_are_never_installed_from_upstream() {
+        let Some(platform) = native_platform() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = backend(dir.path(), platform, None);
+        let started: Arc<Mutex<usize>> = Arc::default();
+        backend.spawn = {
+            let started = started.clone();
+            Arc::new(move |_work| *started.lock().unwrap() += 1)
+        };
+        let udin: Vec<String> = artcraft_launcher_core::catalog::UDINCRAFT_APPS.iter().map(|id| id.to_string()).collect();
+        backend.install_all(&udin);
+        assert!(!backend.start_job("wordcraft", Work::Install(None)));
+        assert!(!backend.start_job("gridcraft", Work::Replace("/x".to_string())));
+        assert_eq!(*started.lock().unwrap(), 0, "no install or update job for a udinCraft app");
+        let told = backend
+            .shared
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::Notice { app, result: Err(m) } if app == "wordcraft" && m.contains("miqbalf/wordcraft/releases")));
+        assert!(told, "the user is told where its updates come from");
+        // Another catalog app still installs from upstream.
+        let other = artcraft_launcher_core::SUITE
+            .iter()
+            .find(|app| app.runs_on(platform.os) && !artcraft_launcher_core::catalog::from_udincraft(app.id))
+            .map(|app| app.id)
+            .unwrap();
+        assert!(backend.start_job(other, Work::Install(None)));
+        assert_eq!(*started.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn update_all_takes_every_place_before_any_worker_starts() {
         let Some(platform) = native_platform() else { return };
         let dir = tempfile::tempdir().unwrap();
         let mut backend = backend(dir.path(), platform, None);
-        let ids: Vec<&str> = artcraft_launcher_core::SUITE.iter().filter(|app| app.runs_on(platform.os)).map(|app| app.id).take(3).collect();
+        // udinCraft apps are never installed from here (see `udincraft_apps_are_never_installed_from_upstream`).
+        let ids: Vec<&str> = artcraft_launcher_core::SUITE
+            .iter()
+            .filter(|app| app.runs_on(platform.os) && !artcraft_launcher_core::catalog::from_udincraft(app.id))
+            .map(|app| app.id)
+            .take(3)
+            .collect();
         assert_eq!(ids.len(), 3);
         type Held = Vec<Box<dyn FnOnce() + Send>>;
         let held: Arc<Mutex<Held>> = Arc::default();

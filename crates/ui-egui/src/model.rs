@@ -80,7 +80,16 @@ impl AppEntry {
             Some(LatestRelease::None) => Latest::NoRelease,
             Some(LatestRelease::Found(r)) => Latest::Found { version: r.version.as_ref(), has_asset: self.installs_here(platform) },
         };
-        status::status(self.installed.as_ref(), latest)
+        let status = status::status(self.installed.as_ref(), latest);
+        // Fork-only (udinCraft): its upstream release is never offered (see `UDINCRAFT_APPS`).
+        if artcraft_launcher_core::catalog::from_udincraft(self.app.id) {
+            return match status {
+                AppStatus::Checking => AppStatus::Checking,
+                s if s.is_installed() => AppStatus::Installed,
+                _ => AppStatus::Unavailable,
+            };
+        }
+        status
     }
 
     pub fn installed_label(&self) -> Option<String> {
@@ -122,7 +131,8 @@ pub fn status_text(status: &AppStatus, manage_apps: bool) -> (String, Tone) {
     }
 }
 
-/// [`status_text`], but saying so when a download is paused or reconnecting.
+/// [`status_text`], but saying so when a download is paused or reconnecting, and where a
+/// udinCraft app's updates come from.
 pub fn entry_status_text(e: &AppEntry, status: &AppStatus, manage_apps: bool) -> (String, Tone) {
     match (e.job, e.paused) {
         (Some(JobPhase::Reconnecting { .. }), _) => (t("Reconnecting…").to_string(), Tone::Warn),
@@ -130,6 +140,13 @@ pub fn entry_status_text(e: &AppEntry, status: &AppStatus, manage_apps: bool) ->
         (Some(JobPhase::Downloading { .. }), _) => (t("Downloading…").to_string(), Tone::Info),
         (None, Some(_)) if status.is_installed() => (t("Update paused").to_string(), Tone::Warn),
         (None, Some(_)) => (t("Download paused").to_string(), Tone::Warn),
+        _ if artcraft_launcher_core::catalog::from_udincraft(e.app.id) && *status != AppStatus::Checking => {
+            if status.is_installed() {
+                (t("Installed · updates come from udinCraft").to_string(), Tone::Neutral)
+            } else {
+                (t("Updates come from udinCraft").to_string(), Tone::Info)
+            }
+        }
         _ => status_text(status, manage_apps),
     }
 }

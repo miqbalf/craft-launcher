@@ -195,6 +195,22 @@ pub const LAUNCHER_REPO: &str = "storytold/craft-launcher";
 pub const SELF_UPDATE_FROM_UPSTREAM: bool = false;
 /// Fork-only (udinCraft): where this build's releases are published.
 pub const FORK_RELEASES_URL: &str = "https://github.com/miqbalf/craft-launcher/releases";
+/// Fork-only (udinCraft, owner 2026-11-27): the apps whose builds come from the udinCraft forks
+/// (Cloud files, live editing, the udinCraft marks). The launcher never installs or updates them
+/// from their upstream releases, which would replace the fork's build with a different app; it
+/// points to [`udincraft_releases`] instead. Every other catalog app updates from upstream.
+pub const UDINCRAFT_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
+
+/// Whether `id` is a udinCraft app (see [`UDINCRAFT_APPS`]).
+pub fn from_udincraft(id: &str) -> bool {
+    UDINCRAFT_APPS.contains(&id)
+}
+
+/// Where a udinCraft app's releases are published, for [`UDINCRAFT_APPS`] only.
+pub fn udincraft_releases(id: &str) -> Option<String> {
+    from_udincraft(id).then(|| format!("https://github.com/miqbalf/{id}/releases"))
+}
+
 /// Fork-only (udinCraft): the upstream launcher this build is based on.
 pub const UPSTREAM_URL: &str = "https://github.com/storytold/craft-launcher";
 /// The launcher's own asset stem.
