@@ -56,9 +56,10 @@ fi
 JXA="$(mktemp -t craft-defaults).js"
 trap 'rm -f "$JXA"' EXIT
 cat >"$JXA" <<'JS'
+// JXA reaches LaunchServices and the CoreServices type functions (checked on macOS 15), but not
+// the UTType class of UniformTypeIdentifiers, which has no bridge metadata.
 ObjC.import('Foundation');
 ObjC.import('CoreServices');
-ObjC.import('UniformTypeIdentifiers');
 
 const ROLES_ALL = 0xFFFFFFFF; // kLSRolesAll
 // Types never set: setting them would capture every file that has no handler of its own, or (for
@@ -86,11 +87,18 @@ const RANK = { Owner: 3, Default: 2, Alternate: 1, None: 0 };
 
 function str(x) { return (x === undefined || x === null) ? null : ObjC.unwrap(x); }
 
+// A CFStringRef that a Copy/Create function returned, as a JS string (null for none).
+function refString(ref) {
+  try {
+    const s = ObjC.unwrap(ObjC.castRefToObject(ref));
+    return (typeof s === 'string' && s.length) ? s : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function handler(uti) {
-  const ref = $.LSCopyDefaultRoleHandlerForContentType($(uti), ROLES_ALL);
-  if (!ref || ref.isNil && ref.isNil()) return null;
-  const s = ObjC.unwrap(ObjC.castRefToObject(ref));
-  return (typeof s === 'string' && s.length) ? s : null;
+  return refString($.LSCopyDefaultRoleHandlerForContentType($(uti), ROLES_ALL));
 }
 
 function setHandler(uti, bundleId) {
@@ -98,15 +106,11 @@ function setHandler(uti, bundleId) {
 }
 
 function conforms(uti, parent) {
-  const t = $.UTType.typeWithIdentifier(uti);
-  const p = $.UTType.typeWithIdentifier(parent);
-  if (!t || t.isNil() || !p || p.isNil()) return uti === parent;
-  return t.conformsToType(p);
+  return !!$.UTTypeConformsTo($(uti), $(parent));
 }
 
 function utiForExtension(ext) {
-  const t = $.UTType.typeWithFilenameExtension(ext);
-  return (!t || t.isNil()) ? null : str(t.identifier);
+  return refString($.UTTypeCreatePreferredIdentifierForTag($('public.filename-extension'), $(ext), $()));
 }
 
 function readPlist(path) {

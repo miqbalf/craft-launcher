@@ -30,8 +30,6 @@ jobs:
         shell: bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@v4
-      - name: JXA probe
-        run: osascript -l JavaScript .github/scripts/jxa-probe.js 2>&1 | tee probe.txt
       - name: Fetch the upstream app bundles
         run: |
           mkdir -p "$RUNNER_TEMP/apps" "$RUNNER_TEMP/dmg"
@@ -81,7 +79,6 @@ jobs:
         with:
           name: craft-defaults-dry-run
           path: |
-            probe.txt
             dry-run.txt
             set.txt
             after-set.txt
