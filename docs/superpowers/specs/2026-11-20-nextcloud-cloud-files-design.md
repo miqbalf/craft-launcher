@@ -422,3 +422,36 @@ section wins.
   transport now honours while reading) and the server-granted lock timeout (locks are refreshed
   at half of it). This deviates from rule 10 (move the rev in
   its own PR). It must be upstreamed and the rev moved before any upstream PR.
+
+## As built: live editing (2026-11-27, phase 2)
+
+Design: section 4 of craft-office-nextcloud `specs/2026-11-21-craft-office-live-design.md`; the
+hand-off contract is craft-office-nextcloud `livepaste/DJ-brief.md`.
+
+- A cloud file whose app is in `LIVE_APPS` (WordCraft, GridCraft, DeckCraft) opens live when the
+  server offers it. The launcher asks `POST /ocs/v2.php/apps/craft_office/api/v1/ticket {fileId}`
+  with Basic auth (login name and app password), the file id coming from `oc:fileid` in the last
+  listing, or from a listing of the file's folder.
+- `relayUrl` may be a path on the server (`/craft`): it is resolved against the server, with
+  `https` made `wss` (`http` made `ws`, loopback only), and the session file always holds the full
+  address. `readOnly` is `permissions == "read"`.
+- On a ticket whose relay address accepts a TCP connection, it downloads a working copy
+  to `<data>/live/<id>/<name>`, writes `<data>/live/<id>.json` (mode 0600, folder 0700) and starts
+  the app with `--live-session <that file> <working copy>`. No LOCK, no upload, no checkout record.
+  The row shows **Live**, with no Done.
+- `expiresAt` is the time before the request plus `expiresIn`. The ticket is renewed at four fifths
+  of `expiresIn` (480 s of 600), written atomically into the same file. A failed
+  renewal keeps the old file, says so once, and retries with backoff (15 s to 2 min).
+- When the app quits, the session file goes; the working copy goes too unless it changed, and then
+  it is kept under `cloud/kept/`. Disconnect and connecting another account are refused while a
+  live session runs.
+- A 401 on the ticket says to reconnect and opens nothing. A 503 is asked once more.
+- Anything else (no file id, 404, 403, 503 twice, a transport error, a relay that isn't `wss://` or
+  doesn't answer) runs the check-out as before, and the status says "Live editing isn't available
+  on this server; changes upload when you save." (not for a read-only open).
+- macOS only, like the check-out: `open -n -W -a <app> --args --live-session <file> <copy>`. A new
+  instance, so the arguments reach it; `open -W` ends when that instance quits.
+- Live sessions live in memory. At start, session files of an earlier run are removed and their
+  working copies moved to `cloud/kept/live/`.
+- Not built: telling an app that is too old for `--live-session` apart (no minimum versions are
+  known yet); following a live session across a launcher restart.
