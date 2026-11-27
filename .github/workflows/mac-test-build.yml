@@ -1,5 +1,10 @@
-# Fork-only: builds an unsigned macOS launcher for a manual test of the
-# cloud files feature. Not for upstream; drop this file before any PR.
+# Fork-only: builds an unsigned (ad-hoc signed) macOS launcher for a manual test of the cloud
+# files feature, and checks the Craft-defaults script against the upstream app bundles. Not for
+# upstream; drop this file and .github/scripts/ before any PR.
+#
+# Runs on the Intel runner only: the arm64 (macos-latest) jobs of 2026-11-20 were never picked up
+# ("The job was not acquired by Runner of type hosted"), while Intel ran every time. The app is
+# still universal: the arm64 half is cross-compiled.
 name: Mac test build
 
 on:
@@ -12,32 +17,97 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    runs-on: macos-15-intel
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain
-        run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check macOS-only code
-        run: cargo check -p artcraft-launcher-native -p artcraft-launcher
-      - name: Build release
-        run: cargo build --release -p artcraft-launcher
-      - name: Package
         run: |
-          mkdir dist
-          cp target/release/artcraft-launcher dist/
-          tar -C dist -czf artcraft-launcher-macos-${{ matrix.arch }}.tar.gz .
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Cloud tests on macOS
+        run: cargo test -p artcraft-launcher-native --test it cloud
+      - name: Package (universal, ad-hoc signed, not notarized)
+        run: packaging/macos/package.sh --arch universal
+      - name: Zip the app too
+        run: |
+          ditto -c -k --keepParent "target/macos-package/ArtCraft Launcher.app" dist/release/ArtCraft-Launcher-macos-universal.app.zip
+          ls -lh dist/release
       - uses: actions/upload-artifact@v4
         with:
-          name: artcraft-launcher-macos-${{ matrix.arch }}
-          path: artcraft-launcher-macos-${{ matrix.arch }}.tar.gz
-          retention-days: 14
+          name: artcraft-launcher-macos-universal
+          path: |
+            dist/release/*.dmg
+            dist/release/*.app.zip
+          retention-days: 30
+
+  defaults:
+    # The installed versions on the owner's Mac (2026-11-27), from storytold releases.
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      APPS: >-
+        wordcraft:0.11.0 deckcraft:0.11.1 gridcraft:0.12.1 pdfcraft:0.14.0 photocraft:0.16.0
+        vectorcraft:0.17.0 designcraft:0.13.0 cadcraft:0.13.0 filmcraft:0.13.0 soundcraft:0.13.1
+        effectcraft:0.17.0 lightcraft:0.14.0
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the upstream app bundles
+        run: |
+          mkdir -p "$RUNNER_TEMP/apps" "$RUNNER_TEMP/dmg"
+          for av in $APPS; do
+            a="${av%%:*}"; v="${av#*:}"
+            gh release download "v$v" -R "storytold/$a" -p "$a-$v-macos-universal.dmg" -D "$RUNNER_TEMP/dmg"
+            mnt="$(mktemp -d)"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$RUNNER_TEMP/dmg/$a-$v-macos-universal.dmg" >/dev/null
+            ditto "$mnt"/*.app "$RUNNER_TEMP/apps/$(basename "$mnt"/*.app)"
+            hdiutil detach "$mnt" >/dev/null
+          done
+          ls "$RUNNER_TEMP/apps"
+      - name: Dry run
+        run: |
+          packaging/macos/set-craft-defaults.sh --dry-run --register --apps-dir "$RUNNER_TEMP/apps" 2>&1 | tee dry-run.txt
+      - name: Set, check, restore (on this throwaway runner)
+        run: |
+          b="$RUNNER_TEMP/backup.json"
+          packaging/macos/set-craft-defaults.sh --apps-dir "$RUNNER_TEMP/apps" --backup "$b" 2>&1 | tee set.txt
+          packaging/macos/set-craft-defaults.sh --dry-run --apps-dir "$RUNNER_TEMP/apps" --backup "$b" 2>&1 | tee after-set.txt
+          # A second run must not replace the saved originals with Craft handlers.
+          cp "$b" backup-first.json
+          packaging/macos/set-craft-defaults.sh --apps-dir "$RUNNER_TEMP/apps" --backup "$b" >/dev/null 2>&1
+          cmp <(plutil -extract handlers json -o - backup-first.json) <(plutil -extract handlers json -o - "$b")
+          packaging/macos/set-craft-defaults.sh --restore --backup "$b" 2>&1 | tee restore.txt
+          packaging/macos/set-craft-defaults.sh --dry-run --apps-dir "$RUNNER_TEMP/apps" --backup "$b" 2>&1 | tee after-restore.txt
+          cp "$b" backup.json
+          # After the set, every planned type reports a Craft handler as current.
+          if grep -E '^  .* -> ' after-set.txt | grep -v 'was: ai\.storyteller\.'; then
+            echo "some types did not take their Craft handler" >&2; exit 1
+          fi
+      - name: Open sample files in the apps, as the launcher does (open -a)
+        run: |
+          python3 .github/scripts/make-office-samples.py "$RUNNER_TEMP/samples"
+          for pair in WordCraft:sample.docx GridCraft:sample.xlsx DeckCraft:sample.pptx PdfCraft:sample.pdf; do
+            app="${pair%%:*}"; file="${pair#*:}"
+            open -a "$RUNNER_TEMP/apps/$app.app" "$RUNNER_TEMP/samples/$file"
+            sleep 15
+            if pgrep -f "$app.app/Contents/MacOS" >/dev/null; then echo "$app is running with $file"; else echo "$app is NOT running" >&2; fi
+            screencapture -x "shot-$app.png" || true
+            osascript -e "tell application \"$app\" to get name of every window" 2>&1 | sed "s/^/$app windows: /" || true
+            pkill -f "$app.app/Contents/MacOS" || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: craft-defaults-dry-run
+          path: |
+            dry-run.txt
+            set.txt
+            after-set.txt
+            restore.txt
+            after-restore.txt
+            backup.json
+            shot-*.png
+          retention-days: 30
