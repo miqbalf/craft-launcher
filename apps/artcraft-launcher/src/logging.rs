@@ -201,7 +201,13 @@ impl Logs {
 fn builder(sink: Arc<Mutex<Sink>>, stderr: bool) -> env_logger::Builder {
     let mut b = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(DEFAULT_FILTER));
     // Suppress raw HTTP wire TRACE records before formatting and output, regardless of RUST_LOG (CWE-532).
-    b.filter_module("ureq_proto", log::LevelFilter::Debug);
+    // Only under RUST_LOG: there it caps a broad `trace` at `debug`. Without it, DEFAULT_FILTER's
+    // `warn` already covers ureq_proto, and the directive would turn on its per-request `debug`
+    // records (`Call<SendRequest>` …) on stderr and in the log of every run. [`Guarded`] drops
+    // wire dumps either way.
+    if std::env::var_os("RUST_LOG").is_some_and(|v| !v.is_empty()) {
+        b.filter_module("ureq_proto", log::LevelFilter::Debug);
+    }
     b.target(env_logger::Target::Pipe(Box::new(Tee { sink, stderr })));
     b
 }
@@ -427,6 +433,21 @@ mod tests {
         assert!(text.contains("Call<SendRequest>") && text.contains("not a wire dump"), "{text}");
         assert!(!logger.enabled(&log::Metadata::builder().level(log::Level::Trace).target("ureq_proto::util").build()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `RUST_LOG`, the HTTP client's per-request `debug` records stay out of stderr and
+    /// the log (only warnings, as for every other library).
+    #[test]
+    fn the_default_filter_keeps_http_client_debug_quiet() {
+        if std::env::var_os("RUST_LOG").is_some_and(|v| !v.is_empty()) {
+            return; // An inherited RUST_LOG chooses the levels; nothing to check here.
+        }
+        let sink = Arc::new(Mutex::new(Sink::new(MAX_FILE_BYTES)));
+        let logger = Guarded(builder(sink, false).build());
+        let at = |level, target| logger.enabled(&log::Metadata::builder().level(level).target(target).build());
+        assert!(!at(log::Level::Debug, "ureq_proto::client"));
+        assert!(at(log::Level::Warn, "ureq_proto::client"));
+        assert!(at(log::Level::Info, "artcraft_launcher"));
     }
 
     #[test]
