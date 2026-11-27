@@ -55,6 +55,8 @@ struct Server {
     ids: HashMap<String, u64>,
     /// The Craft Office ticket endpoint: `None` answers 404 (no such app on the server).
     live: Option<LiveServer>,
+    /// How many times the starting-copy route was asked.
+    base_fetches: u32,
 }
 
 /// What the fake Craft Office app answers on its ticket endpoint.
@@ -66,8 +68,14 @@ struct LiveServer {
     expires_in: u64,
     /// Answer with this status instead of a ticket.
     refuse: Option<u16>,
-    /// Answer this many requests with 503 first (a busy room).
+    /// Answer this many requests with 503 first (a busy room, or one with no base yet).
     busy: u32,
+    /// The app the room is for, as the ticket says it.
+    app: String,
+    /// A pinned room's starting bytes, and the checksum the ticket claims for them.
+    base: Option<(Vec<u8>, String)>,
+    /// Bumped to make the server start a new room for the file.
+    generation: u32,
     /// The file ids tickets were asked for, in order.
     asked: Vec<u64>,
 }
@@ -101,8 +109,17 @@ impl Dav {
 
     /// The server has the Craft Office app, with its relay at `relay`.
     fn offer_live(&self, relay: &str) {
-        self.0.lock().unwrap().live =
-            Some(LiveServer { relay: relay.to_string(), permissions: "edit".to_string(), expires_in: 600, refuse: None, busy: 0, asked: Vec::new() });
+        self.0.lock().unwrap().live = Some(LiveServer {
+            relay: relay.to_string(),
+            permissions: "edit".to_string(),
+            expires_in: 600,
+            refuse: None,
+            busy: 0,
+            app: "wordcraft".to_string(),
+            base: None,
+            generation: 0,
+            asked: Vec::new(),
+        });
     }
 
     fn live_server(&self) -> LiveServer {
@@ -228,6 +245,9 @@ impl Http for Dav {
         if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/ticket") {
             return Ok(ticket_answer(&mut s, &req));
         }
+        if req.url.starts_with(&format!("{SERVER}/apps/craft_office/live/base/")) {
+            return Ok(base_answer(&mut s, &req));
+        }
         if req.url.contains("/ocs/v1.php/cloud/capabilities") {
             return Ok(Response::new(200, br#"{"ocs":{"data":{"capabilities":{"files":{"locking":"1.0"}}}}}"#.to_vec()));
         }
@@ -342,11 +362,35 @@ fn ticket_answer(s: &mut Server, req: &Request) -> Response {
         return Response::new(503, Vec::new());
     }
     let n = live.asked.len();
-    let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": {
-        "ticket": format!("{TICKET_SECRET}-{n}"), "relayUrl": live.relay, "room": format!("inst:{file_id}"),
+    let room = format!("inst:{file_id}:{}", live.generation);
+    let mut data = serde_json::json!({
+        "ticket": format!("{TICKET_SECRET}-{n}"), "relayUrl": live.relay, "room": room,
         "permissions": live.permissions, "displayName": "Alice A.", "expiresIn": live.expires_in, "saver": true,
-    }}});
+        "app": live.app,
+    });
+    if let Some((_, sha)) = &live.base {
+        data["base"] = serde_json::json!({"url": format!("/apps/craft_office/live/base/{room}?sha256={sha}"), "sha256": sha});
+    }
+    let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": data}});
     Response::new(200, answer.to_string().into_bytes())
+}
+
+/// The fake starting-copy route: Basic auth, 404 for every failure, the checksum in a header.
+fn base_answer(s: &mut Server, req: &Request) -> Response {
+    let expected = format!("Basic {}", base64(&format!("alice:{PASSWORD}")));
+    s.base_fetches += 1;
+    match s.live.as_ref().and_then(|l| l.base.clone()) {
+        Some((bytes, _)) if req.method == Method::Get && req.get_header("authorization") == Some(expected.as_str()) => {
+            let sha = sha256_hex(&bytes);
+            Response::new(200, bytes).header("x-craft-base-sha256", sha)
+        }
+        _ => Response::new(404, Vec::new()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn base64(text: &str) -> String {
@@ -1699,4 +1743,162 @@ fn a_restart_clears_the_tickets_of_sessions_it_can_no_longer_follow() {
     rig.service.start();
     assert!(!app.session.exists(), "no ticket stays on disk");
     assert_eq!(kept_with(&rig, b"saved while offline").len(), 1, "the copy is kept, not deleted");
+}
+
+// Pinned rooms (GridCraft, DeckCraft): every peer starts from the room's exact bytes.
+
+const SHEET: &str = "/Docs/budget.xlsx";
+
+/// A server offering a GridCraft room for `SHEET` whose starting copy is `base` (the ticket claims
+/// `claim` as its checksum, the real one when `None`).
+fn pinned(base: &[u8], claim: Option<&str>) -> Dav {
+    let dav = Dav::with_file(SHEET, b"webdav bytes");
+    dav.offer_live(RELAY);
+    let sha = claim.map_or_else(|| sha256_hex(base), str::to_string);
+    dav.edit_live(|l| {
+        l.app = "gridcraft".to_string();
+        l.base = Some((base.to_vec(), sha));
+    });
+    dav
+}
+
+#[test]
+fn a_pinned_room_gives_the_app_its_starting_copy_and_says_where_it_came_from() {
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    assert_eq!(app.app, "gridcraft");
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"room base bytes", "the room's bytes, not the WebDAV file's");
+    let json = session_json(&app);
+    assert_eq!(json["app"], "gridcraft");
+    assert_eq!(json["saver"], true);
+    assert_eq!(json["base"]["sha256"], sha256_hex(b"room base bytes"));
+    let url = json["base"]["url"].as_str().unwrap();
+    assert!(url.starts_with(SERVER) && url.contains("/apps/craft_office/live/base/"), "absolute, on the server: {url}");
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(TICKET_SECRET) && !shown.contains(PASSWORD), "no secret in an event");
+}
+
+#[test]
+fn a_starting_copy_that_doesnt_match_its_checksum_falls_back_and_says_why() {
+    let rig = rig(pinned(b"room base bytes", Some(&sha256_hex(b"something else"))));
+    let local = rig.open(SHEET);
+    assert!(rig.live_apps().is_empty(), "nothing started live");
+    assert_eq!(std::fs::read(&local).unwrap(), b"webdav bytes", "the check-out's copy");
+    assert!(rig.dav.held_lock(SHEET).is_some(), "the check-out locks as before");
+    let detail = rig.last_detail(SHEET).unwrap_or_default();
+    assert!(detail.contains("Live editing isn't available") && detail.contains("checksum"), "{detail}");
+    assert!(std::fs::read_dir(rig.paths.live_root()).map_or(true, |d| d.count() == 0), "no session left behind");
+}
+
+#[test]
+fn a_room_without_a_starting_copy_is_asked_once_more_then_falls_back() {
+    // The server answers 503 while a pinned room has no base yet.
+    let dav = pinned(b"room base bytes", None);
+    dav.edit_live(|l| l.busy = 1);
+    let first = rig(dav);
+    let app = first.open_live(SHEET);
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"room base bytes", "the second answer had it");
+
+    let dav = pinned(b"room base bytes", None);
+    dav.edit_live(|l| l.busy = 2);
+    let second = rig(dav);
+    second.open(SHEET);
+    assert!(second.live_apps().is_empty());
+    assert_eq!(second.dav.live_server().asked.len(), 2, "asked twice, not more");
+    assert!(second.last_detail(SHEET).is_some_and(|d| d.contains("Live editing isn't available")));
+}
+
+#[test]
+fn a_wordcraft_room_has_no_starting_copy_and_uses_the_cloud_file() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"remote v1");
+    let json = session_json(&app);
+    assert!(json.get("base").is_none(), "{json}");
+    assert_eq!(json["app"], "wordcraft");
+    assert_eq!(rig.dav.0.lock().unwrap().base_fetches, 0);
+}
+
+#[test]
+fn a_renewal_that_brings_a_new_room_rewrites_room_and_starting_copy() {
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    let before = session_json(&app);
+    rig.dav.edit_live(|l| {
+        l.generation += 1;
+        l.base = Some((b"new base".to_vec(), sha256_hex(b"new base")));
+    });
+    rig.advance(Duration::from_secs(550));
+    rig.service.tick();
+    let after = session_json(&app);
+    assert_ne!(after["room"], before["room"], "the app sees the new room and restarts on it");
+    assert_eq!(after["base"]["sha256"], sha256_hex(b"new base"));
+    assert_ne!(after["base"]["url"], before["base"]["url"]);
+}
+
+// The app couldn't go live (DJ-brief §2b): it writes `<session file>.fallback` and edits the copy
+// locally, and the launcher turns the row into an ordinary check-out so the edits upload.
+
+fn signal_fallback(app: &LiveApp, body: &str) {
+    let mut name = app.session.as_os_str().to_owned();
+    name.push(".fallback");
+    std::fs::write(PathBuf::from(name), body).unwrap();
+}
+
+#[test]
+fn an_app_that_falls_back_gets_a_check_out_and_its_saves_upload() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.settle();
+    assert!(rig.dav.held_lock(FILE).is_none(), "live: no lock yet");
+    signal_fallback(&app, r#"{"v":1,"reason":"the relay refused the ticket"}"#);
+    rig.service.tick();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    let detail = rig.last_detail(FILE).unwrap_or_default();
+    assert!(detail.contains("the relay refused the ticket") && detail.contains("changes upload when you save"), "{detail}");
+    assert!(rig.dav.held_lock(FILE).is_some(), "checked out: locked as any check-out");
+    assert!(!app.session.exists(), "the ticket doesn't stay on disk");
+
+    let etag = rig.dav.etag(FILE);
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"edited locally", "the local edit reached the cloud");
+    assert_eq!(rig.dav.puts().last().and_then(|p| p.if_match.clone()), Some(etag), "guarded by the version it started from");
+    rig.service.done(FILE);
+    assert!(last_closed(&rig, FILE).is_some(), "Done closes it as any check-out: {:?}", rig.events());
+    assert!(rig.dav.held_lock(FILE).is_none());
+}
+
+#[test]
+fn a_fallback_never_overwrites_changes_others_made_live() {
+    // Others edited live meanwhile: the server's file is no longer what the app started from.
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.dav.change(FILE, b"saved by the relay");
+    signal_fallback(&app, "not json");
+    rig.service.tick();
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Live editing isn't available")));
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"saved by the relay", "not replaced");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Conflict), "the user chooses");
+}
+
+#[test]
+fn a_pinned_room_that_falls_back_asks_before_its_first_save() {
+    // The app was given the room's starting bytes, which aren't the WebDAV file's.
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    signal_fallback(&app, r#"{"v":1,"reason":"base checksum mismatch"}"#);
+    rig.service.tick();
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(SHEET).unwrap(), b"webdav bytes", "not replaced");
+    assert_eq!(rig.status(SHEET), Some(SyncStatus::Conflict));
 }

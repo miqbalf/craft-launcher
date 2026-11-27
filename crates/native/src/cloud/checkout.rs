@@ -42,6 +42,12 @@ impl Synced {
     pub fn of(stamp: Stamp, bytes: &[u8]) -> Self {
         Self { stamp, sha256: digest(bytes) }
     }
+
+    /// The copy as it was, known only by its digest: no file's stamp matches it, so the next
+    /// look compares the bytes.
+    pub fn digest_only(sha256: String) -> Self {
+        Self { stamp: Stamp { secs: 0, nanos: 0, size: u64::MAX }, sha256 }
+    }
 }
 
 pub(super) fn digest(bytes: &[u8]) -> String {

@@ -24,7 +24,7 @@ use craft_suite_account::TokenStore;
 use serde::{Deserialize, Serialize};
 
 use super::CloudService;
-use super::checkout::{self, Book};
+use super::checkout::{self, Book, Checkout, Runtime, Synced, rt_key};
 
 /// The session file format this launcher writes.
 pub const SESSION_VERSION: u32 = 1;
@@ -67,6 +67,17 @@ pub(super) struct Ticket {
     saver: bool,
     /// When it was asked for: its lifetime counts from (at the latest) then.
     asked_at: jiff::Timestamp,
+    /// The app the server opened the room for (`gridcraft`, ...), passed on as given.
+    app: String,
+    /// The exact bytes every peer of the room starts from (GridCraft and DeckCraft rooms).
+    base: Option<Base>,
+}
+
+/// A room's starting bytes: where to fetch them (absolute, on the server) and their SHA-256.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(super) struct Base {
+    url: String,
+    sha256: String,
 }
 
 /// Why there is no ticket.
@@ -104,6 +115,16 @@ struct TicketAnswer {
     expires_in: u64,
     #[serde(default = "yes")]
     saver: bool,
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    base: Option<BaseAnswer>,
+}
+
+#[derive(Deserialize)]
+struct BaseAnswer {
+    url: String,
+    sha256: String,
 }
 
 fn yes() -> bool {
@@ -155,6 +176,21 @@ pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, passw
     if data.expires_in == 0 {
         return Err(TicketError::Malformed("an expired ticket"));
     }
+    let base = match data.base {
+        None => None,
+        Some(b) => {
+            let sha256 = b.sha256.to_ascii_lowercase();
+            if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err(TicketError::Malformed("the room's starting copy has no usable checksum"));
+            }
+            // Fetched with the app password, so only from the server itself.
+            let Some(url) = on_server(&b.url, server) else { return Err(TicketError::Malformed("the room's starting copy isn't on the server")) };
+            Some(Base { url, sha256 })
+        }
+    };
+    if data.app.len() > 64 || data.app.chars().any(char::is_control) {
+        return Err(TicketError::Malformed("an unusable app name"));
+    }
     Ok(Ticket {
         ticket: data.ticket,
         relay_url,
@@ -164,7 +200,45 @@ pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, passw
         expires_in: data.expires_in,
         saver: data.saver,
         asked_at: jiff::Timestamp::UNIX_EPOCH,
+        app: data.app,
+        base,
     })
+}
+
+/// `url` as an absolute address on `server`: a server-relative path (`/apps/...`, as the server's
+/// router builds it, web root included) is put on the server's origin; an absolute URL is kept
+/// only when it has the server's origin. `None` otherwise, so no credential goes elsewhere.
+fn on_server(url: &str, server: &str) -> Option<String> {
+    let scheme_end = server.find("://")? + 3;
+    let origin_end = server[scheme_end..].find('/').map_or(server.len(), |i| scheme_end + i);
+    let origin = &server[..origin_end];
+    if url.starts_with('/') && !url.starts_with("//") && !url.contains(['\\', '\r', '\n']) {
+        return Some(format!("{origin}{url}"));
+    }
+    let rest = url.strip_prefix(origin)?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| url.to_string())
+}
+
+/// Downloads a room's starting bytes and checks them against the checksum the ticket gave
+/// (and the one the server sends beside them). `Err` says why, for the user.
+pub(super) fn fetch_base<H: Http>(http: &H, base: &Base, login: &str, password: &str) -> Result<Vec<u8>, String> {
+    let req = Request::new(Method::Get, base.url.clone())
+        .header("authorization", basic(login, password))
+        .header("ocs-apirequest", "true")
+        .max_body(super::transport::MAX_FILE);
+    let resp = http.send(req).map_err(|e| format!("couldn't download its starting copy ({e})"))?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("the server didn't give its starting copy (HTTP {})", resp.status));
+    }
+    if resp.body.len() > super::transport::MAX_FILE {
+        return Err("its starting copy is too large".to_string());
+    }
+    let got = checkout::digest(&resp.body);
+    let told = resp.get_header("x-craft-base-sha256").map(str::to_ascii_lowercase);
+    if got != base.sha256 || told.is_some_and(|t| t != base.sha256) {
+        return Err("its starting copy didn't match its checksum".to_string());
+    }
+    Ok(resp.body)
 }
 
 /// The value of a Basic `Authorization` header.
@@ -270,9 +344,14 @@ struct SessionRecord<'a> {
     expires_at: String,
     read_only: bool,
     display_name: &'a str,
-    /// Extra to the contract (apps ignore unknown fields): whether the server is saving the room
-    /// right now, as the web editor's "Changes are not being saved right now" note reads it.
+    /// Whether the server is saving the room right now, as the web editor's "Changes are not
+    /// being saved right now" note reads it.
     saver: bool,
+    /// The app the server opened the room for, as the ticket gave it.
+    app: &'a str,
+    /// The room's starting bytes (`url` absolute, `sha256`), for GridCraft and DeckCraft rooms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<&'a Base>,
 }
 
 /// A file open in its app for live editing. Kept with the open files, in memory only: its app
@@ -306,8 +385,9 @@ pub(super) struct LiveSession {
 pub(super) enum LiveOpen {
     /// The app is editing the file live.
     Opened,
-    /// No live session for this file: the check-out runs instead. Logged, never shown.
-    Unavailable(String),
+    /// No live session for this file: the check-out runs instead. `why` is logged; `tell`, when
+    /// set, is added to what the user is told.
+    Unavailable { why: String, tell: Option<String> },
     /// Something went wrong after the ticket (the download, the session file, the app launch):
     /// already told, and nothing is left behind.
     Failed,
@@ -411,7 +491,9 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// Tries to open `path` live in `app`. The book is held by the caller, so no other action
     /// on the file runs meanwhile.
     pub(super) fn open_live(&self, book: &mut Book, account: &CloudAccount, dav: &DavAccount, path: &str, app: &str, read_only: bool) -> LiveOpen {
-        let Some(file_id) = self.file_id_for(dav, path) else { return LiveOpen::Unavailable("the server gave no file id".to_string()) };
+        let Some(file_id) = self.file_id_for(dav, path) else {
+            return LiveOpen::Unavailable { why: "the server gave no file id".to_string(), tell: None };
+        };
         // 503 is also a room that is busy for a moment: asked once more after a short wait.
         let ticket = match self.ticket(file_id) {
             Err(TicketError::Status(503)) => {
@@ -428,11 +510,30 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 self.error(artcraft_launcher_core::cloud::SIGN_IN_EXPIRED);
                 return LiveOpen::Failed;
             }
-            Err(e) => return LiveOpen::Unavailable(format!("no live ticket: {e}")),
+            Err(e) => return LiveOpen::Unavailable { why: format!("no live ticket: {e}"), tell: None },
         };
         if !(self.relay_probe)(&ticket.relay_url) {
-            return LiveOpen::Unavailable("the relay can't be reached".to_string());
+            return LiveOpen::Unavailable { why: "the relay can't be reached".to_string(), tell: None };
         }
+        // A GridCraft or DeckCraft room starts from exact bytes every peer shares: the app gets
+        // those, checked, rather than the file as WebDAV has it now.
+        let base_bytes = match &ticket.base {
+            None => None,
+            Some(base) => {
+                let Some((_, login, password)) = self.session_credentials() else {
+                    return LiveOpen::Unavailable { why: "signed out".to_string(), tell: None };
+                };
+                match fetch_base(&self.http(), base, &login, password.expose()) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        return LiveOpen::Unavailable {
+                            why: format!("the room's starting copy: {e}"),
+                            tell: Some(format!("The live session couldn't start: {e}.")),
+                        };
+                    }
+                }
+            }
+        };
         let root = self.paths.live_root();
         let slot = match private_dir(&root).and_then(|()| new_slot(&root, super::sync::file_name(path))) {
             Ok(s) => s,
@@ -446,8 +547,12 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             let _ = std::fs::remove_file(&slot.session_file);
             let _ = std::fs::remove_dir_all(&slot.folder);
         };
-        let (bytes, _etag) = match Files::new(dav).get(&self.http(), path, super::transport::MAX_FILE) {
-            Ok(got) => got,
+        let fetched = match base_bytes {
+            Some(bytes) => Ok(bytes),
+            None => Files::new(dav).get(&self.http(), path, super::transport::MAX_FILE).map(|(bytes, _etag)| bytes),
+        };
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
             Err(e) => {
                 cleanup(&slot);
                 self.closed(path, SyncStatus::ReadOnly, Some(super::sync::open_message(&e)));
@@ -506,10 +611,20 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 
     /// One pass over the live sessions of `account`: ends those whose app quit, renews tickets
     /// that are due.
-    pub(super) fn tick_live(&self, book: &mut Book, account: &str) {
+    pub(super) fn tick_live(&self, book: &mut Book, account: &str, dav: &DavAccount) {
         let now = self.now();
         let mut i = 0;
         while i < book.live.len() {
+            // The app couldn't go live and edits the copy locally: it becomes a check-out, so
+            // its saves upload (DJ-brief §2b). Checked before an exit, so edits made before it
+            // quit still go up.
+            if book.live[i].account == account
+                && let Some(reason) = fallback_reason(&book.live[i].session_file)
+            {
+                let l = book.live.remove(i);
+                self.live_to_checkout(book, l, dav, &reason);
+                continue;
+            }
             if book.live[i].process.exited() {
                 let ended = book.live.remove(i);
                 self.end_live(ended);
@@ -591,16 +706,88 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         self.closed(&l.path, SyncStatus::Live, Some(detail));
     }
 
+    /// Turns a live session whose app fell back to local editing into a check-out of the same
+    /// working copy: locked when the server can, watched, uploaded with `If-Match`.
+    ///
+    /// The ETag is the server's current one only if the server still holds exactly the bytes
+    /// the app was given; otherwise (others changed it live, or a pinned room started from other
+    /// bytes) none can match, so the first save meets a 412 and the user picks a version.
+    fn live_to_checkout(&self, book: &mut Book, l: LiveSession, dav: &DavAccount, reason: &str) {
+        let http = self.http();
+        let files = Files::new(dav);
+        let etag = match files.get(&http, &l.path, super::transport::MAX_FILE) {
+            Ok((bytes, etag)) if checkout::digest(&bytes) == l.downloaded => etag,
+            Ok(_) => UNKNOWN_ETAG.to_string(),
+            Err(e) => {
+                log::info!("couldn't read a cloud file's version after a live fallback ({e}); its first save asks first");
+                UNKNOWN_ETAG.to_string()
+            }
+        };
+        let lock = if l.read_only {
+            None
+        } else {
+            match files.capabilities(&http) {
+                Ok(caps) if caps.locking => match files.lock(&http, &l.path, super::sync::LOCK_SECS) {
+                    Ok(lock) => Some(checkout::HeldLock::from_dav(lock)),
+                    Err(e) => {
+                        log::info!("couldn't lock a cloud file after a live fallback ({e}); version checks still guard saves");
+                        None
+                    }
+                },
+                _ => None,
+            }
+        };
+        // In step with the server only while the copy is still what the app was given.
+        let synced = match checkout::stamp(&l.local).zip(std::fs::read(&l.local).ok()) {
+            Some((stamp, bytes)) if checkout::digest(&bytes) == l.downloaded => Synced::of(stamp, &bytes),
+            _ => Synced::digest_only(l.downloaded.clone()),
+        };
+        for gone in [l.session_file.clone(), fallback_file(&l.session_file)] {
+            if let Err(e) = std::fs::remove_file(&gone)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("couldn't remove a live session file after a fallback ({e})");
+            }
+        }
+        let status = if l.read_only { SyncStatus::ReadOnly } else { SyncStatus::Saved };
+        book.list.push(Checkout {
+            account: l.account.clone(),
+            path: l.path.clone(),
+            remote: l.path.clone(),
+            local: l.local,
+            etag,
+            lock,
+            app: l.app,
+            tracks_remote: !l.read_only,
+            status,
+            synced: Some(synced),
+        });
+        book.runtime.insert(rt_key(&l.account, &l.path), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
+        self.save_book(book);
+        let detail = if l.read_only {
+            format!("Live editing isn't available ({reason}); this copy is read-only, so changes aren't saved to the cloud.")
+        } else {
+            format!("Live editing isn't available ({reason}); changes upload when you save.")
+        };
+        self.status(&l.path, status, Some(detail));
+    }
+
     /// At start: the live sessions of an earlier run can't be followed any more. Their session
     /// files (tickets) are removed; their working copies are moved to the kept folder, never
     /// deleted, in case an app saved one while offline.
-    pub(super) fn clear_stale_live(&self) {
+    ///
+    /// A folder holding the working copy of a check-out (a session that fell back) stays.
+    pub(super) fn clear_stale_live(&self, checked_out: &[PathBuf]) {
         let root = self.paths.live_root();
         let Ok(dir) = std::fs::read_dir(&root) else { return };
         for entry in dir.flatten() {
             let at = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&at) else { continue };
-            if meta.is_file() && at.extension().is_some_and(|e| e == "json") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if meta.is_dir() && checked_out.iter().any(|local| local.starts_with(&at)) {
+                continue;
+            }
+            if meta.is_file() && (name.ends_with(".json") || name.ends_with(".json.fallback")) {
                 if let Err(e) = std::fs::remove_file(&at) {
                     log::warn!("couldn't remove an old live session file ({e})");
                 }
@@ -620,6 +807,33 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             }
         }
     }
+}
+
+/// The ETag a check-out carries when no version of the server's file is known to match its copy:
+/// no server gives it, so a save meets a 412 and the user chooses.
+const UNKNOWN_ETAG: &str = "craft-launcher-no-known-version";
+/// Longest fallback reason shown.
+const MAX_REASON: usize = 200;
+
+/// `<session file>.fallback`: the app's signal that it couldn't go live (DJ-brief §2b).
+fn fallback_file(session: &Path) -> PathBuf {
+    let mut name = session.as_os_str().to_owned();
+    name.push(".fallback");
+    PathBuf::from(name)
+}
+
+/// The reason in the fallback file next to `session`, once the app wrote one: short, one line,
+/// and plain. A file that can't be read (or of another version) still counts.
+fn fallback_reason(session: &Path) -> Option<String> {
+    let bytes = std::fs::read(fallback_file(session)).ok()?;
+    let reason = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .filter(|v| v.get("v").and_then(serde_json::Value::as_u64) == Some(1))
+        .and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_string))
+        .map(|r| r.chars().filter(|c| !c.is_control()).take(MAX_REASON).collect::<String>())
+        .map(|r| r.trim().trim_end_matches('.').to_string())
+        .filter(|r| !r.is_empty());
+    Some(reason.unwrap_or_else(|| "the app couldn't join the live session".to_string()))
 }
 
 /// When a ticket that lasts `expires_in` seconds is renewed: at four fifths of its life (480 s
@@ -646,15 +860,21 @@ fn write_session(file: &Path, server: &str, file_id: u64, path: &str, t: &Ticket
         read_only,
         display_name: &t.display_name,
         saver: t.saver,
+        app: &t.app,
+        base: t.base.as_ref(),
     };
     let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     crate::paths::write_atomic(file, &bytes)
 }
 
-/// The note a live-capable file that opened through the check-out carries; `why` goes to the log.
-pub(super) fn unavailable_note(why: &str) -> String {
+/// The note a live-capable file that opened through the check-out carries; `why` goes to the log,
+/// `tell` follows the note.
+pub(super) fn unavailable_note(why: &str, tell: Option<&str>) -> String {
     log::info!("live editing isn't available for a cloud file ({why}); opening it through the check-out");
-    LIVE_UNAVAILABLE.to_string()
+    match tell {
+        Some(t) => format!("{LIVE_UNAVAILABLE} {t}"),
+        None => LIVE_UNAVAILABLE.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +906,19 @@ mod tests {
             ["ws://relay.example.com", "https://relay.example.com", "wss://", "wss://user@host", "wss://host:notaport", "ws://127.0.0.1.evil.com"]
         {
             assert!(relay_address(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_starting_copy_is_only_fetched_from_the_server_itself() {
+        let server = "https://cloud.example.com/nextcloud";
+        assert_eq!(
+            on_server("/nextcloud/apps/craft_office/live/base/r?sha256=ab", server).as_deref(),
+            Some("https://cloud.example.com/nextcloud/apps/craft_office/live/base/r?sha256=ab")
+        );
+        assert_eq!(on_server("https://cloud.example.com/index.php/apps/x", server).as_deref(), Some("https://cloud.example.com/index.php/apps/x"));
+        for bad in ["https://evil.example.com/apps/x", "https://cloud.example.com.evil.com/x", "//evil.example.com/x", "apps/x", "/a\nb"] {
+            assert!(on_server(bad, server).is_none(), "{bad}");
         }
     }
 

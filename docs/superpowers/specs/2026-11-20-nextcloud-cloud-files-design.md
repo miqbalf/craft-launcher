@@ -439,6 +439,12 @@ hand-off contract is craft-office-nextcloud `livepaste/DJ-brief.md`.
   to `<data>/live/<id>/<name>`, writes `<data>/live/<id>.json` (mode 0600, folder 0700) and starts
   the app with `--live-session <that file> <working copy>`. No LOCK, no upload, no checkout record.
   The row shows **Live**, with no Done.
+- Pinned rooms (GridCraft, DeckCraft) answer with `base {url, sha256}` and `app`. The launcher
+  downloads `base.url` (made absolute on the server's origin; nothing off it) with Basic auth, checks
+  the bytes against `sha256` and `X-Craft-Base-Sha256`, and gives those bytes to the app as its
+  working copy. On a mismatch or a failed download it falls back to the check-out and says why.
+  `app`, `saver` and `base` go into the session file; a renewal rewrites all of it, so a new room or
+  base reaches the app.
 - `expiresAt` is the time before the request plus `expiresIn`. The ticket is renewed at four fifths
   of `expiresIn` (480 s of 600), written atomically into the same file. A failed
   renewal keeps the old file, says so once, and retries with backoff (15 s to 2 min).
@@ -451,6 +457,13 @@ hand-off contract is craft-office-nextcloud `livepaste/DJ-brief.md`.
   on this server; changes upload when you save." (not for a read-only open).
 - macOS only, like the check-out: `open -n -W -a <app> --args --live-session <file> <copy>`. A new
   instance, so the arguments reach it; `open -W` ends when that instance quits.
+- An app that can't go live writes `<session file>.fallback` (`{"v":1,"reason":…}`) and edits
+  its copy locally. On the next tick the launcher turns that row into a check-out of the same copy:
+  it locks the file when the server can, then watches, uploads with `If-Match` and offers Done, and
+  the row says "Live editing isn't available (<reason>); changes upload when you save." The ETag is
+  the server's only when the server still holds exactly the bytes the app was given. Otherwise the
+  first save meets a 412 and the conflict choices apply, so live edits are never overwritten. The
+  session file goes at once.
 - Live sessions live in memory. At start, session files of an earlier run are removed and their
   working copies moved to `cloud/kept/live/`.
 - Not built: telling an app that is too old for `--live-session` apart (no minimum versions are

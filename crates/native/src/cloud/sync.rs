@@ -28,7 +28,7 @@ const SETTLE: Duration = Duration::from_secs(2);
 const FIRST_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// The lock asked for. It is refreshed at half what the server granted, which may be less.
-const LOCK_SECS: u32 = 30 * 60;
+pub(super) const LOCK_SECS: u32 = 30 * 60;
 /// How often the backend's watcher looks at the open files.
 const POLL_EVERY: Duration = Duration::from_secs(1);
 /// How many numbered conflict-copy names are tried before giving up.
@@ -136,7 +136,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     }
 
     /// Saves the book; a failure is told, but the files stay watched for this session.
-    fn save_book(&self, book: &Book) {
+    pub(super) fn save_book(&self, book: &Book) {
         if let Err(e) = book.save() {
             log::warn!("couldn't save the list of open cloud files: {e}");
             self.error(format!("Couldn't record the open cloud files on this computer ({e}). Keep the launcher open until they're saved."));
@@ -239,8 +239,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         if LIVE_APPS.contains(&app.as_str()) {
             match self.open_live(book, &account, &dav, path, &app, read_only) {
                 LiveOpen::Opened | LiveOpen::Failed => return,
-                LiveOpen::Unavailable(why) => {
-                    let note = live::unavailable_note(&why);
+                LiveOpen::Unavailable { why, tell } => {
+                    let note = live::unavailable_note(&why, tell.as_deref());
                     // A read-only copy uploads nothing, so the note's promise wouldn't hold.
                     if !read_only {
                         live_note = Some(note);
@@ -421,7 +421,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             self.emit(Event::CloudConnected(account));
         }
         drop(guard);
-        self.clear_stale_live();
+        let checked_out: Vec<PathBuf> = {
+            let mut guard = self.lock_book();
+            self.book(&mut guard).map(|b| b.list.iter().map(|c| c.local.clone()).collect()).unwrap_or_default()
+        };
+        self.clear_stale_live(&checked_out);
         self.resume();
     }
 
@@ -443,7 +447,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             return;
         }
         let Some((account, dav)) = self.connected() else { return };
-        self.tick_live(book, &account.id);
+        self.tick_live(book, &account.id, &dav);
         let keys: Vec<String> = book.list.iter().filter(|c| c.account == account.id).map(|c| c.path.clone()).collect();
         let now = self.now();
         for key in keys {
