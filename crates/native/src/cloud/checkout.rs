@@ -206,16 +206,22 @@ pub(super) fn working_copy(cache: &Path, server_path: &str) -> Result<PathBuf, S
 /// can hold `Report.docx` beside `report.docx`, so paths that differ only in case count as the
 /// same; so do two names of one existing file (same device and inode, on Unix).
 pub(super) fn same_slot(a: &Path, b: &Path) -> bool {
-    if a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase() {
-        return true;
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase() || same_file(a, b)
+}
+
+/// Whether `a` and `b` are two names of one existing file (same device and inode).
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
-            return x.dev() == y.dev() && x.ino() == y.ino();
-        }
-    }
+}
+
+/// Off Unix there is no inode to compare, so only the case-folded path counts.
+#[cfg(not(unix))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
     false
 }
 
