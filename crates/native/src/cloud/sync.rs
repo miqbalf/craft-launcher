@@ -234,18 +234,23 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             return self.still_live(book, i);
         }
         // An app that can join a live session opens live when the server offers one: no lock, no
-        // upload, the server saves. Otherwise the check-out below runs, and the user is told.
+        // upload, the server saves. Otherwise the check-out below runs, and the user is told. An
+        // installed copy too old for `--live-session` asks for no ticket at all.
         let mut live_note = None;
         if LIVE_APPS.contains(&app.as_str()) {
-            match self.open_live(book, &account, &dav, path, &app, read_only) {
-                LiveOpen::Opened | LiveOpen::Failed => return,
-                LiveOpen::Unavailable { why, tell } => {
-                    let note = live::unavailable_note(&why, tell.as_deref());
-                    // A read-only copy uploads nothing, so the note's promise wouldn't hold.
-                    if !read_only {
-                        live_note = Some(note);
-                    }
+            let note = match self.live_gate(&app) {
+                Err(note) => {
+                    log::info!("the installed {app} can't join a live session; opening the cloud file through the check-out");
+                    Some(note)
                 }
+                Ok(()) => match self.open_live(book, &account, &dav, path, &app, read_only) {
+                    LiveOpen::Opened | LiveOpen::Failed => return,
+                    LiveOpen::Unavailable { why, tell } => Some(live::unavailable_note(&why, tell.as_deref())),
+                },
+            };
+            // A read-only copy uploads nothing, so the note's promise wouldn't hold.
+            if !read_only {
+                live_note = note;
             }
         }
         let local = match self.cache_dir(&account.id).and_then(|cache| checkout::working_copy(&cache, path)) {

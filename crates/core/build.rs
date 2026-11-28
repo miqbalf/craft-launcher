@@ -26,6 +26,8 @@ struct App {
     site: Option<String>,
     mac_team: Option<String>,
     mac_bundle_name: Option<String>,
+    #[serde(default)]
+    live_since: Option<String>,
     details: Option<Details>,
 }
 #[derive(Deserialize)]
@@ -51,6 +53,11 @@ struct Shot {
 fn optional(s: &Option<String>) -> String {
     s.as_ref().map_or_else(|| "None".to_owned(), |v| format!("Some({v:?})"))
 }
+/// A plain `X.Y.Z` release version (no pre-release, no build), as `live_since` must be.
+fn plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+}
 fn slice(items: &[String]) -> String {
     format!("&{items:?}")
 }
@@ -66,9 +73,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             "community" => "Community",
             _ => return Err(format!("unknown app kind for {}", app.id).into()),
         };
+        if app.live_since.as_deref().is_some_and(|v| !plain_version(v)) {
+            return Err(format!("live_since of {} must be a plain X.Y.Z version", app.id).into());
+        }
         writeln!(
             apps,
-            "CraftApp {{ id: {:?}, name: {:?}, tagline: {:?}, color: {:?}, ink_light: {:?}, ink_dark: {:?}, repo: {:?}, former_ids: {}, former_names: {}, kind: AppKind::{kind}, publisher: {:?}, msi_publisher: {}, bundle: {}, former_bundles: {}, site: {}, mac_team: {}, mac_bundle_name: {} }},",
+            "CraftApp {{ id: {:?}, name: {:?}, tagline: {:?}, color: {:?}, ink_light: {:?}, ink_dark: {:?}, repo: {:?}, former_ids: {}, former_names: {}, kind: AppKind::{kind}, publisher: {:?}, msi_publisher: {}, bundle: {}, former_bundles: {}, site: {}, mac_team: {}, mac_bundle_name: {}, live_since: {} }},",
             app.id,
             app.name,
             app.tagline,
@@ -84,7 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             slice(&app.former_bundles),
             optional(&app.site),
             optional(&app.mac_team),
-            optional(&app.mac_bundle_name)
+            optional(&app.mac_bundle_name),
+            optional(&app.live_since)
         )?;
         if let Some(d) = &app.details {
             write!(

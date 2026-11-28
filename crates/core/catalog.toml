@@ -281,6 +281,9 @@ icon_sha256 = "1933bbeaea290497facd328e917dafcc433d0c0caa9f1e207aa45ac1e430898c"
 ink_dark = [242, 58, 98]
 ink_light = [183, 2, 40]
 kind = "official"
+# Fork-only (udinCraft): the first PdfCraft that takes `--live-session` (PDF live, lane PF). The
+# coordinator sets the exact version at release; until then, the next minor.
+live_since = "0.22.0"
 name = "PdfCraft"
 publisher = "ArtCraft"
 repo = "miqbalf/pdfcraft"

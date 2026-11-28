@@ -51,6 +51,10 @@ pub struct CraftApp {
     /// while those builds carry no signature the launcher can check: it then opens a copy that's
     /// there and links to the releases, but installs nothing.
     pub mac_team: Option<&'static str>,
+    /// Fork-only (udinCraft): the first version of a live-capable app ([`crate::cloud::LIVE_APPS`])
+    /// that takes `--live-session`. An older copy opens cloud files through the check-out; `None`
+    /// means every version does. Read from the bundled catalog only: a signed catalog can't move it.
+    pub live_since: Option<&'static str>,
 }
 
 impl CraftApp {
@@ -147,6 +151,7 @@ const fn app(
         former_bundles: &[],
         site: None,
         mac_team: Some(ARTCRAFT_TEAM_ID),
+        live_since: None,
     }
 }
 
@@ -397,6 +402,21 @@ mod tests {
         assert_eq!(pdf.names().collect::<Vec<_>>(), ["PdfCraft", "PrintCraft"]);
         assert_eq!(pdf.website(), "https://getartcraft.com/apps/pdfcraft");
         assert_eq!(CraftApp::by_id("wordcraft").unwrap().website(), "https://getartcraft.com/apps/wordcraft");
+    }
+
+    #[test]
+    fn live_since_is_read_from_the_catalog_as_a_plain_version() {
+        // The first PdfCraft that ships `--live-session` (lane PF); the coordinator sets the exact
+        // number at release. An older PdfCraft would read the flag as a file to open.
+        assert_eq!(CraftApp::by_id("pdfcraft").unwrap().live_since, Some("0.22.0"));
+        for app in &SUITE {
+            if let Some(since) = app.live_since {
+                let v = crate::version::parse(since).unwrap_or_else(|| panic!("{}: {since}", app.id));
+                assert!(crate::version::is_stable(&v) && v.to_string() == since, "{}: {since}", app.id);
+            } else {
+                assert_ne!(app.id, "pdfcraft");
+            }
+        }
     }
 
     /// Apps can specify custom macOS bundle names and platform support.

@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus};
+use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus, live_refusal};
+use artcraft_launcher_core::{CraftApp, InstallSource, Installed};
 use artcraft_launcher_core::protocol::Event;
 use artcraft_launcher_native::cloud::{CloudService, LiveProcess};
 use artcraft_launcher_native::paths::Paths;
@@ -560,6 +561,9 @@ struct Hooks {
     live: Arc<Mutex<Vec<LiveApp>>>,
     /// Whether the relay answers (default: it does).
     relay_down: Arc<AtomicBool>,
+    /// The installed apps the live gate reads, as the backend's detection finds them (default:
+    /// none, so no app is held back).
+    installed: Arc<Mutex<HashMap<String, Installed>>>,
 }
 
 struct Rig {
@@ -591,7 +595,7 @@ fn build(
 ) -> CloudService<Memory, Dav> {
     let (sink, seen, now) = (events.clone(), launched.clone(), clock.clone());
     let (launch, pause, revealed) = (hooks.launch.clone(), hooks.pause.clone(), hooks.revealed.clone());
-    let (live, relay_down) = (hooks.live.clone(), hooks.relay_down.clone());
+    let (live, relay_down, installed) = (hooks.live.clone(), hooks.relay_down.clone(), hooks.installed.clone());
     CloudService::new(paths, keychain.clone(), dav.clone(), move |e| sink.lock().unwrap().push(e))
         .with_launcher(move |app: &str, file: &Path| {
             let hook = launch.lock().unwrap().clone();
@@ -611,6 +615,11 @@ fn build(
             let quit = Arc::new(AtomicBool::new(false));
             live.lock().unwrap().push(LiveApp { app: app.to_string(), session: session.to_path_buf(), file: file.to_path_buf(), quit: quit.clone() });
             Ok(Box::new(FakeProcess(quit)) as Box<dyn LiveProcess>)
+        })
+        // As the backend's gate: the catalog's `live_since` against the detected version.
+        .with_live_gate(move |app: &str| {
+            let installed = installed.lock().unwrap().get(app).cloned();
+            CraftApp::by_id(app).and_then(|def| live_refusal(def, installed.as_ref())).map_or(Ok(()), Err)
         })
         .with_relay_probe(move |url: &str| !relay_down.load(Ordering::SeqCst) && (url.starts_with("wss://") || url.starts_with("ws://")))
         .with_revealer(move |dir: &Path| {
@@ -1844,15 +1853,103 @@ fn without_live_editing_the_check_out_runs_and_says_so() {
     }
 }
 
-#[test]
-fn a_file_no_live_app_opens_never_asks_for_a_ticket() {
-    let pdf = "/Docs/contract.pdf";
-    let dav = Dav::with_file(pdf, b"%PDF-1.7");
+// PDF live (PL1): PdfCraft joins live sessions from its catalog `live_since` version. An older
+// PdfCraft would read `--live-session` as a file to open, so it takes the check-out instead.
+
+const PDF: &str = "/Docs/contract.pdf";
+
+/// A server offering a PdfCraft room for `PDF`, pinned to `base` as every PDF room is.
+fn pdf_room(base: &[u8]) -> Dav {
+    let dav = Dav::with_file(PDF, b"%PDF-1.7 webdav bytes");
     dav.offer_live(RELAY);
-    let rig = rig(dav);
-    rig.open(pdf);
-    assert!(rig.dav.live_server().asked.is_empty());
-    assert!(rig.last_detail(pdf).is_none_or(|d| !d.contains("Live editing")), "PdfCraft has no live editing to miss");
+    dav.edit_live(|l| {
+        l.app = "pdfcraft".to_string();
+        l.base = Some((base.to_vec(), sha256_hex(base)));
+    });
+    dav
+}
+
+impl Rig {
+    /// Detection found PdfCraft at `version` (`None`: there, but its version couldn't be read).
+    fn install_pdfcraft(&self, version: Option<&str>) {
+        let installed = Installed {
+            version: version.map(|v| artcraft_launcher_core::version::parse(v).unwrap()),
+            source: InstallSource::Launcher,
+            location: "/apps/pdfcraft".to_string(),
+            package: None,
+            externally_managed: false,
+            origin: None,
+            installation: None,
+        };
+        self.hooks.installed.lock().unwrap().insert("pdfcraft".to_string(), installed);
+    }
+}
+
+#[test]
+fn a_pdf_opens_live_from_the_rooms_starting_copy() {
+    let rig = rig(pdf_room(b"%PDF-1.7 room base"));
+    rig.install_pdfcraft(Some("0.22.0"));
+    let app = rig.open_live(PDF);
+    assert_eq!(app.app, "pdfcraft");
+    assert!(rig.launched.lock().unwrap().is_empty(), "the check-out launcher isn't used");
+    assert_eq!(rig.status(PDF), Some(SyncStatus::Live));
+    assert!(rig.dav.held_lock(PDF).is_none(), "a live file is never locked");
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"%PDF-1.7 room base", "the room's bytes, not the WebDAV file's");
+    let json = session_json(&app);
+    assert_eq!(json["app"], "pdfcraft");
+    assert_eq!(json["fileId"], rig.dav.file_id(PDF));
+    assert_eq!(json["base"]["sha256"], sha256_hex(b"%PDF-1.7 room base"));
+    assert!(json["base"]["url"].as_str().unwrap().contains("/apps/craft_office/live/base/"));
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(TICKET_SECRET) && !shown.contains(PASSWORD), "no secret in an event");
+}
+
+#[test]
+fn a_pdfcraft_older_than_live_since_takes_the_check_out_and_says_so() {
+    // An older release, or a copy whose version couldn't be read: either may not know the flag.
+    for version in [Some("0.21.1"), None] {
+        let rig = rig(pdf_room(b"%PDF-1.7 room base"));
+        rig.install_pdfcraft(version);
+        let local = rig.open(PDF);
+        assert!(rig.live_apps().is_empty(), "{version:?}: nothing started live");
+        assert!(rig.dav.live_server().asked.is_empty(), "{version:?}: no ticket is asked for");
+        assert_eq!(std::fs::read(&local).unwrap(), b"%PDF-1.7 webdav bytes", "{version:?}: the check-out's copy");
+        assert!(rig.dav.held_lock(PDF).is_some(), "{version:?}: the check-out locks as before");
+        assert_eq!(rig.status(PDF), Some(SyncStatus::Saved), "{version:?}");
+        let detail = rig.last_detail(PDF).unwrap_or_default();
+        assert!(detail.contains("PdfCraft 0.22.0 or newer") && detail.contains("changes upload when you save"), "{version:?}: {detail}");
+        assert!(std::fs::read_dir(rig.paths.live_root()).map_or(true, |d| d.count() == 0), "{version:?}: no session left behind");
+        rig.save(&local, b"%PDF-1.7 local edit");
+        rig.settle();
+        assert_eq!(rig.dav.remote(PDF).unwrap(), b"%PDF-1.7 local edit", "{version:?}: and saves upload");
+    }
+}
+
+#[test]
+fn a_read_only_pdf_below_live_since_opens_read_only_without_the_upload_note() {
+    let rig = rig(pdf_room(b"%PDF-1.7 room base"));
+    rig.install_pdfcraft(Some("0.21.1"));
+    rig.service.open(PDF, None, true);
+    assert!(rig.live_apps().is_empty() && rig.dav.live_server().asked.is_empty());
+    assert!(rig.last_detail(PDF).is_none_or(|d| !d.contains("changes upload")), "{:?}", rig.last_detail(PDF));
+}
+
+#[test]
+fn a_pdf_whose_app_falls_back_gets_a_check_out_that_asks_before_its_first_save() {
+    let rig = rig(pdf_room(b"%PDF-1.7 room base"));
+    rig.install_pdfcraft(Some("0.22.0"));
+    let app = rig.open_live(PDF);
+    signal_fallback(&app, r#"{"v":1,"reason":"the PDF needs a password"}"#);
+    rig.service.tick();
+    let detail = rig.last_detail(PDF).unwrap_or_default();
+    assert!(detail.contains("the PDF needs a password") && detail.contains("changes upload when you save"), "{detail}");
+    assert!(rig.dav.held_lock(PDF).is_some(), "checked out: locked as any check-out");
+    assert!(!app.session.exists(), "the ticket doesn't stay on disk");
+    // The app was given the room's starting bytes, which aren't the WebDAV file's.
+    rig.save(&app.file, b"%PDF-1.7 edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(PDF).unwrap(), b"%PDF-1.7 webdav bytes", "not replaced");
+    assert_eq!(rig.status(PDF), Some(SyncStatus::Conflict), "the user chooses");
 }
 
 #[test]

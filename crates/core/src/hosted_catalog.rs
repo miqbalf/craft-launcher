@@ -66,6 +66,8 @@ struct Record {
     site: Option<String>,
     mac_team: Option<String>,
     mac_bundle_name: Option<String>,
+    #[serde(default)]
+    live_since: Option<String>,
     icon_url: String,
     icon_sha256: String,
     desktop_categories: Vec<String>,
@@ -199,6 +201,12 @@ impl VerifiedCatalog {
                     ),
                 });
             }
+            // A bundled app keeps the bundled `live_since`: it says which of its versions this
+            // launcher may start with `--live-session`, so a signed catalog can't move it.
+            let live_since = match SUITE.iter().find(|a| a.id == record.id) {
+                Some(bundled) => bundled.live_since,
+                None => record.live_since.map(intern),
+            };
             apps.push(CraftApp {
                 id: intern(record.id),
                 name: intern(record.name),
@@ -217,6 +225,7 @@ impl VerifiedCatalog {
                 bundle: record.bundle.map(intern),
                 site: record.site.map(intern),
                 mac_team: record.mac_team.map(intern),
+                live_since,
             });
         }
         for app in &SUITE {
@@ -299,6 +308,10 @@ fn valid_record(r: &Record) -> bool {
         || !r.former_bundles.is_empty()
         || r.mac_bundle_name.as_deref().is_some_and(|name| name != r.name)
     {
+        return false;
+    }
+    // A plain `X.Y.Z`, as the bundled catalog's (see `build.rs`).
+    if r.live_since.as_deref().is_some_and(|v| !semver::Version::parse(v).is_ok_and(|p| p.pre.is_empty() && p.build.is_empty() && p.to_string() == v)) {
         return false;
     }
     if r.desktop_categories.len() > 16
@@ -471,6 +484,32 @@ mod tests {
         r = first_record();
         r.details.as_mut().unwrap().shots[0].url = "https://other.example/shot.jpg".into();
         assert!(!valid_record(&r));
+    }
+
+    #[test]
+    fn a_signed_catalog_cannot_move_a_pinned_live_since() {
+        let pdf = |text: &str| {
+            let snapshot = signed(text.as_bytes()).unwrap().into_snapshot(HashMap::new());
+            snapshot.apps.iter().find(|a| a.id == "pdfcraft").unwrap().live_since
+        };
+        let text = std::str::from_utf8(BUNDLED).unwrap();
+        assert!(text.contains("live_since = \"0.22.0\""), "the bundled catalog carries the field");
+        assert_eq!(pdf(text), Some("0.22.0"));
+        assert_eq!(pdf(&text.replace("live_since = \"0.22.0\"", "live_since = \"0.1.0\"")), Some("0.22.0"), "not lowered");
+        assert_eq!(pdf(&text.replace("live_since = \"0.22.0\"\n", "")), Some("0.22.0"), "not dropped");
+    }
+
+    #[test]
+    fn a_live_since_must_be_a_plain_version() {
+        let mut r = future_app();
+        r.live_since = Some("1.2.3".into());
+        assert!(valid_record(&r));
+        for bad in ["soon", "1.2", "1.2.3-rc.1", "", " 1.2.3", "1.2.3\n"] {
+            r.live_since = Some(bad.into());
+            assert!(!valid_record(&r), "{bad:?}");
+        }
+        let snapshot = VerifiedCatalog { records: vec![future_app()], rejected_entries: 0 }.into_snapshot(HashMap::new());
+        assert_eq!(snapshot.apps[0].live_since, None);
     }
 
     #[test]

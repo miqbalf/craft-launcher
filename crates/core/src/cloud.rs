@@ -16,8 +16,20 @@ pub const SIGN_IN_EXPIRED: &str = "Your cloud sign-in is no longer valid. Reconn
 pub const CLOUD_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
 
 /// Catalog ids of the apps that can join a live editing session (`--live-session`): their cloud
-/// files open live when the server offers it, and through the check-out otherwise.
-pub const LIVE_APPS: [&str; 3] = ["wordcraft", "gridcraft", "deckcraft"];
+/// files open live when the server offers it, and through the check-out otherwise. An app with a
+/// catalog `live_since` joins only from that version on ([`live_refusal`]).
+pub const LIVE_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
+
+/// Why the installed copy of `app` can't join a live session, as the note its check-out carries;
+/// `None` when it can, or when it isn't installed (opening it says so).
+pub fn live_refusal(app: &crate::CraftApp, installed: Option<&crate::Installed>) -> Option<String> {
+    let since = app.live_since?;
+    let installed = installed?;
+    let since_v = crate::version::parse(since)?;
+    // A copy whose version couldn't be read may be older: it would open the flag as a file.
+    let joins = installed.version.as_ref().is_some_and(|v| crate::version::compare(v, &since_v).is_ge());
+    (!joins).then(|| format!("Live editing needs {} {since} or newer; changes upload when you save.", app.name))
+}
 
 /// What the launcher tells the user when a live-capable file opens through the check-out instead,
 /// because the server offers no live session for it (no Craft Office app, no access, or its relay
@@ -184,5 +196,45 @@ mod tests {
         assert_eq!(app_for("y.odp"), Some("deckcraft"));
         assert_eq!(app_for("photo.jpg"), None);
         assert_eq!(app_for("noext"), None);
+    }
+
+    fn installed(version: Option<&str>) -> crate::Installed {
+        crate::Installed {
+            version: version.map(|v| crate::version::parse(v).unwrap()),
+            source: crate::InstallSource::Launcher,
+            location: "/apps/pdfcraft".to_string(),
+            package: None,
+            externally_managed: false,
+            origin: None,
+            installation: None,
+        }
+    }
+
+    #[test]
+    fn every_cloud_app_can_join_live_editing() {
+        assert!(CLOUD_APPS.iter().all(|app| LIVE_APPS.contains(app)), "{LIVE_APPS:?}");
+    }
+
+    #[test]
+    fn pdfcraft_joins_live_only_from_its_live_since_version() {
+        let pdf = crate::CraftApp::by_id("pdfcraft").unwrap();
+        assert_eq!(live_refusal(pdf, None), None, "not installed: the live launcher says so itself");
+        for old in [Some("0.21.1"), Some("0.22.0-rc.1"), Some("0.2.0"), None] {
+            let note = live_refusal(pdf, Some(&installed(old))).unwrap_or_else(|| panic!("{old:?} must take the check-out"));
+            assert!(note.contains("PdfCraft 0.22.0 or newer") && note.contains("changes upload when you save"), "{old:?}: {note}");
+        }
+        for new in ["0.22.0", "0.22.3", "1.0.0"] {
+            assert_eq!(live_refusal(pdf, Some(&installed(Some(new)))), None, "{new}");
+        }
+    }
+
+    #[test]
+    fn the_office_apps_that_were_live_before_have_no_version_gate() {
+        for id in ["wordcraft", "gridcraft", "deckcraft"] {
+            let app = crate::CraftApp::by_id(id).unwrap();
+            assert_eq!(app.live_since, None, "{id}");
+            assert_eq!(live_refusal(app, Some(&installed(Some("0.0.1")))), None, "{id}");
+            assert_eq!(live_refusal(app, Some(&installed(None))), None, "{id}: an unread version stays live, as before");
+        }
     }
 }

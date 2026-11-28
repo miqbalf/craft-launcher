@@ -23,7 +23,7 @@ pub use live::{LiveProcess, SESSION_VERSION, TICKET_PATH, relay_address, relay_r
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::cloud::{CloudAccount, CloudEntry};
@@ -49,6 +49,9 @@ type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 type WallClock = Box<dyn Fn() -> jiff::Timestamp + Send + Sync>;
 /// Starts an app for a live session: `(app id, session file, working copy)`.
 type LiveLauncher = Box<dyn Fn(&str, &Path, &Path) -> Result<Box<dyn LiveProcess>, String> + Send + Sync>;
+/// `Err(note)` when the installed app can't join a live session (an `Arc`, so a check runs
+/// without the lock held).
+type LiveGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Whether a relay URL accepts connections.
 type RelayProbe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 /// Shows a folder in the file manager.
@@ -90,6 +93,8 @@ pub struct CloudService<S: TokenStore, H: Http> {
     /// The server's file ids of the paths the last listings showed, which live tickets name.
     file_ids: Mutex<HashMap<String, u64>>,
     live_launcher: LiveLauncher,
+    /// Whether the installed app may be started live (see [`CloudService::set_live_gate`]).
+    live_gate: Mutex<LiveGate>,
     relay_probe: RelayProbe,
     /// The open files. `None` until first read from disk. Held for the whole of each sync step, so
     /// an open, a poll, a Done, a resolve and a disconnect never interleave on one file.
@@ -125,6 +130,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             not_writable: Mutex::new(HashSet::new()),
             file_ids: Mutex::new(HashMap::new()),
             live_launcher: Box::new(|_, _, _| Err("Live editing isn't supported on this system yet".to_string())),
+            live_gate: Mutex::new(Arc::new(|_| Ok(()))),
             relay_probe: Box::new(relay_reachable),
             book: Mutex::new(None),
             assist: Mutex::new(assist::AssistState::default()),
@@ -169,6 +175,27 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     pub fn with_live_launcher(mut self, launch: impl Fn(&str, &Path, &Path) -> Result<Box<dyn LiveProcess>, String> + Send + Sync + 'static) -> Self {
         self.live_launcher = Box::new(launch);
         self
+    }
+
+    /// Replaces the check that the installed app can join a live session, as
+    /// [`CloudService::set_live_gate`] (tests answer it).
+    #[must_use]
+    pub fn with_live_gate(self, gate: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        self.set_live_gate(gate);
+        self
+    }
+
+    /// Sets the check that the installed app can join a live session: `Err(note)` opens the file
+    /// through the check-out, with `note` beside it, and asks for no ticket. The backend sets it
+    /// once the service is shared (the catalog's `live_since` against the detected version).
+    pub fn set_live_gate(&self, gate: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) {
+        *self.live_gate.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(gate);
+    }
+
+    /// Asks the live gate whether the installed `app` can join a live session.
+    fn live_gate(&self, app: &str) -> Result<(), String> {
+        let gate = self.live_gate.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        gate(app)
     }
 
     /// Replaces the check that a live session's relay can be reached (tests answer it).

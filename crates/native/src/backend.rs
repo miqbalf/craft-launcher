@@ -280,6 +280,15 @@ fn open_live_in_app(
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
 type Spawn = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
+/// Whether the installed catalog app `app` can join a live session: from its catalog `live_since`
+/// version on (`Err` is the note its check-out carries). Fork-only (udinCraft): an older PdfCraft
+/// would read `--live-session` as a file to open.
+fn live_gate(shared: &Shared, app: &str) -> Result<(), String> {
+    let Some(def) = CraftApp::by_id(app) else { return Ok(()) };
+    let installed = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app).cloned();
+    artcraft_launcher_core::cloud::live_refusal(def, installed.as_ref()).map_or(Ok(()), Err)
+}
+
 impl NativeBackend {
     /// `waker` is called (from any thread) whenever events are waiting; it should repaint the UI.
     pub fn new(waker: impl Fn() + Send + Sync + 'static) -> Self {
@@ -339,6 +348,10 @@ impl NativeBackend {
                     .with_live_launcher(move |app, session, file| open_live_in_app(&live_apps, app, session, file)),
             )
         });
+        if let Some(cloud) = &cloud {
+            let installed = shared.clone();
+            cloud.set_live_gate(move |app| live_gate(&installed, app));
+        }
         if let Some(cloud) = &cloud {
             // Says whether an account is still connected, then watches the files open from the
             // cloud: shows last run's again and uploads their saves.
