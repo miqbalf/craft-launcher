@@ -19,7 +19,7 @@ use craft_nextcloud::{Account as DavAccount, Error as DavError};
 use craft_suite_account::TokenStore;
 
 use super::checkout::{self, Book, Checkout, HeldLock, Recent, Runtime, Synced, rt_key};
-use super::live::{self, LiveOpen};
+use super::live::{self, LiveOpen, Release};
 use super::{CloudService, explain_dav};
 
 /// How long a changed file must stay unchanged before it is uploaded: apps save in steps.
@@ -317,6 +317,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             tracks_remote: !read_only,
             status,
             synced: Some(Synced::of(stamp, &bytes)),
+            live_room: None,
         };
         // Launched before it is recorded (the book is held, so the watcher waits): an app that
         // can't be given the file leaves nothing locked, recorded or in the cache.
@@ -556,7 +557,21 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             return Upload::Saved;
         }
         self.status(key, SyncStatus::Uploading, None);
-        let result = put_checked(&Files::new(dav), &self.http(), &c, bytes);
+        let (files, http) = (Files::new(dav), self.http());
+        let mut result = put_rebased(&files, &http, &c, bytes.clone());
+        // Refused by the lock of the live room this copy fell back from: the room is given up again
+        // (the others may have left since), and the save tried once more if it ended.
+        let mut others_live = false;
+        if matches!(result, Err(DavError::Locked))
+            && let Some(room) = &c.live_room
+        {
+            match self.release_live(room) {
+                Release::Ended | Release::Gone => result = put_rebased(&files, &http, &c, bytes),
+                Release::Live => others_live = true,
+                Release::Unknown => {}
+            }
+        }
+        let (by_live_room, by_app) = (c.live_room.is_some(), self.listed_lock(&c.path).1);
         let rt = book.runtime.entry(rt_key(account, key)).or_default();
         rt.seen = None;
         let c = &mut book.list[i];
@@ -565,9 +580,24 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Ok(etag) => {
                 c.etag = etag;
                 c.synced = Some(synced);
+                c.live_room = None;
                 rt.retry_at = None;
                 rt.backoff = Duration::ZERO;
                 (SyncStatus::Saved, None, Upload::Saved)
+            }
+            // Others are editing it live: their work isn't overwritten, so this version stays here
+            // until the user chooses (Keep both puts it beside theirs).
+            Err(DavError::Locked) if others_live => {
+                c.tracks_remote = false;
+                log::info!("a cloud file is still edited live by others; uploads stop until the user chooses");
+                (
+                    SyncStatus::Conflict,
+                    Some(
+                        "Others are still editing this file live, so your changes didn't replace theirs. They're kept here: choose Keep both to upload your version as a copy beside theirs."
+                            .to_string(),
+                    ),
+                    Upload::Failed,
+                )
             }
             Err(DavError::Conflict) => {
                 c.tracks_remote = false;
@@ -616,6 +646,13 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 rt.backoff = if rt.backoff.is_zero() { FIRST_BACKOFF } else { (rt.backoff * 2).min(MAX_BACKOFF) };
                 rt.retry_at = Some(now + rt.backoff);
                 let detail = match &e {
+                    // The lock of a live session on the server (Craft Office), not a person's.
+                    DavError::Locked if by_live_room => {
+                        "The live editing session on the server still holds this file, so your changes couldn't upload yet. They're kept here and upload once that session closes.".to_string()
+                    }
+                    DavError::Locked if by_app => {
+                        "An editing app on the server holds this file (someone may be editing it in the browser), so your changes couldn't upload yet. They're kept here and upload once it lets go.".to_string()
+                    }
                     DavError::Locked => "Someone else has this file locked. Your changes are kept here and uploaded when they're done.".to_string(),
                     other => format!("{} Your changes are kept here and uploaded when it works again.", explain_dav(other).0),
                 };
@@ -1036,6 +1073,26 @@ fn put_checked<H: Http>(files: &Files<'_>, http: &H, c: &Checkout, bytes: Vec<u8
             Err(DavError::Locked) => Err(DavError::Conflict),
             other => other,
         },
+        other => other,
+    }
+}
+
+/// [`put_checked`], and when the server answers 412 although its file still holds exactly the
+/// version this copy started from, once more over the server's current ETag. A lock taken and
+/// released (a live session's) changes the ETag without changing the file; that is no conflict,
+/// and treating it as one would ask the user to choose between two equal versions.
+fn put_rebased<H: Http>(files: &Files<'_>, http: &H, c: &Checkout, bytes: Vec<u8>) -> craft_nextcloud::Result<String> {
+    match put_checked(files, http, c, bytes.clone()) {
+        Err(DavError::Conflict) => {
+            let Some(base) = c.synced.as_ref().map(|s| s.sha256.as_str()) else { return Err(DavError::Conflict) };
+            match files.get(http, &c.remote, super::transport::MAX_FILE) {
+                Ok((theirs, etag)) if checkout::digest(&theirs) == base => {
+                    log::info!("a cloud file's version changed but not its content; saving over it");
+                    put_checked(files, http, &Checkout { etag, ..c.clone() }, bytes)
+                }
+                _ => Err(DavError::Conflict),
+            }
+        }
         other => other,
     }
 }

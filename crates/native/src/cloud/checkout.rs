@@ -93,6 +93,19 @@ pub(super) struct Checkout {
     pub status: SyncStatus,
     /// The working copy as it was when last in step with `etag`.
     pub synced: Option<Synced>,
+    /// The live room this check-out came from, while that room may still hold the file (its app
+    /// fell back from live editing, DJ-brief §2b): an upload the room's lock refuses gives the room
+    /// up again rather than only waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_room: Option<LiveRoom>,
+}
+
+/// A live room the launcher held tickets for: its id and the id those tickets carried. Neither is
+/// a secret: giving the room up also needs the account's sign-in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LiveRoom {
+    pub room: String,
+    pub client: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
