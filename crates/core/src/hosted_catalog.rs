@@ -311,7 +311,8 @@ fn valid_record(r: &Record) -> bool {
         return false;
     }
     // A plain `X.Y.Z`, as the bundled catalog's (see `build.rs`).
-    if r.live_since.as_deref().is_some_and(|v| !semver::Version::parse(v).is_ok_and(|p| p.pre.is_empty() && p.build.is_empty() && p.to_string() == v)) {
+    if r.live_since.as_deref().is_some_and(|v| !semver::Version::parse(v).is_ok_and(|p| p.pre.is_empty() && p.build.is_empty() && p.to_string() == v))
+    {
         return false;
     }
     if r.desktop_categories.len() > 16

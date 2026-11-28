@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus, live_refusal};
-use artcraft_launcher_core::{CraftApp, InstallSource, Installed};
 use artcraft_launcher_core::protocol::Event;
+use artcraft_launcher_core::{CraftApp, InstallSource, Installed};
 use artcraft_launcher_native::cloud::{CloudService, LiveProcess};
 use artcraft_launcher_native::paths::Paths;
 use craft_nextcloud::http::{Http, Method, Request, Response};
