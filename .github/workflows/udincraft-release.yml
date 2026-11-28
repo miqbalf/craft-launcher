@@ -271,7 +271,7 @@ jobs:
           files() { (cd dist && ls -1 -- $1 2>/dev/null) | sed 's/^/- `/; s/$/`/' || true; }
           {
             case "$APP_TITLE" in
-              udinCraft*) echo "$APP_TITLE, the udinCraft build of $UPSTREAM_TITLE, based on $UPSTREAM_TITLE by the ArtCraft team." ;;
+              udinCraft*) echo "$APP_TITLE, based on $UPSTREAM_TITLE by the ArtCraft team." ;;
               *) echo "udinCraft build of $APP_TITLE, based on $UPSTREAM_TITLE by the ArtCraft team." ;;
             esac
             echo
