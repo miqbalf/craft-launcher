@@ -954,6 +954,14 @@ pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(
     process::open_with(Path::new(&installed.location), file).map_err(|e| format!("Couldn't open {}: {e}", app.name))
 }
 
+/// Opens `file`, a file on this computer, in an installed app. On macOS it goes to the app the
+/// way a cloud working copy does ([`open_file`]: an open-document event to the installed bundle,
+/// so an app that is already running opens it too). Elsewhere the app starts as its Open button
+/// starts it ([`launch`]), with the file as its argument.
+pub fn open_local(app: &CraftApp, installed: &Installed, paths: &Paths, file: &Path) -> Result<(), String> {
+    if cfg!(target_os = "macos") { open_file(app, installed, file) } else { launch(app, installed, paths, &[file.to_string_lossy().into_owned()]) }
+}
+
 /// Starts a new instance of an installed app for a live session: `--live-session <session>`
 /// and the working copy `file`. macOS only in this version, as [`open_file`]. The returned
 /// process ends when the app quits.

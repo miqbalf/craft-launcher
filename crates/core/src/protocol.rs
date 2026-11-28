@@ -51,6 +51,14 @@ pub enum Command {
         app: String,
         args: Vec<String>,
     },
+    /// Open `path`, a file on this computer, in the installed app `app` (see
+    /// [`crate::local_file`]): a plain open, with no upload and no lock. It starts the app the way
+    /// [`Command::Launch`] does, with the file on its command line; on macOS the file goes to the
+    /// app as a cloud working copy does, so an app that is already running opens it too.
+    OpenLocal {
+        app: String,
+        path: String,
+    },
     /// Show the installed app in the file manager.
     Reveal {
         app: String,

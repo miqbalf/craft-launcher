@@ -724,6 +724,18 @@ impl Host for DesktopHost {
         dialog.pick_folder().and_then(|p| p.to_str().map(str::to_string))
     }
 
+    fn pick_file(&mut self, filters: &[artcraft_launcher_ui_egui::FileFilter]) -> Option<String> {
+        // The portal's globs can match case-sensitively on Linux, so `REPORT.DOCX` is offered too.
+        let dialog = filters.iter().fold(rfd::FileDialog::new(), |dialog, f| {
+            let mut exts: Vec<String> = f.extensions.iter().map(|e| (*e).to_string()).collect();
+            if cfg!(target_os = "linux") {
+                exts.extend(f.extensions.iter().map(|e| e.to_ascii_uppercase()));
+            }
+            dialog.add_filter(&f.name, &exts)
+        });
+        dialog.pick_file().and_then(|p| p.to_str().map(str::to_string))
+    }
+
     fn default_install_folder(&mut self, kind: artcraft_launcher_core::PackageKind, arch: Option<artcraft_launcher_core::Arch>) -> Option<String> {
         if let Some((_, answer)) = self.default_folders.iter().find(|(question, _)| *question == (kind, arch)) {
             return answer.clone();
