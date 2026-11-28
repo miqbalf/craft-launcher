@@ -408,14 +408,15 @@ fn ticket_answer(s: &mut Server, req: &Request) -> Response {
     }
     let room_lock = live.room_lock && live.permissions == "edit";
     let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": data}});
-    if room_lock && let Some(path) = s.ids.iter().find(|(_, id)| **id == file_id).map(|(p, _)| p.clone()) {
-        if !s.locks.contains_key(&path) {
-            s.locks.insert(path.clone(), ROOM_LOCK.to_string());
-            s.lock_owners.insert(path.clone(), ("Craft Office".to_string(), 1));
-            let tag = s.tag();
-            if let Some(f) = s.files.get_mut(&path) {
-                f.1 = tag;
-            }
+    if room_lock
+        && let Some(path) = s.ids.iter().find(|(_, id)| **id == file_id).map(|(p, _)| p.clone())
+        && !s.locks.contains_key(&path)
+    {
+        s.locks.insert(path.clone(), ROOM_LOCK.to_string());
+        s.lock_owners.insert(path.clone(), ("Craft Office".to_string(), 1));
+        let tag = s.tag();
+        if let Some(f) = s.files.get_mut(&path) {
+            f.1 = tag;
         }
     }
     Response::new(200, answer.to_string().into_bytes())

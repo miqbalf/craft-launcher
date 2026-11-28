@@ -147,7 +147,14 @@ struct OcsBody {
 /// Asks `server` for a ticket to edit `file_id` live, as `login` with the app password
 /// `password` (Basic auth, as every Nextcloud API call from the launcher). `client` is the id this
 /// session gives all its tickets, so it can give the room up later ([`release_room`]).
-pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, password: &str, file_id: u64, client: Option<&str>) -> Result<Ticket, TicketError> {
+pub(super) fn request_ticket<H: Http>(
+    http: &H,
+    server: &str,
+    login: &str,
+    password: &str,
+    file_id: u64,
+    client: Option<&str>,
+) -> Result<Ticket, TicketError> {
     let url = format!("{}{TICKET_PATH}", server.trim_end_matches('/'));
     let body = match client {
         Some(client) => serde_json::json!({ "fileId": file_id, "client": client }),
