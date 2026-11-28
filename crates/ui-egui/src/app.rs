@@ -1129,26 +1129,32 @@ impl LauncherUi {
         self.entry(id).is_some_and(|e| e.status(self.platform, self.caps.manage_apps).is_installed())
     }
 
-    /// "ArtCraft API", "GitHub" or "ArtCraft API and GitHub": the services behind the releases on
-    /// screen right now. `None` until something has loaded.
+    /// The services behind the releases on screen right now: "udinCraft releases" for the
+    /// udinCraft apps (read from the fork's own GitHub releases), then "ArtCraft API" and "GitHub"
+    /// for the others, joined as "{a} and {b}" or "{a}, {b} and {c}". `None` until something has
+    /// loaded.
     pub(crate) fn sources_label(&self) -> Option<String> {
         use artcraft_launcher_core::protocol::Origin;
-        let mut api = false;
-        let mut github = false;
+        let (mut udincraft, mut api, mut github) = (false, false, false);
         for e in &self.entries {
             if matches!(e.latest, Some(LatestRelease::Found(_) | LatestRelease::None)) {
                 match e.origin {
+                    Some(_) if artcraft_launcher_core::catalog::from_udincraft(e.app.id) => udincraft = true,
                     Some(Origin::ArtCraftApi) => api = true,
                     Some(Origin::GitHub) => github = true,
                     None => {}
                 }
             }
         }
-        match (api, github) {
-            (true, true) => Some(crate::i18n::fmt(tl!("{a} and {b}"), &[("a", Origin::ArtCraftApi.label()), ("b", Origin::GitHub.label())])),
-            (true, false) => Some(Origin::ArtCraftApi.label().to_string()),
-            (false, true) => Some(Origin::GitHub.label().to_string()),
-            (false, false) => None,
+        let names: Vec<&str> = [(udincraft, tl!("udinCraft releases")), (api, Origin::ArtCraftApi.label()), (github, Origin::GitHub.label())]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        match names.as_slice() {
+            [] => None,
+            [a] => Some((*a).to_string()),
+            [a, b] => Some(crate::i18n::fmt(tl!("{a} and {b}"), &[("a", a), ("b", b)])),
+            [a, b, c, ..] => Some(crate::i18n::fmt(tl!("{a}, {b} and {c}"), &[("a", a), ("b", b), ("c", c)])),
         }
     }
 

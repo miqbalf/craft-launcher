@@ -15,39 +15,40 @@ use crate::paths::Paths;
 
 pub use craft_update::self_update::{FINISH_FLAG, Install, PRETEND_VAR};
 
+/// Fork-only (udinCraft): the launcher as craft-update knows it, with the fork's releases
+/// ([`LAUNCHER_REPO`]) and name in the update windows. craft-update reads a fork app's
+/// `udincraft-v*` release as the fork's, whose builds carry no Developer ID or Authenticode
+/// signature (`craft_update::fork`): on macOS the ad-hoc bundle must pass `codesign --verify
+/// --deep --strict` as `ai.storyteller.artcraft-launcher`, and on Windows the unsigned MSI or
+/// program installs once its SHA-256 matches the release's checksums.
+///
+/// [`LAUNCHER_REPO`]: artcraft_launcher_core::catalog::LAUNCHER_REPO
+pub const LAUNCHER: craft_update::App =
+    craft_update::App { repo: artcraft_launcher_core::catalog::LAUNCHER_REPO, developer: "udinCraft", ..craft_update::suite::LAUNCHER };
+
 /// The version this launcher counts as (see [`PRETEND_VAR`]).
 pub fn current_version() -> Option<Version> {
-    craft_update::self_update::current_version(&craft_update::suite::LAUNCHER, env!("CARGO_PKG_VERSION"))
+    craft_update::self_update::current_version(&LAUNCHER, env!("CARGO_PKG_VERSION"))
 }
 
 /// How this copy is installed, if it's one the launcher knows how to replace.
 pub fn current() -> Option<Install> {
-    craft_update::self_update::current(&craft_update::suite::LAUNCHER)
+    craft_update::self_update::current(&LAUNCHER)
 }
 
 /// Whether this copy can update itself: [`current`] finds it and, on Windows, it is signed.
 pub fn is_self_updating() -> bool {
-    craft_update::self_update::is_self_updating(&craft_update::suite::LAUNCHER)
+    craft_update::self_update::is_self_updating(&LAUNCHER)
 }
 
 /// Fork-only (udinCraft): whether this copy installs the fork's own release ([`LAUNCHER_REPO`]'s
-/// `udincraft-v*`) itself, rather than offering its download.
-///
-/// craft-update's swap checks the new copy the way upstream signs it: on macOS a Developer ID
-/// signature from ArtCraft's team, on Windows an Authenticode signature like this copy's. The
-/// fork's builds carry neither (macOS ad hoc, Windows unsigned), so there the update would only
-/// fail after its download; it is offered as a download of the fork's release instead. On Linux
-/// (an AppImage or a standalone copy) nothing is signed, and the download is checked against the
-/// release's checksums, so the copy updates itself.
+/// `udincraft-v*`) itself, rather than offering its download: wherever it can update itself at
+/// all. craft-update accepts the fork's unsigned builds for [`LAUNCHER`] (see there), so macOS,
+/// Windows and Linux copies all install it.
 ///
 /// [`LAUNCHER_REPO`]: artcraft_launcher_core::catalog::LAUNCHER_REPO
 pub fn fork_updates_itself() -> bool {
-    fork_installs_on(Platform::current().map(|p| p.os)) && is_self_updating()
-}
-
-/// [`fork_updates_itself`]'s rule for one operating system.
-fn fork_installs_on(os: Option<artcraft_launcher_core::Os>) -> bool {
-    os == Some(artcraft_launcher_core::Os::Linux)
+    is_self_updating()
 }
 
 fn to_update_paths(paths: &Paths) -> craft_update::Paths {
@@ -135,7 +136,7 @@ pub fn update(
         });
     };
     craft_update::self_update::update(
-        &craft_update::suite::LAUNCHER,
+        &LAUNCHER,
         install,
         &update_release,
         update_platform,
@@ -181,35 +182,37 @@ fn update_kind(install: &Install) -> craft_update::PackageKind {
 /// Whether `release` has the file that updating `install` on `platform` downloads ([`kind`]),
 /// picked as [`update`] picks it. The pick reads only the file names, so the repo is left empty.
 pub fn installs_from(install: &Install, release: &Release, platform: Platform) -> bool {
-    let app = &craft_update::suite::LAUNCHER;
+    let app = &LAUNCHER;
     craft_update::pick_asset(&to_update_release(release, ""), &[app.id], to_update_platform(platform), &[update_kind(install)]).is_some()
 }
 
 /// Finishes an update when this program was started as the update helper.
 pub fn finish(args: &[OsString]) -> Option<Result<(), String>> {
-    craft_update::self_update::finish(&craft_update::suite::LAUNCHER, args)
+    craft_update::self_update::finish(&LAUNCHER, args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Fork-only (udinCraft): only Linux copies install the fork's unsigned release themselves;
-    /// macOS and Windows offer its download.
+    /// Fork-only (udinCraft): craft-update knows the launcher as the fork's, so it reads the
+    /// fork's `udincraft-v*` release as one whose unsigned builds it installs.
     #[test]
-    fn the_fork_installs_its_own_launcher_release_only_on_linux() {
-        use artcraft_launcher_core::Os;
-        assert!(fork_installs_on(Some(Os::Linux)));
-        for os in [Some(Os::MacOs), Some(Os::Windows), Some(Os::FreeBsd), None] {
-            assert!(!fork_installs_on(os), "{os:?}");
-        }
+    fn the_launcher_is_the_forks_to_craft_update() {
+        assert_eq!(LAUNCHER.repo, artcraft_launcher_core::catalog::LAUNCHER_REPO);
+        assert_eq!((LAUNCHER.id, LAUNCHER.bundle_id().as_str()), ("artcraft-launcher", "ai.storyteller.artcraft-launcher"));
+        assert!(craft_update::fork::is_fork_app(&LAUNCHER));
+        let tag = "udincraft-v0.19.3-20261201";
+        let r = artcraft_launcher_core::release::release_from_sums(LAUNCHER.repo, tag, &[]);
+        assert!(craft_update::fork::is_fork_release(&LAUNCHER, &to_update_release(&r, LAUNCHER.repo)));
+        assert!(!craft_update::fork::is_fork_app(&craft_update::suite::LAUNCHER), "upstream's launcher keeps its signature checks");
     }
 
     /// Fork-only (udinCraft): the fork's launcher release passes craft-update's link check when it
     /// carries the fork's repo, as the launcher's update check hands it over.
     #[test]
     fn the_forks_launcher_release_passes_the_link_check() {
-        let app = &craft_update::suite::LAUNCHER;
+        let app = &LAUNCHER;
         let repo = artcraft_launcher_core::catalog::LAUNCHER_REPO;
         let tag = "udincraft-v0.19.3-20261201";
         let r = artcraft_launcher_core::release::release_from_sums(
@@ -228,7 +231,7 @@ mod tests {
     /// repository, and is refused as the launcher's own.
     #[test]
     fn the_update_checks_links_against_the_repo_the_release_came_from() {
-        let app = &craft_update::suite::LAUNCHER;
+        let app = &LAUNCHER;
         let sums = |name: &str| [("a".repeat(64), name.to_string())];
         let renamed = artcraft_launcher_core::release::release_from_sums(
             "storytold/artcraft-launcher-next",
@@ -252,7 +255,7 @@ mod tests {
     fn a_release_without_the_installed_format_for_this_platform_does_not_install() {
         use artcraft_launcher_core::platform::{Arch, Os};
         use std::path::PathBuf;
-        let app = &craft_update::suite::LAUNCHER;
+        let app = &LAUNCHER;
         let release = |names: &[&str]| {
             let sums: Vec<(String, String)> = names.iter().map(|n| ("a".repeat(64), (*n).to_string())).collect();
             artcraft_launcher_core::release::release_from_sums(app.repo, "v0.9.0", &sums)

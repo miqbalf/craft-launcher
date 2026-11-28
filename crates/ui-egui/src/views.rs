@@ -16,10 +16,16 @@ use crate::settings::{Filter, SortKey, ViewMode};
 use crate::theme::{self, Tokens, rgb, tint};
 use crate::widgets::{self, Kind};
 
-/// The byline that says who makes an app: "by ArtCraft" or "by <publisher>". Official apps take
-/// the accent colour, community apps the muted one.
+/// Who publishes `app` as this launcher shows it: "udinCraft" for the udinCraft apps, whose
+/// releases come from the fork, else the catalog's publisher ("ArtCraft").
+pub(crate) fn publisher(app: &artcraft_launcher_core::CraftApp) -> &'static str {
+    if artcraft_launcher_core::catalog::from_udincraft(app.id) { "udinCraft" } else { app.publisher }
+}
+
+/// The byline that says who makes an app: "by ArtCraft", "by udinCraft" or "by <publisher>".
+/// Official apps take the accent colour, community apps the muted one.
 fn kind_badge(ui: &mut Ui, app: &artcraft_launcher_core::CraftApp, t: &Tokens) {
-    let text = fmt(tl!("by {name}"), &[("name", app.publisher)]);
+    let text = fmt(tl!("by {name}"), &[("name", publisher(app))]);
     let color = match app.kind {
         AppKind::Official => t.accent_ink,
         AppKind::Community => t.muted,
@@ -872,7 +878,7 @@ impl LauncherUi {
                 row.col(|ui| self.table_version_cell(ui, &entry, &status, t));
                 row.col(|ui| self.table_released_cell(ui, &entry, now, t));
                 row.col(|ui| {
-                    ui.label(RichText::new(entry.app.publisher).color(t.muted));
+                    ui.label(RichText::new(publisher(entry.app)).color(t.muted));
                 });
                 // A pinned row's grip leads its actions; the other rows leave its room empty, so
                 // every row's buttons stay in line. Every row also reserves the pin-toggle square.

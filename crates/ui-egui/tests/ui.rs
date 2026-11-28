@@ -3111,10 +3111,11 @@ fn the_footer_names_the_services_behind_what_is_on_screen() {
             h.get_by_label_contains("Checked ").accesskit_node().label().or_else(|| h.get_by_label_contains("Checked ").accesskit_node().value());
         label.unwrap_or_default()
     };
-    assert_eq!(footer(Vec::new()), "Checked 3 min ago · using ArtCraft API");
+    // The udinCraft apps' releases are the fork's own, whatever service answered for them.
+    assert_eq!(footer(Vec::new()), "Checked 3 min ago · using udinCraft releases and ArtCraft API");
     let from_github =
-        vec![Event::Latest { app: "wordcraft".into(), latest: LatestRelease::Found(release("wordcraft", "0.3.1", NOW)), from: Origin::GitHub }];
-    assert_eq!(footer(from_github), "Checked 3 min ago · using ArtCraft API and GitHub");
+        vec![Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(release("photocraft", "0.5.1", NOW)), from: Origin::GitHub }];
+    assert_eq!(footer(from_github), "Checked 3 min ago · using udinCraft releases, ArtCraft API and GitHub");
 }
 
 #[test]
@@ -5485,4 +5486,14 @@ fn a_udincraft_app_updates_from_its_forks_release() {
     h.get_by_label("Update to 0.9.0").click();
     h.run_steps(2);
     assert_eq!(launches_and_installs(&sent, "wordcraft"), (0, 1), "{:?}", sent.borrow());
+}
+
+#[test]
+fn the_udincraft_apps_say_who_publishes_them() {
+    // Fork-only (udinCraft): the four udinCraft apps' cards say "by udinCraft"; the other
+    // ArtCraft apps keep "by ArtCraft".
+    let (mut h, _) = harness(ViewMode::Grid, egui::Theme::Dark, true);
+    h.run_steps(6);
+    assert!(h.query_all_by_label("by udinCraft").count() > 0);
+    assert!(h.query_all_by_label("by ArtCraft").count() > 0);
 }

@@ -40,7 +40,7 @@ jobs:
         run: |
           cargo clippy --locked -p artcraft-launcher-core -p artcraft-launcher-native --all-targets -- -D warnings
           cargo test --locked -p artcraft-launcher-core -- udincraft
-          cargo test --locked -p artcraft-launcher-native --lib -- udincraft macos_verify macos_checks
+          cargo test --locked -p artcraft-launcher-native --lib -- udincraft macos_verify macos_checks self_update::
       - name: Package (universal, ad-hoc signed, not notarized)
         run: packaging/macos/package.sh --arch universal
       - name: Zip the app too
