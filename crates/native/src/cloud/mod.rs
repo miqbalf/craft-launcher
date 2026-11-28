@@ -11,11 +11,13 @@
 //! silently (see [`sync`]).
 
 mod account;
+mod assist;
 mod checkout;
 mod live;
 mod sync;
 pub mod transport;
 
+pub use assist::{ASSIST_FILE_VERSION, ASSIST_TOKEN_PATH};
 pub use live::{LiveProcess, SESSION_VERSION, TICKET_PATH, relay_address, relay_reachable, resolve_relay};
 
 use std::collections::{HashMap, HashSet};
@@ -92,6 +94,8 @@ pub struct CloudService<S: TokenStore, H: Http> {
     /// The open files. `None` until first read from disk. Held for the whole of each sync step, so
     /// an open, a poll, a Done, a resolve and a disconnect never interleave on one file.
     book: Mutex<Option<checkout::Book>>,
+    /// When the account-wide grammar and AI token is renewed next.
+    assist: Mutex<assist::AssistState>,
 }
 
 /// Why a cloud call produced nothing.
@@ -123,6 +127,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             live_launcher: Box::new(|_, _, _| Err("Live editing isn't supported on this system yet".to_string())),
             relay_probe: Box::new(relay_reachable),
             book: Mutex::new(None),
+            assist: Mutex::new(assist::AssistState::default()),
         }
     }
 

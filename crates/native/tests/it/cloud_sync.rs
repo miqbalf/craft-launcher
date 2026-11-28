@@ -57,7 +57,21 @@ struct Server {
     live: Option<LiveServer>,
     /// How many times the starting-copy route was asked.
     base_fetches: u32,
+    /// The Craft Office assist token route: `None` answers 404 (an older Craft Office).
+    assist: Option<AssistServer>,
 }
+
+/// What the fake Craft Office app answers on its assist token route.
+#[derive(Clone, Default)]
+struct AssistServer {
+    /// Answer with this status instead of a token.
+    refuse: Option<u16>,
+    /// How many tokens were asked for.
+    asked: u32,
+}
+
+/// The assist token the fake server issues, numbered: it must never reach an event.
+const ASSIST_SECRET: &str = "asst-SECRET-never-logged";
 
 /// What the fake Craft Office app answers on its ticket endpoint.
 #[derive(Clone)]
@@ -151,6 +165,19 @@ impl Dav {
                 f.1 = tag;
             }
         }
+    }
+
+    /// The server offers grammar and AI (craft_office 0.5.4.3 and later).
+    fn offer_assist(&self) {
+        self.0.lock().unwrap().assist = Some(AssistServer::default());
+    }
+
+    fn edit_assist(&self, f: impl FnOnce(&mut AssistServer)) {
+        f(self.0.lock().unwrap().assist.as_mut().unwrap());
+    }
+
+    fn assist_asked(&self) -> u32 {
+        self.0.lock().unwrap().assist.as_ref().map_or(0, |a| a.asked)
     }
 
     fn live_server(&self) -> LiveServer {
@@ -272,6 +299,9 @@ impl Http for Dav {
             let login = if s.login.is_empty() { "alice".to_string() } else { s.login.clone() };
             let body = format!(r#"{{"server":"{SERVER}","loginName":"{login}","appPassword":"another-app-password"}}"#);
             return Ok(Response::new(200, body.into_bytes()));
+        }
+        if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/assist/token") {
+            return Ok(assist_answer(&mut s, &req));
         }
         if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/ticket") {
             return Ok(ticket_answer(&mut s, &req));
@@ -451,6 +481,21 @@ fn release_answer(s: &mut Server, req: &Request) -> Response {
     }
     let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": {"state": state}}});
     Response::new(200, answer.to_string().into_bytes())
+}
+
+/// The fake assist token route: Basic auth with the account's app password, as the ticket's.
+fn assist_answer(s: &mut Server, req: &Request) -> Response {
+    let Some(assist) = s.assist.as_mut() else { return Response::new(404, Vec::new()) };
+    let expected = format!("Basic {}", base64(&format!("alice:{PASSWORD}")));
+    if req.method != Method::Post || req.get_header("authorization") != Some(expected.as_str()) || req.get_header("ocs-apirequest") != Some("true") {
+        return Response::new(401, Vec::new());
+    }
+    assist.asked += 1;
+    if let Some(status) = assist.refuse {
+        return Response::new(status, Vec::new());
+    }
+    let data = serde_json::json!({"token": format!("{ASSIST_SECRET}.{}", assist.asked), "expiresIn": 600, "proof": true, "ai": false});
+    Response::new(200, serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": data}}).to_string().into_bytes())
 }
 
 /// The fake starting-copy route: Basic auth, 404 for every failure, the checksum in a header.
@@ -2064,4 +2109,110 @@ fn a_version_change_that_left_the_bytes_alone_is_no_conflict() {
     rig.settle();
     assert_eq!(rig.dav.remote(FILE).unwrap(), b"mine");
     assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+}
+
+// Grammar and AI (DG1): the launcher hands the apps an assist token, never its app password, in
+// the live session file and in one account-wide file that every other open reads.
+
+impl Rig {
+    fn assist_json(&self) -> Option<serde_json::Value> {
+        std::fs::read(self.paths.assist_file()).ok().map(|b| serde_json::from_slice(&b).unwrap())
+    }
+}
+
+#[test]
+fn signed_in_the_account_wide_assist_file_is_kept_fresh_and_private() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_assist();
+    let rig = rig(dav);
+    rig.service.tick();
+    let first = rig.assist_json().unwrap_or_else(|| panic!("no assist file: {:?}", rig.events()));
+    assert_eq!(first["v"], 1);
+    assert_eq!(first["server"], SERVER);
+    assert!(first["assist"]["token"].as_str().unwrap().starts_with(ASSIST_SECRET));
+    assert_eq!((first["assist"]["proof"].as_bool(), first["assist"]["ai"].as_bool()), (Some(true), Some(false)), "the server's flags, as given");
+    let expires: jiff::Timestamp = first["assist"]["expiresAt"].as_str().unwrap().parse().unwrap();
+    assert!(expires > wall());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(rig.paths.assist_file()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "only this user may read the token");
+    }
+    rig.settle();
+    assert_eq!(rig.assist_json().unwrap()["assist"]["token"], first["assist"]["token"], "not renewed while it is young");
+    rig.advance(Duration::from_secs(500));
+    rig.service.tick();
+    assert_ne!(rig.assist_json().unwrap()["assist"]["token"], first["assist"]["token"], "renewed before the 600 s token ran out");
+    // A passing failure keeps the file (it still holds a token until it runs out).
+    rig.dav.edit_assist(|a| a.refuse = Some(503));
+    rig.advance(Duration::from_secs(500));
+    rig.service.tick();
+    assert!(rig.assist_json().is_some());
+    // A refusal (the sign-in no longer accepted) removes it: the apps say to sign in.
+    rig.dav.edit_assist(|a| a.refuse = Some(401));
+    rig.advance(Duration::from_secs(150));
+    rig.service.tick();
+    assert!(rig.assist_json().is_none(), "a refused sign-in leaves no token behind");
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(ASSIST_SECRET) && !shown.contains(PASSWORD), "no secret in an event");
+    let mut files = Vec::new();
+    files_under(rig.root.path(), &mut files);
+    for file in files {
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes()), "password in {}", file.display());
+    }
+}
+
+#[test]
+fn an_older_server_gets_no_assist_file() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    rig.settle();
+    assert!(rig.assist_json().is_none());
+    assert!(!rig.paths.assist_file().exists());
+}
+
+#[test]
+fn disconnecting_removes_the_assist_file() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_assist();
+    let rig = rig(dav);
+    rig.service.tick();
+    assert!(rig.assist_json().is_some());
+    rig.service.disconnect();
+    assert!(rig.assist_json().is_none(), "signed out: no token left for the apps");
+    let asked = rig.dav.assist_asked();
+    rig.advance(Duration::from_secs(700));
+    rig.service.tick();
+    assert!(rig.assist_json().is_none() && rig.dav.assist_asked() == asked, "not asked for again once signed out");
+}
+
+#[test]
+fn a_live_session_file_carries_an_assist_token_renewed_with_the_ticket() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    dav.offer_assist();
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    let first = session_json(&app);
+    assert!(first["assist"]["token"].as_str().unwrap().starts_with(ASSIST_SECRET));
+    assert!(first["assist"]["expiresAt"].as_str().is_some());
+    rig.advance(Duration::from_secs(550));
+    rig.service.tick();
+    let renewed = session_json(&app);
+    assert_ne!(renewed["ticket"], first["ticket"]);
+    assert_ne!(renewed["assist"]["token"], first["assist"]["token"], "a fresh assist token with the fresh ticket");
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(ASSIST_SECRET));
+}
+
+#[test]
+fn a_live_session_on_a_server_without_assist_has_no_assist_field() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    let json = session_json(&app);
+    assert!(json.get("assist").is_none(), "{json}");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live), "live editing goes on regardless");
 }
