@@ -1898,7 +1898,7 @@ fn a_dismissed_install_prompt_is_not_called_a_cancelled_download() {
 /// Download again.
 fn a_kept_update_installs_on_retry_and_an_up_to_date_app_is_not_downloaded_again() {
     let mut ev = events();
-    for app in ["effectcraft", "lightcraft"] {
+    for app in ["effectcraft", "wordcraft"] {
         ev.push(Event::ReadyToInstall { app: app.into(), ready: true });
     }
     let (mut h, sent) = harness_with(ev, ViewMode::Table, egui::Theme::Dark, true, 1.0);
@@ -1909,8 +1909,8 @@ fn a_kept_update_installs_on_retry_and_an_up_to_date_app_is_not_downloaded_again
     h.get_by_label("Retry update to 0.6.0").click();
     h.run_steps(2);
     assert_eq!(*sent.borrow(), [Command::Install { app: "effectcraft".into() }]);
-    // LightCraft is up to date: its menu offers Reinstall, which uses the kept file.
-    let row = h.get_by_role_and_label(egui::accesskit::Role::Label, "LightCraft").rect().center().y;
+    // WordCraft is up to date: its menu offers Reinstall, which uses the kept file.
+    let row = h.get_by_role_and_label(egui::accesskit::Role::Label, "WordCraft").rect().center().y;
     h.get_all_by_label_contains("More actions").find(|n| (n.rect().center().y - row).abs() < 25.0).unwrap().click();
     h.run_steps(3);
     h.get_by_label("Reinstall");
@@ -2407,12 +2407,11 @@ fn order(h: &Harness<'_, Option<LauncherUi>>) -> Vec<String> {
 fn every_table_column_sorts_both_ways() {
     let (mut h, _) = harness(ViewMode::Table, egui::Theme::Dark, true);
     h.run_steps(6);
-    // Status: apps with an update first (suite order breaks the tie), then WordCraft (installed,
-    // its updates come from udinCraft), then the up to date ones.
+    // Status: apps with an update first (suite order breaks the tie), then the up to date ones.
     h.get_by_label("Status").click();
     h.run_steps(3);
     let o = order(&h);
-    assert_eq!(&o[..4], ["PhotoCraft", "EffectCraft", "WordCraft", "LightCraft"], "{o:?}");
+    assert_eq!(&o[..4], ["PhotoCraft", "EffectCraft", "LightCraft", "WordCraft"], "{o:?}");
     // Reversed: the apps not installed first, then up to date, then the updates last. The table
     // keeps its column's order; only the grid puts installed apps above the rest.
     h.get_by_label("Status").click();
@@ -2638,8 +2637,7 @@ fn hostile_release_asset_urls_never_reach_the_opener() {
     }
     let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, false, 1.0);
     h.run_steps(8);
-    // The udinCraft apps link to their own releases instead.
-    assert!(h.query_all_by_label("Download for macOS").count() >= 6, "the cards must offer their asset downloads");
+    assert!(h.query_all_by_label("Download for macOS").count() >= 8, "the cards must offer their asset downloads");
     let opened = all_opened(&mut h, "Download for macOS");
     assert!(!opened.iter().any(|url| url.as_str() == HOSTILE), "a hostile card asset URL reached the opener: {opened:?}");
 
@@ -3125,10 +3123,11 @@ fn the_footer_names_the_services_behind_what_is_on_screen() {
             h.get_by_label_contains("Checked ").accesskit_node().label().or_else(|| h.get_by_label_contains("Checked ").accesskit_node().value());
         label.unwrap_or_default()
     };
-    assert_eq!(footer(Vec::new()), "Checked 3 min ago · using ArtCraft API");
+    // The udinCraft apps' releases are the fork's own, whatever service answered for them.
+    assert_eq!(footer(Vec::new()), "Checked 3 min ago · using udinCraft releases and ArtCraft API");
     let from_github =
-        vec![Event::Latest { app: "wordcraft".into(), latest: LatestRelease::Found(release("wordcraft", "0.3.1", NOW)), from: Origin::GitHub }];
-    assert_eq!(footer(from_github), "Checked 3 min ago · using ArtCraft API and GitHub");
+        vec![Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(release("photocraft", "0.5.1", NOW)), from: Origin::GitHub }];
+    assert_eq!(footer(from_github), "Checked 3 min ago · using udinCraft releases, ArtCraft API and GitHub");
 }
 
 #[test]
@@ -3136,9 +3135,7 @@ fn web_build_offers_downloads() {
     let (mut h, _) = harness(ViewMode::Grid, egui::Theme::Dark, false);
     h.run_steps(8);
     snapshot(&mut h, "web-grid-dark");
-    // The udinCraft apps link to their own releases instead.
-    assert!(h.query_all_by_label("Download for macOS").count() >= 6);
-    assert!(h.query_all_by_label("Updates come from udinCraft").count() >= 1);
+    assert!(h.query_all_by_label("Download for macOS").count() >= 8);
     assert!(h.query_by_label("Install").is_none());
     assert!(h.query_by_label_contains("without updating").is_none(), "nothing installed to open on the web");
 }
@@ -5052,15 +5049,17 @@ fn status_change_is_announced() {
 
 #[test]
 fn missing_app_offers_install() {
-    // DeckCraft is a udinCraft app: the row points to its udinCraft releases instead of
-    // installing upstream's build.
     let (mut h, sent, _) = connected_with(top_folder());
     let deck = h.get_by_role_and_label(Role::Button, "deck.pptx");
     assert!(deck.accesskit_node().is_disabled(), "DeckCraft isn't installed, so the file can't open yet");
-    assert!(h.query_by_role_and_label(Role::Button, "Install DeckCraft").is_none());
-    h.get_by_role_and_label(Role::Button, "Updates come from udinCraft").click();
+    h.get_by_role_and_label(Role::Button, "Install DeckCraft").click();
     h.run_steps(4);
-    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::Install { .. })), "no upstream install");
+    // The launcher asks where to install a new app first, as it does from the Apps page.
+    if let Some(confirm) = h.query_all_by_role_and_label(Role::Button, "Install").last() {
+        confirm.click();
+        h.run_steps(3);
+    }
+    assert_eq!(cloud_sent(&sent).last(), Some(&Command::Install { app: "deckcraft".into() }));
 }
 
 #[test]
@@ -5471,30 +5470,44 @@ fn a_live_file_shows_live_with_nothing_to_press_until_its_app_closes() {
 }
 
 #[test]
-fn udincraft_apps_never_offer_an_upstream_update_or_install() {
-    // Upstream has WordCraft 0.9.0 (installed: 0.3.0) and GridCraft (not installed); PhotoCraft
-    // 0.5.0 (installed: 0.4.1) still updates from upstream.
+fn a_udincraft_app_updates_from_its_forks_release() {
+    // Fork-only (udinCraft): the backend reads WordCraft's releases from miqbalf/wordcraft, so its
+    // card offers that release like any other update (installed: 0.3.0).
+    let tag = "udincraft-v0.9.0-20261201";
+    let name = "wordcraft-0.9.0-macos-universal.dmg";
+    let fork = Release {
+        tag: tag.into(),
+        version: version::parse(tag),
+        name: tag.into(),
+        published_at: Some(NOW - 3600),
+        html_url: format!("https://github.com/miqbalf/wordcraft/releases/tag/{tag}"),
+        notes: String::new(),
+        prerelease: false,
+        assets: vec![Asset {
+            name: name.into(),
+            size: 150 << 20,
+            url: format!("https://github.com/miqbalf/wordcraft/releases/download/{tag}/{name}"),
+            sha256: None,
+        }],
+    };
     let mut ev = events();
-    ev.push(Event::Latest {
-        app: "wordcraft".into(),
-        latest: LatestRelease::Found(release("wordcraft", "0.9.0", NOW - 3600)),
-        from: Origin::ArtCraftApi,
-    });
+    ev.push(Event::Latest { app: "wordcraft".into(), latest: LatestRelease::Found(fork), from: Origin::GitHub });
     let (mut h, sent) = harness_with(ev, ViewMode::Table, egui::Theme::Dark, true, 1.0);
     h.run_steps(6);
-    assert!(h.query_all_by_label_contains("Update to 0.9.0").next().is_none(), "no upstream update for WordCraft");
-    assert!(h.query_all_by_label_contains("Update to 0.5.0").next().is_some(), "PhotoCraft still updates from upstream");
-    assert!(h.query_all_by_label_contains("Installed · updates come from udinCraft").next().is_some(), "WordCraft says where its updates come from");
-    let links: Vec<_> = h.query_all_by_role_and_label(Role::Button, "Updates come from udinCraft").collect();
-    assert!(!links.is_empty(), "a missing udinCraft app points to its releases instead of installing");
-    let udin = |id: &str| matches!(id, "wordcraft" | "gridcraft" | "deckcraft" | "pdfcraft");
-    links[0].click();
-    h.run_steps(3);
-    assert!(!sent.borrow().iter().any(|c| match c {
-        Command::Install { app } => udin(app),
-        Command::InstallAll { apps } => apps.iter().any(|a| udin(a)),
-        _ => false,
-    }));
+    assert!(h.query_by_label_contains("updates come from udinCraft").is_none(), "no block: the fork's releases are its updates");
+    h.get_by_label("Update to 0.9.0").click();
+    h.run_steps(2);
+    assert_eq!(launches_and_installs(&sent, "wordcraft"), (0, 1), "{:?}", sent.borrow());
+}
+
+#[test]
+fn the_udincraft_apps_say_who_publishes_them() {
+    // Fork-only (udinCraft): the four udinCraft apps' cards say "by udinCraft"; the other
+    // ArtCraft apps keep "by ArtCraft".
+    let (mut h, _) = harness(ViewMode::Grid, egui::Theme::Dark, true);
+    h.run_steps(6);
+    assert!(h.query_all_by_label("by udinCraft").count() > 0);
+    assert!(h.query_all_by_label("by ArtCraft").count() > 0);
 }
 
 /// The shell's file picker, scripted: each pick answers the next queued path (none: cancelled),

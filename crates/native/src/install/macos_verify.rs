@@ -62,6 +62,35 @@ pub(super) fn verify_with(
     Ok(())
 }
 
+/// Fork-only (udinCraft): the checks a udinCraft app's macOS build passes instead of
+/// [`verify_with`]. The fork's builds are signed ad hoc (no Developer ID, not notarized), so
+/// there is no team to pin and Gatekeeper has nothing to accept. What vouches for the download is
+/// the HTTPS fetch from the fork's own release and its line in the release's `SHA256SUMS.txt`
+/// (checked before this runs); these checks then make sure the app inside is whole (its ad hoc
+/// signature seals every file, nested code included) and is the app the catalog names (its signing
+/// identifier is the catalog's bundle id).
+pub(super) fn verify_fork_build(
+    app: &CraftApp,
+    bundle: &Path,
+    mut run: impl FnMut(&str, &[&str], Duration) -> Result<crate::process::RunOutput, String>,
+) -> Result<(), String> {
+    let path = bundle.to_str().ok_or("couldn't check the app's unusual path, so it wasn't installed")?;
+    let requirement = format!("={}", identifiers(app)?);
+    for (check, args) in [
+        ("signature integrity", vec!["--verify", "--all-architectures", "--deep", "--strict", path]),
+        ("bundle identity", vec!["--verify", "--all-architectures", "--strict", "-R", &requirement, path]),
+    ] {
+        let output = run(CODESIGN, &args, TIMEOUT)
+            .map_err(|reason| format!("macOS verification did not succeed ({check}: {reason}), so the app wasn't installed"))?;
+        if !output.success {
+            let reason = output.stderr.trim();
+            let reason = if reason.is_empty() { output.status } else { reason.to_string() };
+            return Err(format!("macOS verification did not succeed ({check}: {reason}), so the app wasn't installed"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssessmentStatus {
     Enabled,
@@ -91,6 +120,17 @@ fn identity_requirement(app: &CraftApp, team: &str) -> Result<String, String> {
     if team.is_empty() || !team.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err("no valid macOS signing team is configured, so the app wasn't installed".into());
     }
+    // Developer ID Application's standard requirement, also observed in the real app's DR.
+    Ok(format!(
+        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU]=\"{team}\" and ({})",
+        identifiers(app)?
+    ))
+}
+
+/// `identifier "<id>" or …` for every bundle id the catalog gives `app`.
+fn identifiers(app: &CraftApp) -> Result<String, String> {
     let mut identifiers = Vec::new();
     // Catalog data only, never an identifier supplied by the downloaded app. Keep approved
     // former IDs so detecting/updating an older bundle still agrees with the catalog.
@@ -100,13 +140,7 @@ fn identity_requirement(app: &CraftApp, team: &str) -> Result<String, String> {
         }
         identifiers.push(format!("identifier \"{id}\""));
     }
-    // Developer ID Application's standard requirement, also observed in the real app's DR.
-    Ok(format!(
-        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
-         and certificate leaf[subject.OU]=\"{team}\" and ({})",
-        identifiers.join(" or ")
-    ))
+    Ok(identifiers.join(" or "))
 }
 
 fn assessment_accepted(output: &str) -> bool {
@@ -169,6 +203,31 @@ mod tests {
         assert_eq!(required_team(Some("G5QA5U5X2S"), false).unwrap(), Some("G5QA5U5X2S"));
         assert_eq!(required_team(None, true).unwrap(), None);
         assert_eq!(required_team(Some("G5QA5U5X2S"), true).unwrap(), Some("G5QA5U5X2S"));
+    }
+
+    #[test]
+    fn a_udincraft_build_is_checked_for_integrity_and_identity_without_a_team() {
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let mut calls = Vec::new();
+        verify_fork_build(app, Path::new("/private/owned/WordCraft.app"), |program, args, timeout| {
+            assert_eq!((program, timeout), (CODESIGN, Duration::from_secs(60)));
+            calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            Ok(success(""))
+        })
+        .unwrap();
+        assert_eq!(calls.len(), 2, "no notarization or Gatekeeper check for an ad hoc build");
+        assert_eq!(calls[0], ["--verify", "--all-architectures", "--deep", "--strict", "/private/owned/WordCraft.app"]);
+        assert_eq!(calls[1][4], "=identifier \"ai.storyteller.wordcraft\"");
+        // A broken seal or another app's identifier stops it.
+        for failing in [0, 1] {
+            let mut n = 0;
+            let err = verify_fork_build(app, Path::new("/private/owned/WordCraft.app"), |_, _, _| {
+                n += 1;
+                Ok(if n - 1 == failing { crate::process::RunOutput::exit(1, "", "invalid signature") } else { success("") })
+            })
+            .unwrap_err();
+            assert!(err.contains("wasn't installed") && err.contains("invalid signature"), "{err}");
+        }
     }
 
     #[test]

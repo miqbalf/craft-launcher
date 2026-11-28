@@ -867,16 +867,7 @@ impl LauncherUi {
             Some(why) => resp.on_disabled_hover_text(why.as_str()),
             None => resp.on_hover_text(description.as_str()),
         };
-        // Fork-only (udinCraft): a missing udinCraft app comes from its releases, not from here.
-        let udincraft = app.and_then(artcraft_launcher_core::catalog::udincraft_releases);
-        if show_install && let Some(url) = &udincraft {
-            let label = tl!("Updates come from udinCraft");
-            let w = widgets::button_width(ui, label, 0.0).min(kind_w);
-            let at = Rect::from_center_size(pos2(kind_x + w / 2.0, y), vec2(w, theme::CONTROL_H));
-            if ui.put(at, |ui: &mut Ui| widgets::button(ui, label, Kind::Secondary, 0.0)).on_hover_text(url.as_str()).clicked() {
-                widgets::open_external_link(ui.ctx(), url);
-            }
-        } else if show_install && let Some(app) = app {
+        if show_install && let Some(app) = app {
             let label = fmt(tl!("Install {app}"), &[("app", app_name.as_deref().unwrap_or(app))]);
             let w = widgets::button_width(ui, &label, 0.0).min(kind_w);
             let at = Rect::from_center_size(pos2(kind_x + w / 2.0, y), vec2(w, theme::CONTROL_H));

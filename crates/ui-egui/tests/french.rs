@@ -121,7 +121,7 @@ fn french_ui_translates_labels_dates_and_messages() {
     h.get_by_label("Retouche d'images");
     h.get_by_label("Mettre à jour vers 0.5.0");
     h.get_by_label_contains("Vérification de la somme de contrôle…");
-    h.get_by_label_contains("Vérifié il y a 3 min · via ArtCraft API");
+    h.get_by_label_contains("Vérifié il y a 3 min · via versions udinCraft et ArtCraft API");
     h.get_by_label("LightCraft mis à jour vers 0.5.0");
 
     let mut table = harness(ViewMode::Table);

@@ -139,6 +139,8 @@
 	Apps you hid	Aplicativos que você ocultou
 	Checked {ago} · using {sources}	Verificado {ago} · via {sources}
 	{a} and {b}	{a} e {b}
+	{a}, {b} and {c}	{a}, {b} e {c}
+	udinCraft releases	versões do udinCraft
 	Join the Discord	Entrar no Discord
 	Learn more	Saiba mais
 	Minimize	Minimizar
@@ -477,8 +479,6 @@ anicraft	Classic tweens with eight easing presets and custom ease curves, plus s
 	Conflict	Conflict
 	Read-only	Read-only
 	Close it in the app first	Close it in the app first
-	Updates come from udinCraft	Updates come from udinCraft
-	Installed · updates come from udinCraft	Installed · updates come from udinCraft
 	Live	Live
 	Approve the sign-in in your browser to finish connecting.	Approve the sign-in in your browser to finish connecting.
 	Connected to {server} as {name}	Connected to {server} as {name}

@@ -128,7 +128,7 @@ fn ukrainian_ui_translates_labels_dates_and_messages() {
     h.get_by_label("Редагування зображень");
     h.get_by_label("Оновити до 0.5.0");
     h.get_by_label_contains("Перевірка контрольної суми…");
-    h.get_by_label_contains("Перевірено 3 хвилини тому · джерела: ArtCraft API");
+    h.get_by_label_contains("Перевірено 3 хвилини тому · джерела: релізи udinCraft і ArtCraft API");
     h.get_by_label("Застосунок LightCraft оновлено до 0.5.0");
 
     let mut table = harness(ViewMode::Table);

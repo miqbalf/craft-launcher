@@ -121,6 +121,8 @@
 	Apps you hid	Aplikacije koje ste sakrili
 	Checked {ago} · using {sources}	Provjereno {ago} · koristeći {sources}
 	{a} and {b}	{a} i {b}
+	{a}, {b} and {c}	{a}, {b} i {c}
+	udinCraft releases	izdanja udinCrafta
 	Join the Discord	Pridružite se Discordu
 	Learn more	Saznajte više
 	Minimize	Minimiziraj
@@ -463,8 +465,6 @@ artcraft	AI image and video creation	Kreiranje slika i videa pomoću AI
 	Conflict	Conflict
 	Read-only	Read-only
 	Close it in the app first	Close it in the app first
-	Updates come from udinCraft	Updates come from udinCraft
-	Installed · updates come from udinCraft	Installed · updates come from udinCraft
 	Live	Live
 	Approve the sign-in in your browser to finish connecting.	Approve the sign-in in your browser to finish connecting.
 	Connected to {server} as {name}	Connected to {server} as {name}

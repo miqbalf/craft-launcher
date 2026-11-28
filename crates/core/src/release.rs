@@ -202,7 +202,7 @@ pub fn choose_version(releases: &[Release], track: &crate::protocol::VersionTrac
         VersionTrack::Stable => releases
             .iter()
             .filter(|r| !r.prerelease && r.version.as_ref().is_some_and(version::is_stable))
-            .max_by(|a, b| a.version.cmp(&b.version))
+            .max_by(|a, b| a.version.cmp(&b.version).then_with(|| udincraft_date(a).cmp(&udincraft_date(b))))
             .cloned(),
         VersionTrack::Nightly => releases.iter().filter(|r| is_nightly(r) && has_published_checksum(r)).max_by_key(|r| r.published_at).cloned(),
         VersionTrack::Pinned(tag) => releases.iter().find(|r| r.tag == *tag).cloned(),
@@ -234,6 +234,89 @@ pub fn parse_github_release_list(json: &str, repo: &str, allow_prerelease: bool)
         }
     }
     Ok(best)
+}
+
+/// Fork-only (udinCraft): the build date of a udinCraft release (`udincraft-v<version>-<YYYYMMDD>`),
+/// which breaks a tie between two builds of one version; 0 for any other tag.
+fn udincraft_date(r: &Release) -> u32 {
+    version::udincraft_tag(&r.tag).map_or(0, |(_, date)| date)
+}
+
+/// Fork-only (udinCraft): whether `a` is a newer udinCraft build than `b`: a higher version, or
+/// the same version built on a later date.
+fn newer_udincraft_build(a: &Release, b: &Release) -> bool {
+    match (a.version.as_ref(), b.version.as_ref()) {
+        (Some(va), Some(vb)) => match version::compare(va, vb) {
+            std::cmp::Ordering::Equal => udincraft_date(a) > udincraft_date(b),
+            order => order == std::cmp::Ordering::Greater,
+        },
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Fork-only (udinCraft): the udinCraft releases in `GET /repos/<repo>/releases`, newest first.
+///
+/// Only tags `udincraft-v<version>-<YYYYMMDD>` count, so a release with any other tag (an
+/// upstream-style `v0.19.1`, should one ever be published on the fork) is never offered. Drafts
+/// are skipped, and so is a release without `SHA256SUMS.txt`: its files are checked against that
+/// list ([`udincraft_checksum`]) before anything is installed.
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed or its top level is not an array.
+pub fn parse_udincraft_releases(json: &str, repo: &str) -> Result<Vec<Release>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("unreadable answer from GitHub ({e})"))?;
+    let list = v.as_array().ok_or("unexpected answer from GitHub")?;
+    let mut releases: Vec<Release> = list
+        .iter()
+        .filter(|item| !item["draft"].as_bool().unwrap_or(false))
+        .filter(|item| item["tag_name"].as_str().is_some_and(|t| version::udincraft_tag(t).is_some()))
+        .filter_map(|item| release_from_value(item, repo).ok())
+        .filter(|r| r.version.is_some() && r.sums_asset().is_some())
+        .take(100)
+        .collect();
+    releases.sort_by(|a, b| {
+        if newer_udincraft_build(a, b) {
+            std::cmp::Ordering::Less
+        } else if newer_udincraft_build(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    Ok(releases)
+}
+
+/// Fork-only (udinCraft): the newest udinCraft release in `GET /repos/<repo>/releases` (see
+/// [`parse_udincraft_releases`]), stable only unless `allow_prerelease`.
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed or its top level is not an array.
+pub fn parse_udincraft_release_list(json: &str, repo: &str, allow_prerelease: bool) -> Result<Option<Release>, String> {
+    Ok(parse_udincraft_releases(json, repo)?
+        .into_iter()
+        .find(|r| allow_prerelease || (!r.prerelease && r.version.as_ref().is_some_and(version::is_stable))))
+}
+
+/// Fork-only (udinCraft): the checksum a udinCraft release's file is installed against, from the
+/// release's own `SHA256SUMS.txt` (`sums`, its text). A udinCraft file is always checked against
+/// that list, whichever route found the release: a file the list doesn't name is not installed,
+/// and GitHub's own digest (`asset.sha256`), when it has one, must agree with the list.
+///
+/// # Errors
+///
+/// When the list doesn't name the file, or names it with another checksum than GitHub's.
+pub fn udincraft_checksum(asset: &Asset, sums: &str) -> Result<String, String> {
+    let listed = parse_sha256sums(sums).into_iter().find(|(_, name)| *name == asset.name).map(|(hash, _)| hash);
+    let Some(hash) = listed else {
+        return Err(format!("SHA256SUMS.txt doesn't list {}, so it can't be verified and wasn't installed", asset.name));
+    };
+    if asset.sha256.as_ref().is_some_and(|digest| *digest != hash) {
+        return Err(format!("{} doesn't match its line in SHA256SUMS.txt, so it wasn't installed", asset.name));
+    }
+    Ok(hash)
 }
 
 fn release_from_value(v: &serde_json::Value, repo: &str) -> Result<Release, String> {
@@ -533,6 +616,77 @@ mod tests {
         assert_eq!(parse_github_release_list(json, REPO, false).unwrap().unwrap().tag, "v0.5.0");
         assert_eq!(parse_github_release_list(json, REPO, true).unwrap().unwrap().tag, "v0.6.0-rc.1");
         assert_eq!(parse_github_release_list("[]", REPO, false).unwrap(), None);
+    }
+
+    const UDIN: &str = "miqbalf/wordcraft";
+
+    /// One release in GitHub's list for [`UDIN`], with the files RL1's workflow publishes.
+    fn udin_item(tag: &str, extra: &str) -> String {
+        let dl = format!("https://github.com/{UDIN}/releases/download/{tag}");
+        format!(
+            r#"{{"tag_name":"{tag}","name":"{tag}","html_url":"https://github.com/{UDIN}/releases/tag/{tag}","published_at":"2026-11-27T10:00:00Z"{extra},
+            "assets":[{{"name":"wordcraft-0.18.1-macos-universal.dmg","size":10,"browser_download_url":"{dl}/wordcraft-0.18.1-macos-universal.dmg","digest":"sha256:{HASH}"}},
+                      {{"name":"wordcraft-0.18.1-linux-x86_64.AppImage","size":10,"browser_download_url":"{dl}/wordcraft-0.18.1-linux-x86_64.AppImage"}},
+                      {{"name":"SHA256SUMS.txt","size":10,"browser_download_url":"{dl}/SHA256SUMS.txt"}}]}}"#
+        )
+    }
+
+    #[test]
+    fn only_udincraft_tags_with_a_sums_file_count_as_udincraft_releases() {
+        let no_sums = r#"{"tag_name":"udincraft-v0.19.0-20261201","assets":[]}"#;
+        let json = format!(
+            "[{},{},{},{},{no_sums},{}]",
+            udin_item("v0.19.1", ""),
+            udin_item("udincraft-v0.18.1-20261127", ""),
+            udin_item("udincraft-v0.18.1-20261128", ""),
+            udin_item("udincraft-v0.20.0-20261202", r#","draft":true"#),
+            udin_item("udincraft-v0.19.0-rc.1-20261130", r#","prerelease":true"#),
+        );
+        let list = parse_udincraft_releases(&json, UDIN).unwrap();
+        // Newest first: the version, then the date of two builds of the same version.
+        assert_eq!(
+            list.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
+            ["udincraft-v0.19.0-rc.1-20261130", "udincraft-v0.18.1-20261128", "udincraft-v0.18.1-20261127"]
+        );
+        let latest = parse_udincraft_release_list(&json, UDIN, false).unwrap().unwrap();
+        assert_eq!((latest.tag.as_str(), latest.version.clone()), ("udincraft-v0.18.1-20261128", Some(Version::new(0, 18, 1))));
+        assert_eq!(parse_udincraft_release_list(&json, UDIN, true).unwrap().unwrap().tag, "udincraft-v0.19.0-rc.1-20261130");
+        assert_eq!(choose_version(&list, &crate::protocol::VersionTrack::Stable).unwrap().tag, "udincraft-v0.18.1-20261128");
+        // Only upstream-style releases: nothing to offer.
+        assert_eq!(parse_udincraft_release_list(&format!("[{}]", udin_item("v0.19.1", "")), UDIN, false).unwrap(), None);
+        assert_eq!(parse_udincraft_release_list("[]", UDIN, false).unwrap(), None);
+        assert!(parse_udincraft_releases("{}", UDIN).is_err());
+    }
+
+    #[test]
+    fn a_udincraft_file_is_checked_against_its_sums_file() {
+        let r = parse_udincraft_release_list(&format!("[{}]", udin_item("udincraft-v0.18.1-20261127", "")), UDIN, false).unwrap().unwrap();
+        // The asset links are the fork's own.
+        assert!(r.assets.iter().all(|a| a.url.starts_with("https://github.com/miqbalf/wordcraft/releases/download/udincraft-v0.18.1-20261127/")));
+        let (dmg, appimage) = (&r.assets[0], &r.assets[1]);
+        let other = "1".repeat(64);
+        let sums = format!("{HASH}  wordcraft-0.18.1-macos-universal.dmg\n{other}  wordcraft-0.18.1-linux-x86_64.AppImage\n");
+        // GitHub's digest agrees with the list; a file without one takes the list's.
+        assert_eq!(udincraft_checksum(dmg, &sums).unwrap(), HASH);
+        assert_eq!(udincraft_checksum(appimage, &sums).unwrap(), other);
+        // A digest that disagrees with the list, or a file the list doesn't name, is refused.
+        let wrong = format!("{other}  wordcraft-0.18.1-macos-universal.dmg\n");
+        assert!(udincraft_checksum(dmg, &wrong).unwrap_err().contains("doesn't match"));
+        assert!(udincraft_checksum(appimage, &wrong).unwrap_err().contains("doesn't list"));
+        assert!(udincraft_checksum(dmg, "").unwrap_err().contains("doesn't list"));
+    }
+
+    #[test]
+    fn udincraft_release_pages_read_like_any_other() {
+        // The quota-free route: the tag from the redirect, the files from SHA256SUMS.txt.
+        let sums = parse_sha256sums(&format!("{HASH}  wordcraft-0.18.1-macos-universal.dmg\n"));
+        let r = release_from_sums(UDIN, "udincraft-v0.18.1-20261127", &sums);
+        assert_eq!(r.version, Some(Version::new(0, 18, 1)));
+        assert_eq!(
+            r.assets[0].url,
+            "https://github.com/miqbalf/wordcraft/releases/download/udincraft-v0.18.1-20261127/wordcraft-0.18.1-macos-universal.dmg"
+        );
+        assert!(valid_tag("udincraft-v0.18.1-20261127"));
     }
 
     #[test]

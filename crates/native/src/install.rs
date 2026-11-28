@@ -216,8 +216,9 @@ pub fn install_at(
     let version = release.version_label();
     let result = match kind {
         // No team to check the signature against: refuse rather than install it unchecked.
+        // Fork-only (udinCraft): a udinCraft app has no team but its own checks (see `check_and_swap`).
         #[cfg(target_os = "macos")]
-        PackageKind::Dmg if app.mac_team.is_none() => {
+        PackageKind::Dmg if app.mac_team.is_none() && !artcraft_launcher_core::catalog::from_udincraft(app.id) => {
             Err("udinCraft Launcher has no macOS signing team recorded for this app, so it wasn't installed here".into())
         }
         #[cfg(target_os = "macos")]
@@ -712,9 +713,15 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
     if !release::valid_file_name(&asset.name) {
         return Err("the release has an unexpected file name".into());
     }
-    let sha = match &asset.sha256 {
-        Some(s) => Some(s.clone()),
-        None => published_checksum(release, asset, job.http)?,
+    let sha = if artcraft_launcher_core::version::udincraft_tag(&release.tag).is_some() {
+        // Fork-only (udinCraft): always the release's own SHA256SUMS.txt, which GitHub's digest
+        // must agree with (see `release::udincraft_checksum`).
+        Some(udincraft_checksum(release, asset, job.http)?)
+    } else {
+        match &asset.sha256 {
+            Some(s) => Some(s.clone()),
+            None => published_checksum(release, asset, job.http)?,
+        }
     };
     let Some(sha) = sha else {
         return Err(format!(
@@ -741,6 +748,16 @@ fn published_checksum(release: &Release, asset: &Asset, http: &Http) -> Result<O
         return Ok(None);
     };
     Ok(release::parse_sha256sums(&text).into_iter().find(|(_, n)| *n == asset.name).map(|(h, _)| h))
+}
+
+/// Fork-only (udinCraft): the checksum a udinCraft release's file is installed against, read from
+/// the release's `SHA256SUMS.txt`. A release without one, or a list that doesn't vouch for the file,
+/// installs nothing.
+fn udincraft_checksum(release: &Release, asset: &Asset, http: &Http) -> Result<String, String> {
+    let no_sums = || format!("the release publishes no SHA256SUMS.txt, so {} can't be verified and wasn't installed", asset.name);
+    let sums = release.sums_asset().ok_or_else(no_sums)?;
+    let text = http.get_text(&sums.url).map_err(|e| format!("couldn't fetch the release's checksums ({e}). Try again"))?.ok_or_else(no_sums)?;
+    release::udincraft_checksum(asset, &text)
 }
 
 /// When `installed` is owned by something the launcher doesn't drive, what to tell the user
@@ -1954,8 +1971,13 @@ pub mod macos {
         expect: &Expect<'_>,
         run: impl FnMut(&str, &[&str], Duration) -> Result<process::RunOutput, String>,
     ) -> Result<(), String> {
-        if let Some(team) = required_team(expect.team, cfg!(test))? {
-            super::macos_verify::verify_with(app, bundle, team, run)?;
+        // Fork-only (udinCraft): a udinCraft build has no Developer ID team; its download was
+        // checked against its release's SHA256SUMS.txt, and its own signature is checked here.
+        let udincraft = artcraft_launcher_core::catalog::from_udincraft(app.id);
+        match required_team(expect.team, cfg!(test) || udincraft)? {
+            Some(team) => super::macos_verify::verify_with(app, bundle, team, run)?,
+            None if udincraft => super::macos_verify::verify_fork_build(app, bundle, run)?,
+            None => {}
         }
         if let Some(want) = expect.version
             && !found.version.as_ref().is_some_and(|v| same_release(v, want))
@@ -3221,6 +3243,66 @@ mod tests {
         assert!(!phases.contains(&JobPhase::Installing));
     }
 
+    #[test]
+    fn a_udincraft_download_is_checked_against_its_release_sums_file() {
+        use crate::http::tests::{Reply, body, serve};
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let (body, sha) = body();
+        let other = "1".repeat(64);
+        let name = "wordcraft-0.3.0-test.pkg";
+        let kind = if cfg!(windows) { PackageKind::Dmg } else { PackageKind::Msi };
+        // `sums`: what the release's SHA256SUMS.txt says (`None`: the release has no such file);
+        // `digest`: GitHub's own. Returns the install's error and how many package requests came.
+        let attempt = |sums: Option<String>, digest: Option<String>| {
+            let (url, requests) = serve(body.clone(), vec![Reply::Full]);
+            let asset = Asset { name: name.into(), size: body.len() as u64, url, sha256: digest };
+            let mut assets = vec![asset.clone()];
+            if let Some(text) = sums {
+                let (sums_url, _) = serve(text.into_bytes(), vec![Reply::Full]);
+                assets.push(Asset { name: "SHA256SUMS.txt".into(), size: 0, url: sums_url, sha256: None });
+            }
+            let release = Release { tag: "udincraft-v0.3.0-20261127".into(), version: version::parse("0.3.0"), assets, ..Release::default() };
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let http = Http::new().unwrap();
+            let mut phase = |_: JobPhase| {};
+            let mut job = Job {
+                http: &http,
+                paths: &paths,
+                stop: &Stop::default(),
+                phase: &mut phase,
+                install_locations: &InstallLocations::default(),
+                replace: false,
+                approved_path: None,
+                downgrade: None,
+                batch: None,
+                place: None,
+            };
+            let err = install(app, &release, &asset, kind, None, None, &mut job).unwrap_err();
+            let fetched = requests.lock().unwrap().len();
+            (err, fetched)
+        };
+        // Listed with the right checksum: fetched and verified (then this system can't install it).
+        let (err, fetched) = attempt(Some(format!("{sha}  {name}\n")), None);
+        assert!(err.contains("isn't supported"), "{err}");
+        assert_eq!(fetched, 1);
+        let (err, _) = attempt(Some(format!("{sha}  {name}\n")), Some(sha.clone()));
+        assert!(err.contains("isn't supported"), "{err}");
+        // GitHub's digest alone is not enough: no sums file, or a list that leaves the file out.
+        for (sums, digest, says) in [
+            (None, Some(sha.clone()), "publishes no SHA256SUMS.txt"),
+            (Some(format!("{sha}  another-file.zip\n")), Some(sha.clone()), "doesn't list"),
+            (Some(format!("{other}  {name}\n")), Some(sha.clone()), "doesn't match"),
+        ] {
+            let (err, fetched) = attempt(sums, digest);
+            assert!(err.contains(says), "{says}: {err}");
+            assert_eq!(fetched, 0, "{says}: nothing is downloaded");
+        }
+        // The list is what the download is checked against: bytes that don't match it are refused.
+        let (err, _) = attempt(Some(format!("{other}  {name}\n")), None);
+        assert!(!err.contains("isn't supported"), "a download that doesn't match the list was installed: {err}");
+    }
+
     #[cfg(unix)]
     fn tarball(path: &Path, entries: &[&str]) {
         let f = std::fs::File::create(path).unwrap();
@@ -4165,6 +4247,54 @@ mod tests {
             );
             assert!(refused.unwrap_err().contains("already exists"));
             assert_eq!(std::fs::read_to_string(&plist).unwrap(), unrelated);
+        }
+
+        /// Fork-only (udinCraft): an ad hoc signed WordCraft passes the fork build's checks with
+        /// the real codesign; a broken seal or another identifier stops it before the swap.
+        #[test]
+        fn a_udincraft_build_signed_ad_hoc_installs_and_a_tampered_one_does_not() {
+            let wordcraft = SUITE.iter().find(|a| a.id == "wordcraft").unwrap();
+            let make = |dir: &Path, identifier: &str| {
+                let app = dir.join("WordCraft.app");
+                let contents = app.join("Contents");
+                std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+                std::fs::write(
+                    contents.join("Info.plist"),
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>\
+                     <key>CFBundleIdentifier</key><string>ai.storyteller.wordcraft</string>\
+                     <key>CFBundleExecutable</key><string>WordCraft</string>\
+                     <key>CFBundleShortVersionString</key><string>0.18.1</string></dict></plist>",
+                )
+                .unwrap();
+                std::fs::write(contents.join("MacOS/WordCraft"), "0.18.1").unwrap();
+                let ok = std::process::Command::new("codesign")
+                    .args(["--force", "--sign", "-", "--identifier", identifier])
+                    .arg(&app)
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "codesign failed");
+                app
+            };
+            let swap = |app: &Path, dest: &Path| {
+                let found = crate::detect::macos::read_bundle(wordcraft, app).unwrap();
+                super::macos::check_and_swap(wordcraft, app, dest, &found, &Expect::release(wordcraft, &Release::default()), process::run_with_output)
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let (good, tampered, other) = (dir.path().join("good"), dir.path().join("tampered"), dir.path().join("other"));
+            let dest = dir.path().join("Applications/WordCraft.app");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            assert_eq!(Expect::release(wordcraft, &Release::default()).team, None, "no Developer ID team for a udinCraft app");
+            let app = make(&good, "ai.storyteller.wordcraft");
+            swap(&app, &dest).unwrap();
+            assert!(dest.join("Contents/MacOS/WordCraft").exists(), "the checked copy was put in place");
+            let app = make(&tampered, "ai.storyteller.wordcraft");
+            std::fs::write(app.join("Contents/MacOS/WordCraft"), "changed after signing").unwrap();
+            let err = swap(&app, &dir.path().join("Applications/Tampered.app")).unwrap_err();
+            assert!(err.contains("signature integrity"), "{err}");
+            let app = make(&other, "com.example.other");
+            let err = swap(&app, &dir.path().join("Applications/Other.app")).unwrap_err();
+            assert!(err.contains("bundle identity"), "{err}");
         }
 
         #[test]
