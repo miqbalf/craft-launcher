@@ -78,7 +78,21 @@ struct LiveServer {
     generation: u32,
     /// The file ids tickets were asked for, in order.
     asked: Vec<u64>,
+    /// An edit ticket takes the server's own app lock on the file while the room lives, as the
+    /// Craft Office app does; taking and dropping it changes the file's ETag, not its bytes.
+    room_lock: bool,
+    /// The `client` id each ticket request carried.
+    clients: Vec<Option<String>>,
+    /// Other editors (browser tabs) holding edit tickets for the room.
+    others: u32,
+    /// Whether the release route exists (an older server answers 404).
+    release_route: bool,
+    /// The `(room, client)` of each release asked for.
+    released: Vec<(String, String)>,
 }
+
+/// The lock the fake Craft Office app holds on a file while its live room lives.
+const ROOM_LOCK: &str = "opaquelocktoken:craft_office-room";
 
 impl Server {
     fn tag(&mut self) -> String {
@@ -119,7 +133,24 @@ impl Dav {
             base: None,
             generation: 0,
             asked: Vec::new(),
+            room_lock: false,
+            clients: Vec::new(),
+            others: 0,
+            release_route: true,
+            released: Vec::new(),
         });
+    }
+
+    /// The live room's lock goes (its worker closed it): the ETag changes again, the bytes don't.
+    fn end_room(&self, path: &str) {
+        let mut s = self.0.lock().unwrap();
+        if s.locks.get(path).map(String::as_str) == Some(ROOM_LOCK) {
+            s.locks.remove(path);
+            let tag = s.tag();
+            if let Some(f) = s.files.get_mut(path) {
+                f.1 = tag;
+            }
+        }
     }
 
     fn live_server(&self) -> LiveServer {
@@ -245,6 +276,9 @@ impl Http for Dav {
         if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/ticket") {
             return Ok(ticket_answer(&mut s, &req));
         }
+        if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/ticket/release") {
+            return Ok(release_answer(&mut s, &req));
+        }
         if req.url.starts_with(&format!("{SERVER}/apps/craft_office/live/base/")) {
             return Ok(base_answer(&mut s, &req));
         }
@@ -354,6 +388,7 @@ fn ticket_answer(s: &mut Server, req: &Request) -> Response {
     let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
     let file_id = body["fileId"].as_u64().unwrap();
     live.asked.push(file_id);
+    live.clients.push(body["client"].as_str().map(str::to_string));
     if let Some(status) = live.refuse {
         return Response::new(status, Vec::new());
     }
@@ -371,7 +406,49 @@ fn ticket_answer(s: &mut Server, req: &Request) -> Response {
     if let Some((_, sha)) = &live.base {
         data["base"] = serde_json::json!({"url": format!("/apps/craft_office/live/base/{room}?sha256={sha}"), "sha256": sha});
     }
+    let room_lock = live.room_lock && live.permissions == "edit";
     let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": data}});
+    if room_lock && let Some(path) = s.ids.iter().find(|(_, id)| **id == file_id).map(|(p, _)| p.clone()) {
+        if !s.locks.contains_key(&path) {
+            s.locks.insert(path.clone(), ROOM_LOCK.to_string());
+            s.lock_owners.insert(path.clone(), ("Craft Office".to_string(), 1));
+            let tag = s.tag();
+            if let Some(f) = s.files.get_mut(&path) {
+                f.1 = tag;
+            }
+        }
+    }
+    Response::new(200, answer.to_string().into_bytes())
+}
+
+/// The fake release route: a client that holds tickets for the room gives it up. With no other
+/// editor the room ends and its lock goes (a new ETag, the same bytes); otherwise it stays.
+fn release_answer(s: &mut Server, req: &Request) -> Response {
+    let expected = format!("Basic {}", base64(&format!("alice:{PASSWORD}")));
+    let Some(live) = s.live.as_mut().filter(|l| l.release_route) else { return Response::new(404, Vec::new()) };
+    if req.method != Method::Post || req.get_header("authorization") != Some(expected.as_str()) {
+        return Response::new(401, Vec::new());
+    }
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let (room, client) = (body["room"].as_str().unwrap().to_string(), body["client"].as_str().unwrap().to_string());
+    live.released.push((room.clone(), client.clone()));
+    if !live.clients.iter().any(|c| c.as_deref() == Some(client.as_str())) {
+        return Response::new(404, Vec::new());
+    }
+    let state = if live.others > 0 { "live" } else { "ended" };
+    if state == "ended" {
+        let file_id: u64 = room.split(':').nth(1).unwrap().parse().unwrap();
+        if let Some(path) = s.ids.iter().find(|(_, id)| **id == file_id).map(|(p, _)| p.clone())
+            && s.locks.get(&path).map(String::as_str) == Some(ROOM_LOCK)
+        {
+            s.locks.remove(&path);
+            let tag = s.tag();
+            if let Some(f) = s.files.get_mut(&path) {
+                f.1 = tag;
+            }
+        }
+    }
+    let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": {"state": state}}});
     Response::new(200, answer.to_string().into_bytes())
 }
 
@@ -1901,4 +1978,89 @@ fn a_pinned_room_that_falls_back_asks_before_its_first_save() {
     rig.settle();
     assert_eq!(rig.dav.remote(SHEET).unwrap(), b"webdav bytes", "not replaced");
     assert_eq!(rig.status(SHEET), Some(SyncStatus::Conflict));
+}
+
+// DJI F4: the server's own live room lock held the file after a fallback, so the upload waited
+// minutes behind it, and the lock alone changed the ETag into a false conflict.
+
+fn room_locked(dav: Dav) -> Dav {
+    dav.offer_live(RELAY);
+    dav.edit_live(|l| l.room_lock = true);
+    dav
+}
+
+#[test]
+fn a_fallback_gives_the_live_room_up_so_the_first_save_uploads() {
+    let rig = rig(room_locked(Dav::with_file(FILE, b"remote v1")));
+    let app = rig.open_live(FILE);
+    assert_eq!(rig.dav.held_lock(FILE).as_deref(), Some(ROOM_LOCK), "the room holds the file");
+    signal_fallback(&app, r#"{"v":1,"reason":"the relay can't be reached"}"#);
+    rig.service.tick();
+    let live = rig.dav.live_server();
+    let client = live.clients[0].clone().expect("tickets carry the session's id");
+    assert_eq!(live.released, vec![(format!("inst:{}:0", rig.dav.file_id(FILE)), client)], "the room was given up");
+    assert_ne!(rig.dav.held_lock(FILE).as_deref(), Some(ROOM_LOCK));
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"edited locally", "uploaded on the first save");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+}
+
+#[test]
+fn a_renewal_carries_the_same_session_id() {
+    let rig = rig(room_locked(Dav::with_file(FILE, b"remote v1")));
+    rig.open_live(FILE);
+    rig.advance(Duration::from_secs(550));
+    rig.service.tick();
+    let clients = rig.dav.live_server().clients;
+    assert!(clients.len() >= 2 && clients[0].is_some() && clients.iter().all(|c| *c == clients[0]), "{clients:?}");
+}
+
+#[test]
+fn a_fallback_while_others_edit_live_keeps_their_work_and_offers_keep_both() {
+    let rig = rig(room_locked(Dav::with_file(FILE, b"remote v1")));
+    rig.dav.edit_live(|l| l.others = 1);
+    let app = rig.open_live(FILE);
+    signal_fallback(&app, r#"{"v":1,"reason":"the relay can't be reached"}"#);
+    rig.service.tick();
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Others are still editing")), "{:?}", rig.last_detail(FILE));
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"remote v1", "their file isn't replaced");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Conflict), "the user chooses");
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Keep both")), "{:?}", rig.last_detail(FILE));
+    rig.service.resolve(FILE, ConflictChoice::KeepBoth);
+    let files = rig.dav.0.lock().unwrap().files.clone();
+    assert!(files.iter().any(|(p, (b, _))| p != FILE && b == b"edited locally"), "the local version went up beside theirs");
+}
+
+#[test]
+fn without_the_release_route_the_save_waits_for_the_room_honestly_then_uploads_without_a_false_conflict() {
+    let rig = rig(room_locked(Dav::with_file(FILE, b"remote v1")));
+    rig.dav.edit_live(|l| l.release_route = false);
+    let app = rig.open_live(FILE);
+    signal_fallback(&app, r#"{"v":1,"reason":"the relay can't be reached"}"#);
+    rig.service.tick();
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::WaitingToUpload));
+    let detail = rig.last_detail(FILE).unwrap_or_default();
+    assert!(detail.contains("live editing session") && !detail.contains("Someone else"), "{detail}");
+    // The room ends on its own: the lock goes, and with it the ETag changes once more.
+    rig.dav.end_room(FILE);
+    rig.advance(Duration::from_secs(600));
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"edited locally");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved), "an ETag change without a content change is no conflict");
+}
+
+#[test]
+fn a_version_change_that_left_the_bytes_alone_is_no_conflict() {
+    let rig = rig(Dav::with_file(FILE, b"remote v1"));
+    let local = rig.open(FILE);
+    rig.dav.change(FILE, b"remote v1");
+    rig.save(&local, b"mine");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"mine");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
 }

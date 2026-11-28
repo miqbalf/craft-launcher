@@ -24,12 +24,15 @@ use craft_suite_account::TokenStore;
 use serde::{Deserialize, Serialize};
 
 use super::CloudService;
-use super::checkout::{self, Book, Checkout, Runtime, Synced, rt_key};
+use super::checkout::{self, Book, Checkout, LiveRoom, Runtime, Synced, rt_key};
 
 /// The session file format this launcher writes.
 pub const SESSION_VERSION: u32 = 1;
 /// The ticket endpoint of the server's Craft Office app, under the server's base URL.
 pub const TICKET_PATH: &str = "/ocs/v2.php/apps/craft_office/api/v1/ticket";
+/// Where a client gives up a live room it holds tickets for (the server ends the room when no
+/// one else is editing it), under the server's base URL.
+pub const RELEASE_PATH: &str = "/ocs/v2.php/apps/craft_office/api/v1/ticket/release";
 /// Largest ticket answer read: it is a few hundred bytes.
 const MAX_TICKET_ANSWER: usize = 64 * 1024;
 /// Longest ticket accepted. The relay checks it; this only keeps a hostile answer small.
@@ -142,10 +145,15 @@ struct OcsBody {
 }
 
 /// Asks `server` for a ticket to edit `file_id` live, as `login` with the app password
-/// `password` (Basic auth, as every Nextcloud API call from the launcher).
-pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, password: &str, file_id: u64) -> Result<Ticket, TicketError> {
+/// `password` (Basic auth, as every Nextcloud API call from the launcher). `client` is the id this
+/// session gives all its tickets, so it can give the room up later ([`release_room`]).
+pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, password: &str, file_id: u64, client: Option<&str>) -> Result<Ticket, TicketError> {
     let url = format!("{}{TICKET_PATH}", server.trim_end_matches('/'));
-    let body = serde_json::json!({ "fileId": file_id }).to_string();
+    let body = match client {
+        Some(client) => serde_json::json!({ "fileId": file_id, "client": client }),
+        None => serde_json::json!({ "fileId": file_id }),
+    }
+    .to_string();
     let req = Request::new(Method::Post, url)
         .header("authorization", basic(login, password))
         .header("ocs-apirequest", "true")
@@ -203,6 +211,75 @@ pub(super) fn request_ticket<H: Http>(http: &H, server: &str, login: &str, passw
         app: data.app,
         base,
     })
+}
+
+/// What the server did with a live room this launcher gave up ([`release_room`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Release {
+    /// The room ended now: its lock is gone, and the copy can be saved through WebDAV.
+    Ended,
+    /// The room had ended already; nothing holds the file for it.
+    Gone,
+    /// Others are still editing it live: it keeps the file, so their work isn't overwritten.
+    Live,
+    /// No answer this launcher can use (an older server, a refusal, no connection).
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct ReleaseAnswer {
+    ocs: ReleaseBody,
+}
+
+#[derive(Deserialize)]
+struct ReleaseBody {
+    data: ReleaseData,
+}
+
+#[derive(Deserialize)]
+struct ReleaseData {
+    state: String,
+}
+
+/// Tells `server` this launcher's session `client` gives up the live room `room`: its app fell
+/// back to editing a local copy (DJ-brief §2b), so the room's app lock shouldn't keep that copy
+/// from uploading. The server ends the room only when nobody else holds an edit ticket for it.
+pub(super) fn release_room<H: Http>(http: &H, server: &str, login: &str, password: &str, room: &str, client: &str) -> Release {
+    let url = format!("{}{RELEASE_PATH}", server.trim_end_matches('/'));
+    let body = serde_json::json!({ "room": room, "client": client }).to_string();
+    let req = Request::new(Method::Post, url)
+        .header("authorization", basic(login, password))
+        .header("ocs-apirequest", "true")
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .body(body.into_bytes())
+        .max_body(MAX_TICKET_ANSWER);
+    let resp = match http.send(req) {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::info!("couldn't give up a live room ({e})");
+            return Release::Unknown;
+        }
+    };
+    if !(200..300).contains(&resp.status) {
+        // 404 is also a server from before this call existed.
+        log::info!("the server didn't take a live room back (HTTP {})", resp.status);
+        return Release::Unknown;
+    }
+    match serde_json::from_slice::<ReleaseAnswer>(&resp.body).map(|a| a.ocs.data.state) {
+        Ok(state) if state == "ended" => Release::Ended,
+        Ok(state) if state == "gone" => Release::Gone,
+        Ok(state) if state == "live" => Release::Live,
+        _ => Release::Unknown,
+    }
+}
+
+/// A fresh random id for one live session's tickets (32 hex digits). `None` without randomness:
+/// the session then can't give its room up, and waits for the server to end it.
+fn client_id() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(crate::http::hex(&bytes))
 }
 
 /// `url` as an absolute address on `server`: a server-relative path (`/apps/...`, as the server's
@@ -374,6 +451,9 @@ pub(super) struct LiveSession {
     /// Asked for read-only by the user: a renewed edit ticket doesn't change that.
     forced_read_only: bool,
     saver: bool,
+    /// The room of the newest ticket, and the id its tickets carry: given up when the app falls back.
+    room: String,
+    client: Option<String>,
     refresh_at: Instant,
     backoff: Duration,
     /// The last renewal failed (the user was told once).
@@ -464,11 +544,17 @@ impl Book {
 }
 
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
-    /// A ticket for `file_id` as the connected account.
-    fn ticket(&self, file_id: u64) -> Result<Ticket, TicketError> {
+    /// A ticket for `file_id` as the connected account, for the session whose tickets carry `client`.
+    fn ticket(&self, file_id: u64, client: Option<&str>) -> Result<Ticket, TicketError> {
         let Some((server, login, password)) = self.session_credentials() else { return Err(TicketError::Status(401)) };
         let asked_at = (self.wall)();
-        request_ticket(&self.http(), &server, &login, password.expose(), file_id).map(|t| Ticket { asked_at, ..t })
+        request_ticket(&self.http(), &server, &login, password.expose(), file_id, client).map(|t| Ticket { asked_at, ..t })
+    }
+
+    /// Gives up the live room a fallen-back session held ([`release_room`]).
+    pub(super) fn release_live(&self, room: &LiveRoom) -> Release {
+        let Some((server, login, password)) = self.session_credentials() else { return Release::Unknown };
+        release_room(&self.http(), &server, &login, password.expose(), &room.room, &room.client)
     }
 
     /// The server's id of the file at `path`: from the last listings, else from a listing of its
@@ -494,11 +580,12 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         let Some(file_id) = self.file_id_for(dav, path) else {
             return LiveOpen::Unavailable { why: "the server gave no file id".to_string(), tell: None };
         };
+        let client = client_id();
         // 503 is also a room that is busy for a moment: asked once more after a short wait.
-        let ticket = match self.ticket(file_id) {
+        let ticket = match self.ticket(file_id, client.as_deref()) {
             Err(TicketError::Status(503)) => {
                 std::thread::sleep(self.poll_every);
-                self.ticket(file_id)
+                self.ticket(file_id, client.as_deref())
             }
             other => other,
         };
@@ -593,6 +680,8 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             read_only,
             forced_read_only: read_only && !ticket.read_only,
             saver: ticket.saver,
+            room: ticket.room.clone(),
+            client,
             refresh_at: now + refresh_after(ticket.expires_in),
             backoff: Duration::ZERO,
             failing: false,
@@ -641,7 +730,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// the old file and tries again with backoff: the app keeps editing over the connection it
     /// has, and only a reconnect needs the new ticket.
     fn renew(&self, l: &mut LiveSession, now: Instant) {
-        let result = self.ticket(l.file_id).and_then(|t| {
+        let result = self.ticket(l.file_id, l.client.as_deref()).and_then(|t| {
             let read_only = l.forced_read_only || t.read_only;
             write_session(&l.session_file, &l.server, l.file_id, &l.path, &t, read_only)
                 .map_err(|_| TicketError::Malformed("the session file couldn't be written"))
@@ -655,6 +744,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 l.failing = false;
                 l.read_only = read_only;
                 l.saver = ticket.saver;
+                l.room = ticket.room.clone();
                 if changed {
                     let detail = live_detail(app_name(&l.app), read_only, ticket.saver);
                     self.status(&l.path, SyncStatus::Live, Some(detail));
@@ -709,21 +799,24 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     /// Turns a live session whose app fell back to local editing into a check-out of the same
     /// working copy: locked when the server can, watched, uploaded with `If-Match`.
     ///
+    /// First the live room is given up ([`release_room`]): the server holds an app lock on the file
+    /// while the room lives, which would refuse every upload. It ends the room when nobody else is
+    /// editing it live; when others are, the room stays, and so do their edits.
+    ///
     /// The ETag is the server's current one only if the server still holds exactly the bytes
     /// the app was given; otherwise (others changed it live, or a pinned room started from other
     /// bytes) none can match, so the first save meets a 412 and the user picks a version.
     fn live_to_checkout(&self, book: &mut Book, l: LiveSession, dav: &DavAccount, reason: &str) {
         let http = self.http();
         let files = Files::new(dav);
-        let etag = match files.get(&http, &l.path, super::transport::MAX_FILE) {
-            Ok((bytes, etag)) if checkout::digest(&bytes) == l.downloaded => etag,
-            Ok(_) => UNKNOWN_ETAG.to_string(),
-            Err(e) => {
-                log::info!("couldn't read a cloud file's version after a live fallback ({e}); its first save asks first");
-                UNKNOWN_ETAG.to_string()
-            }
+        let room = match (&l.client, l.read_only) {
+            (Some(client), false) => Some(LiveRoom { room: l.room.clone(), client: client.clone() }),
+            _ => None,
         };
-        let lock = if l.read_only {
+        let released = room.as_ref().map(|r| self.release_live(r));
+        let others_live = released == Some(Release::Live);
+        // Locked before the version is read: taking a lock can change the file's ETag.
+        let lock = if l.read_only || others_live {
             None
         } else {
             match files.capabilities(&http) {
@@ -735,6 +828,14 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                     }
                 },
                 _ => None,
+            }
+        };
+        let etag = match files.get(&http, &l.path, super::transport::MAX_FILE) {
+            Ok((bytes, etag)) if checkout::digest(&bytes) == l.downloaded => etag,
+            Ok(_) => UNKNOWN_ETAG.to_string(),
+            Err(e) => {
+                log::info!("couldn't read a cloud file's version after a live fallback ({e}); its first save asks first");
+                UNKNOWN_ETAG.to_string()
             }
         };
         // In step with the server only while the copy is still what the app was given.
@@ -761,11 +862,17 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             tracks_remote: !l.read_only,
             status,
             synced: Some(synced),
+            // Kept while the room may still hold the file, so a refused upload asks again.
+            live_room: room.filter(|_| matches!(released, Some(Release::Live | Release::Unknown))),
         });
         book.runtime.insert(rt_key(&l.account, &l.path), Runtime { lock_checked: Some(self.now()), ..Runtime::default() });
         self.save_book(book);
         let detail = if l.read_only {
             format!("Live editing isn't available ({reason}); this copy is read-only, so changes aren't saved to the cloud.")
+        } else if others_live {
+            format!(
+                "Live editing isn't available ({reason}). Others are still editing this file live, so your saves stay on this computer until they finish; if they're still editing when you save, you choose how to keep your version."
+            )
         } else {
             format!("Live editing isn't available ({reason}); changes upload when you save.")
         };
