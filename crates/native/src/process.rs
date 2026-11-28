@@ -357,6 +357,12 @@ pub fn launch_binary(exe: &Path, args: &[String]) -> Result<(), String> {
 /// sandbox `flatpak-spawn` does not pass the launcher's environment on, so each one becomes an
 /// `--env=` argument instead.
 pub fn launch_binary_with_env(exe: &Path, args: &[String], env: &[(&str, &std::ffi::OsStr)]) -> Result<(), String> {
+    spawn_detached(binary_command(exe, args, env))
+}
+
+/// The command [`launch_binary_with_env`] runs, for a caller that has to follow the process
+/// (a live session ends when its app quits).
+pub fn binary_command<S: AsRef<std::ffi::OsStr>>(exe: &Path, args: &[S], env: &[(&str, &std::ffi::OsStr)]) -> Command {
     let mut cmd = if in_sandbox() {
         let mut c = command("flatpak-spawn");
         c.arg("--host");
@@ -372,7 +378,7 @@ pub fn launch_binary_with_env(exe: &Path, args: &[String], env: &[(&str, &std::f
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
     }
-    spawn_detached(cmd)
+    cmd
 }
 
 /// `--env=NAME=VALUE` for each of `env`, as `flatpak run` and `flatpak-spawn` take them.

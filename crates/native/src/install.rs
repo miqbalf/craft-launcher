@@ -905,6 +905,19 @@ fn remove_appimage(app: &CraftApp, path: &Path, record: Option<&Record>) -> Resu
 
 /// Starts an installed app with `args` (the user's launch flags) on its command line.
 pub fn launch(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[String]) -> Result<(), String> {
+    let path = Path::new(&installed.location);
+    // `open` starts the app through Launch Services, which gives it the user's real home, so
+    // it finds the file at its default path; not every macOS `open` takes an environment.
+    if installed.source == InstallSource::MacApp || (cfg!(target_os = "macos") && path.extension().is_some_and(|e| e == "app")) {
+        return process::open_app(path, args).map_err(|e| format!("Couldn't open {}: {e}", app.name));
+    }
+    let cmd = app_command(app, installed, paths, args)?;
+    process::spawn_detached(cmd).map_err(|e| format!("Couldn't open {}: {e}", app.name))
+}
+
+/// The command that starts an installed app (not a macOS bundle, which `open` starts) with
+/// `args` on its command line: what its Open button runs, and what a cloud or live open runs.
+fn app_command<S: AsRef<std::ffi::OsStr>>(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[S]) -> Result<std::process::Command, String> {
     let _ = paths;
     let path = Path::new(&installed.location);
     // Every app is told where the shared version-choice file is (see `craft_update::pins`), so
@@ -921,11 +934,8 @@ pub fn launch(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[Stri
             cmd.arg(installed.package.clone().unwrap_or_else(|| app.bundle_id()));
             // After the app's id: flags before it would go to `flatpak run` itself.
             cmd.args(args);
-            process::spawn_detached(cmd)
+            Ok(cmd)
         }
-        // `open` starts the app through Launch Services, which gives it the user's real home, so
-        // it finds the file at its default path; not every macOS `open` takes an environment.
-        InstallSource::MacApp => process::open_app(path, args),
         // A tarball the launcher unpacked into its own folder: run it here, against its own
         // home, rather than on the host through `flatpak-spawn` (which is what `launch_binary`
         // would do inside the sandbox). Its settings then land beside it instead of in the
@@ -945,9 +955,8 @@ pub fn launch(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[Stri
             if let Some(dir) = path.parent() {
                 cmd.current_dir(dir);
             }
-            process::spawn_detached(cmd)
+            Ok(cmd)
         }
-        _ if cfg!(target_os = "macos") && path.extension().is_some_and(|e| e == "app") => process::open_app(path, args),
         _ => {
             if !is_resolved_location(path) {
                 if cfg!(windows) && installed.source == InstallSource::Msi && path.components().count() < 2 {
@@ -958,17 +967,26 @@ pub fn launch(app: &CraftApp, installed: &Installed, paths: &Paths, args: &[Stri
                 }
                 return Err(format!("{} isn't where it was installed ({})", app.name, path.display()));
             }
-            process::launch_binary_with_env(path, args, &env)
+            Ok(process::binary_command(path, args, &env))
         }
     }
-    .map_err(|e| format!("Couldn't open {}: {e}", app.name))
 }
 
-/// Opens `file` (a cloud working copy) in an installed app. macOS only in this version: the four
-/// office apps there take an open-document event, whether or not they are already running.
+/// Opens `file` (a cloud working copy) in an installed app. On macOS the four office apps take
+/// an open-document event, whether or not they are already running.
 #[cfg(target_os = "macos")]
-pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(), String> {
+pub fn open_file(app: &CraftApp, installed: &Installed, paths: &Paths, file: &Path) -> Result<(), String> {
+    let _ = paths;
     process::open_with(Path::new(&installed.location), file).map_err(|e| format!("Couldn't open {}: {e}", app.name))
+}
+
+/// Opens `file` (a cloud working copy) in an installed app. On Linux the app starts as its Open
+/// button starts it, with the file as its argument; an app that is already running gets a
+/// second window of its own for it.
+#[cfg(target_os = "linux")]
+pub fn open_file(app: &CraftApp, installed: &Installed, paths: &Paths, file: &Path) -> Result<(), String> {
+    let cmd = app_command(app, installed, paths, &[file.as_os_str()])?;
+    process::spawn_detached(cmd).map_err(|e| format!("Couldn't open {}: {e}", app.name))
 }
 
 /// Opens `file`, a file on this computer, in an installed app. On macOS it goes to the app the
@@ -976,29 +994,45 @@ pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(
 /// so an app that is already running opens it too). Elsewhere the app starts as its Open button
 /// starts it ([`launch`]), with the file as its argument.
 pub fn open_local(app: &CraftApp, installed: &Installed, paths: &Paths, file: &Path) -> Result<(), String> {
-    if cfg!(target_os = "macos") { open_file(app, installed, file) } else { launch(app, installed, paths, &[file.to_string_lossy().into_owned()]) }
+    if cfg!(target_os = "macos") { open_file(app, installed, paths, file) } else { launch(app, installed, paths, &[file.to_string_lossy().into_owned()]) }
 }
 
 /// Starts a new instance of an installed app for a live session: `--live-session <session>`
-/// and the working copy `file`. macOS only in this version, as [`open_file`]. The returned
-/// process ends when the app quits.
+/// and the working copy `file`. The returned process ends when the app quits.
 #[cfg(target_os = "macos")]
-pub fn open_live(app: &CraftApp, installed: &Installed, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+pub fn open_live(app: &CraftApp, installed: &Installed, paths: &Paths, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let _ = paths;
     let child = process::open_live_with(Path::new(&installed.location), session, file).map_err(|e| format!("Couldn't open {}: {e}", app.name))?;
     Ok(Box::new(child))
 }
 
+/// Starts a new instance of an installed app for a live session: the command its Open button
+/// runs, with `--live-session <session>` and the working copy `file`. The returned process is
+/// the app itself (or the `flatpak` / `flatpak-spawn` process that waits for it), so it ends
+/// when the app quits.
+#[cfg(target_os = "linux")]
+pub fn open_live(app: &CraftApp, installed: &Installed, paths: &Paths, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let mut cmd = app_command(app, installed, paths, &[std::ffi::OsStr::new("--live-session"), session.as_os_str(), file.as_os_str()])?;
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Couldn't open {}: couldn't start it ({e})", app.name))?;
+    Ok(Box::new(child))
+}
+
 /// Starts an app for a live session: not on this system yet.
-#[cfg(not(target_os = "macos"))]
-pub fn open_live(app: &CraftApp, installed: &Installed, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
-    let _ = (app, installed, session, file);
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn open_live(app: &CraftApp, installed: &Installed, paths: &Paths, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let _ = (app, installed, paths, session, file);
     Err("Live editing isn't supported on this system yet".to_string())
 }
 
 /// Opens `file` (a cloud working copy) in an installed app: not on this system yet.
-#[cfg(not(target_os = "macos"))]
-pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(), String> {
-    let _ = (app, installed, file);
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn open_file(app: &CraftApp, installed: &Installed, paths: &Paths, file: &Path) -> Result<(), String> {
+    let _ = (app, installed, paths, file);
     Err("Opening from the cloud isn't supported on this system yet".to_string())
 }
 
@@ -3426,6 +3460,80 @@ mod tests {
         assert!(!bin.exists() && !root.join("share").exists());
         assert!(home.join(".config/wordcraft/settings.toml").is_file(), "the app's settings were removed with it");
         assert!(linux::remove_tree(app, &paths).is_err(), "a second removal says there is nothing there");
+    }
+
+    /// DV1: on Linux a cloud file opened live starts its own instance of the app with the
+    /// session, and the launcher follows that instance until it quits; a check-out gets the
+    /// file alone. Both run the app as its Open button does (here: against the app's own home).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cloud_file_opens_in_the_app_on_linux_live_or_checked_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let app = CraftApp::by_id("gridcraft").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let bin = paths.apps().join("gridcraft/bin/gridcraft");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        // Writes its arguments and its HOME, then runs until the test lets it quit.
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nn=$(date +%s%N)\nprintf '%s\\n' \"$HOME\" \"$@\" > {o}/$n.tmp && mv {o}/$n.tmp {o}/$n.args\nwhile [ ! -e {o}/quit ]; do sleep 0.05; done\n",
+                o = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = Installed {
+            version: None,
+            source: InstallSource::Launcher,
+            location: bin.display().to_string(),
+            package: None,
+            externally_managed: false,
+            origin: None,
+            installation: None,
+        };
+        let seen = || -> Vec<Vec<String>> {
+            let mut files: Vec<_> = std::fs::read_dir(&out)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "args"))
+                .collect();
+            files.sort();
+            files.iter().map(|p| std::fs::read_to_string(p).unwrap().lines().map(str::to_string).collect()).collect()
+        };
+        let wait_for = |n: usize| {
+            let start = std::time::Instant::now();
+            while seen().len() < n && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            seen()
+        };
+
+        let session = dir.path().join("live/s1.json");
+        let copy = dir.path().join("live/s1/Budget.xlsx");
+        let mut live = open_live(app, &installed, &paths, &session, &copy).expect("a live open starts the app on Linux");
+        let runs = wait_for(1);
+        assert_eq!(runs.len(), 1, "the app wasn't started");
+        let home = std::path::PathBuf::from(&runs[0][0]);
+        assert!(home.starts_with(paths.apps().join("gridcraft")), "a launcher-installed app keeps its own home: {home:?}");
+        assert_eq!(runs[0][1..], [String::from("--live-session"), session.display().to_string(), copy.display().to_string()]);
+        assert!(!live.exited(), "the session ended while the app was still running");
+
+        open_file(app, &installed, &paths, &copy).expect("a check-out opens the app on Linux");
+        let runs = wait_for(2);
+        assert_eq!(runs.len(), 2, "the checked-out copy wasn't opened");
+        assert_eq!(runs[1][1..], [copy.display().to_string()], "a check-out passes the file alone, without a session");
+
+        std::fs::write(out.join("quit"), "").unwrap();
+        let start = std::time::Instant::now();
+        while !live.exited() && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(live.exited(), "the launcher didn't see the app quit, so the live session would never end");
     }
 
     #[cfg(target_os = "linux")]

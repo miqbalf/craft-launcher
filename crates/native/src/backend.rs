@@ -253,20 +253,22 @@ pub struct NativeBackend {
 
 type Cloud = CloudService<craft_suite_account::Keychain, Transport>;
 
-/// Whether a cloud file can be opened in its app on this system (`install::open_file`).
-const CLOUD_OPENS_HERE: bool = cfg!(target_os = "macos");
+/// Whether a cloud file can be opened in its app on this system (`install::open_file` and
+/// `install::open_live`).
+const CLOUD_OPENS_HERE: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 
 /// Opens a cloud working copy in the installed catalog app `app`.
-fn open_in_app(shared: &Shared, app: &str, file: &std::path::Path) -> Result<(), String> {
+fn open_in_app(shared: &Shared, paths: &Paths, app: &str, file: &std::path::Path) -> Result<(), String> {
     let def = CraftApp::by_id(app).ok_or_else(|| "Opening from the cloud isn't supported for this app yet.".to_string())?;
     let installed = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app).cloned();
     let installed = installed.ok_or_else(|| format!("{} isn't installed. Install it from the Apps page, then open the file again.", def.name))?;
-    install::open_file(def, &installed, file)
+    install::open_file(def, &installed, paths, file)
 }
 
 /// Starts the installed catalog app `app` for a live session of the cloud file `file`.
 fn open_live_in_app(
     shared: &Shared,
+    paths: &Paths,
     app: &str,
     session: &std::path::Path,
     file: &std::path::Path,
@@ -274,7 +276,7 @@ fn open_live_in_app(
     let def = CraftApp::by_id(app).ok_or_else(|| "Live editing isn't supported for this app yet.".to_string())?;
     let installed = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app).cloned();
     let installed = installed.ok_or_else(|| format!("{} isn't installed. Install it from the Apps page, then open the file again.", def.name))?;
-    install::open_live(def, &installed, session, file)
+    install::open_live(def, &installed, paths, session, file)
 }
 
 /// Runs a job's worker (see [`NativeBackend::spawn`]).
@@ -333,10 +335,11 @@ impl NativeBackend {
         });
         let cloud = http.as_ref().map(|h| {
             let (sink, apps, live_apps) = (shared.clone(), shared.clone(), shared.clone());
+            let (app_paths, live_paths) = (paths.clone(), paths.clone());
             Arc::new(
                 CloudService::new(&paths, craft_suite_account::Keychain, Transport::new(h), move |event| sink.emit(event))
-                    .with_launcher(move |app, file| open_in_app(&apps, app, file))
-                    .with_live_launcher(move |app, session, file| open_live_in_app(&live_apps, app, session, file)),
+                    .with_launcher(move |app, file| open_in_app(&apps, &app_paths, app, file))
+                    .with_live_launcher(move |app, session, file| open_live_in_app(&live_apps, &live_paths, app, session, file)),
             )
         });
         if let Some(cloud) = &cloud {
