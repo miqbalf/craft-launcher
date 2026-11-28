@@ -954,6 +954,22 @@ pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(
     process::open_with(Path::new(&installed.location), file).map_err(|e| format!("Couldn't open {}: {e}", app.name))
 }
 
+/// Starts a new instance of an installed app for a live session: `--live-session <session>`
+/// and the working copy `file`. macOS only in this version, as [`open_file`]. The returned
+/// process ends when the app quits.
+#[cfg(target_os = "macos")]
+pub fn open_live(app: &CraftApp, installed: &Installed, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let child = process::open_live_with(Path::new(&installed.location), session, file).map_err(|e| format!("Couldn't open {}: {e}", app.name))?;
+    Ok(Box::new(child))
+}
+
+/// Starts an app for a live session: not on this system yet.
+#[cfg(not(target_os = "macos"))]
+pub fn open_live(app: &CraftApp, installed: &Installed, session: &Path, file: &Path) -> Result<Box<dyn crate::cloud::LiveProcess>, String> {
+    let _ = (app, installed, session, file);
+    Err("Live editing isn't supported on this system yet".to_string())
+}
+
 /// Opens `file` (a cloud working copy) in an installed app: not on this system yet.
 #[cfg(not(target_os = "macos"))]
 pub fn open_file(app: &CraftApp, installed: &Installed, file: &Path) -> Result<(), String> {

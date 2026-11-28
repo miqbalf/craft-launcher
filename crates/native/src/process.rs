@@ -409,6 +409,17 @@ pub fn open_with(bundle: &Path, file: &Path) -> Result<(), String> {
     spawn_detached(cmd)
 }
 
+/// macOS: starts a new instance of the app at `bundle` with `--live-session <session> <file>`
+/// (`open -n -W -a … --args …`), and returns the `open` process, which ends when that instance
+/// quits. A new instance, because an app that is already running would get only an
+/// open-document event and never see the session argument.
+#[cfg(target_os = "macos")]
+pub fn open_live_with(bundle: &Path, session: &Path, file: &Path) -> Result<std::process::Child, String> {
+    let mut cmd = command("open");
+    cmd.arg("-n").arg("-W").arg("-a").arg(bundle).arg("--args").arg("--live-session").arg(session).arg(file);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| format!("couldn't start it ({e})"))
+}
+
 /// The system's default opener for `target`: `explorer` on Windows, `open` on macOS, and
 /// `xdg-open` elsewhere (on the host, through `flatpak-spawn --host`, inside the sandbox).
 fn opener(target: &std::ffi::OsStr) -> Result<Command, String> {

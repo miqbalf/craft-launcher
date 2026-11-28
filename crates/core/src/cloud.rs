@@ -15,6 +15,15 @@ pub const SIGN_IN_EXPIRED: &str = "Your cloud sign-in is no longer valid. Reconn
 /// Catalog ids of the office apps a cloud file can open in.
 pub const CLOUD_APPS: [&str; 4] = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft"];
 
+/// Catalog ids of the apps that can join a live editing session (`--live-session`): their cloud
+/// files open live when the server offers it, and through the check-out otherwise.
+pub const LIVE_APPS: [&str; 3] = ["wordcraft", "gridcraft", "deckcraft"];
+
+/// What the launcher tells the user when a live-capable file opens through the check-out instead,
+/// because the server offers no live session for it (no Craft Office app, no access, or its relay
+/// is out of reach).
+pub const LIVE_UNAVAILABLE: &str = "Live editing isn't available on this server; changes upload when you save.";
+
 /// Extensions (lowercase) per app, in the order of [`CLOUD_APPS`].
 const EXTENSIONS: [&[&str]; 4] =
     [&["docx", "doc", "dotx", "odt", "rtf", "txt", "md"], &["xlsx", "xls", "ods", "csv"], &["pptx", "ppt", "odp"], &["pdf"]];
@@ -99,6 +108,10 @@ pub struct CloudEntry {
     /// The user may change it. A read-only share still lists, but opens read-only.
     #[serde(default = "yes")]
     pub writable: bool,
+    /// The server's file id, which a live session is asked for by. `None` when the listing
+    /// didn't give one.
+    #[serde(default)]
+    pub file_id: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -116,6 +129,9 @@ pub enum SyncStatus {
     Conflict,
     ReadOnly,
     CloseInAppFirst,
+    /// Open in its app for live editing: the server saves every change, so the launcher holds no
+    /// lock and uploads nothing. Ends when the app quits.
+    Live,
 }
 
 /// How the user settles a file changed both here and in the cloud.

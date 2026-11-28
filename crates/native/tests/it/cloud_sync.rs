@@ -3,12 +3,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::cloud::{ConflictChoice, SyncStatus};
 use artcraft_launcher_core::protocol::Event;
-use artcraft_launcher_native::cloud::CloudService;
+use artcraft_launcher_native::cloud::{CloudService, LiveProcess};
 use artcraft_launcher_native::paths::Paths;
 use craft_nextcloud::http::{Http, Method, Request, Response};
 use craft_suite_account::{Memory, Secret, TokenStore, accounts};
@@ -16,6 +17,9 @@ use craft_suite_account::{Memory, Secret, TokenStore, accounts};
 const SERVER: &str = "http://127.0.0.1:8080";
 const PASSWORD: &str = "app-pass-w0rd-NEVER-ON-DISK";
 const FILE: &str = "/Docs/report.docx";
+/// The ticket the fake server issues, numbered: it must never reach an event.
+const TICKET_SECRET: &str = "tkt-SECRET-never-logged";
+const RELAY: &str = "wss://relay.example.test/live";
 const FILES_ROOT: &str = "http://127.0.0.1:8080/remote.php/dav/files/alice";
 
 /// One request as the fake saw it.
@@ -47,6 +51,33 @@ struct Server {
     read_only: Vec<String>,
     /// The lock timeout the server grants (`Timeout: Second-N`); none is sent when unset.
     grant: Option<u32>,
+    /// The server's file id of each path (`oc:fileid`), given when the file is first written.
+    ids: HashMap<String, u64>,
+    /// The Craft Office ticket endpoint: `None` answers 404 (no such app on the server).
+    live: Option<LiveServer>,
+    /// How many times the starting-copy route was asked.
+    base_fetches: u32,
+}
+
+/// What the fake Craft Office app answers on its ticket endpoint.
+#[derive(Clone)]
+struct LiveServer {
+    relay: String,
+    /// `"edit"` or `"read"`.
+    permissions: String,
+    expires_in: u64,
+    /// Answer with this status instead of a ticket.
+    refuse: Option<u16>,
+    /// Answer this many requests with 503 first (a busy room, or one with no base yet).
+    busy: u32,
+    /// The app the room is for, as the ticket says it.
+    app: String,
+    /// A pinned room's starting bytes, and the checksum the ticket claims for them.
+    base: Option<(Vec<u8>, String)>,
+    /// Bumped to make the server start a new room for the file.
+    generation: u32,
+    /// The file ids tickets were asked for, in order.
+    asked: Vec<u64>,
 }
 
 impl Server {
@@ -72,6 +103,35 @@ impl Dav {
         let mut s = self.0.lock().unwrap();
         let tag = s.tag();
         s.files.insert(path.to_string(), (bytes.to_vec(), tag));
+        let id = 1000 + s.ids.len() as u64;
+        s.ids.entry(path.to_string()).or_insert(id);
+    }
+
+    /// The server has the Craft Office app, with its relay at `relay`.
+    fn offer_live(&self, relay: &str) {
+        self.0.lock().unwrap().live = Some(LiveServer {
+            relay: relay.to_string(),
+            permissions: "edit".to_string(),
+            expires_in: 600,
+            refuse: None,
+            busy: 0,
+            app: "wordcraft".to_string(),
+            base: None,
+            generation: 0,
+            asked: Vec::new(),
+        });
+    }
+
+    fn live_server(&self) -> LiveServer {
+        self.0.lock().unwrap().live.clone().unwrap()
+    }
+
+    fn edit_live(&self, f: impl FnOnce(&mut LiveServer)) {
+        f(self.0.lock().unwrap().live.as_mut().unwrap());
+    }
+
+    fn file_id(&self, path: &str) -> u64 {
+        self.0.lock().unwrap().ids[path]
     }
 
     fn lock_by_other(&self, path: &str) {
@@ -182,6 +242,12 @@ impl Http for Dav {
             let body = format!(r#"{{"server":"{SERVER}","loginName":"{login}","appPassword":"another-app-password"}}"#);
             return Ok(Response::new(200, body.into_bytes()));
         }
+        if req.url == format!("{SERVER}/ocs/v2.php/apps/craft_office/api/v1/ticket") {
+            return Ok(ticket_answer(&mut s, &req));
+        }
+        if req.url.starts_with(&format!("{SERVER}/apps/craft_office/live/base/")) {
+            return Ok(base_answer(&mut s, &req));
+        }
         if req.url.contains("/ocs/v1.php/cloud/capabilities") {
             return Ok(Response::new(200, br#"{"ocs":{"data":{"capabilities":{"files":{"locking":"1.0"}}}}}"#.to_vec()));
         }
@@ -266,6 +332,7 @@ impl Http for Dav {
                         _ => String::new(),
                     };
                     let lock = if s.read_only.contains(file) { format!("{lock}<oc:permissions>RG</oc:permissions>") } else { lock };
+                    let lock = format!("{lock}<oc:fileid>{}</oc:fileid>", s.ids.get(file).copied().unwrap_or_default());
                     xml.push_str(&format!("<d:response><d:href>/remote.php/dav/files/alice{file}</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>9</d:getcontentlength>{lock}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
                 }
                 xml.push_str("</d:multistatus>");
@@ -273,6 +340,85 @@ impl Http for Dav {
             }
             _ => Ok(Response::new(405, Vec::new())),
         }
+    }
+}
+
+/// The fake ticket endpoint: Basic auth with the account's app password, a JSON body naming the
+/// file, and an OCS answer shaped as the Craft Office app's.
+fn ticket_answer(s: &mut Server, req: &Request) -> Response {
+    let Some(live) = s.live.as_mut() else { return Response::new(404, Vec::new()) };
+    let expected = format!("Basic {}", base64(&format!("alice:{PASSWORD}")));
+    if req.method != Method::Post || req.get_header("authorization") != Some(expected.as_str()) || req.get_header("ocs-apirequest") != Some("true") {
+        return Response::new(401, Vec::new());
+    }
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let file_id = body["fileId"].as_u64().unwrap();
+    live.asked.push(file_id);
+    if let Some(status) = live.refuse {
+        return Response::new(status, Vec::new());
+    }
+    if live.busy > 0 {
+        live.busy -= 1;
+        return Response::new(503, Vec::new());
+    }
+    let n = live.asked.len();
+    let room = format!("inst:{file_id}:{}", live.generation);
+    let mut data = serde_json::json!({
+        "ticket": format!("{TICKET_SECRET}-{n}"), "relayUrl": live.relay, "room": room,
+        "permissions": live.permissions, "displayName": "Alice A.", "expiresIn": live.expires_in, "saver": true,
+        "app": live.app,
+    });
+    if let Some((_, sha)) = &live.base {
+        data["base"] = serde_json::json!({"url": format!("/apps/craft_office/live/base/{room}?sha256={sha}"), "sha256": sha});
+    }
+    let answer = serde_json::json!({"ocs": {"meta": {"status": "ok"}, "data": data}});
+    Response::new(200, answer.to_string().into_bytes())
+}
+
+/// The fake starting-copy route: Basic auth, 404 for every failure, the checksum in a header.
+fn base_answer(s: &mut Server, req: &Request) -> Response {
+    let expected = format!("Basic {}", base64(&format!("alice:{PASSWORD}")));
+    s.base_fetches += 1;
+    match s.live.as_ref().and_then(|l| l.base.clone()) {
+        Some((bytes, _)) if req.method == Method::Get && req.get_header("authorization") == Some(expected.as_str()) => {
+            let sha = sha256_hex(&bytes);
+            Response::new(200, bytes).header("x-craft-base-sha256", sha)
+        }
+        _ => Response::new(404, Vec::new()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn base64(text: &str) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in text.as_bytes().chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// A live session app the tests start: what it was given, and a switch that quits it.
+#[derive(Clone)]
+struct LiveApp {
+    app: String,
+    session: PathBuf,
+    file: PathBuf,
+    quit: Arc<AtomicBool>,
+}
+
+struct FakeProcess(Arc<AtomicBool>);
+
+impl LiveProcess for FakeProcess {
+    fn exited(&mut self) -> bool {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -288,6 +434,9 @@ struct Hooks {
     launch: LaunchHook,
     pause: PauseHook,
     revealed: Arc<Mutex<Vec<PathBuf>>>,
+    live: Arc<Mutex<Vec<LiveApp>>>,
+    /// Whether the relay answers (default: it does).
+    relay_down: Arc<AtomicBool>,
 }
 
 struct Rig {
@@ -319,6 +468,7 @@ fn build(
 ) -> CloudService<Memory, Dav> {
     let (sink, seen, now) = (events.clone(), launched.clone(), clock.clone());
     let (launch, pause, revealed) = (hooks.launch.clone(), hooks.pause.clone(), hooks.revealed.clone());
+    let (live, relay_down) = (hooks.live.clone(), hooks.relay_down.clone());
     CloudService::new(paths, keychain.clone(), dav.clone(), move |e| sink.lock().unwrap().push(e))
         .with_launcher(move |app: &str, file: &Path| {
             let hook = launch.lock().unwrap().clone();
@@ -334,6 +484,12 @@ fn build(
                 hook();
             }
         })
+        .with_live_launcher(move |app: &str, session: &Path, file: &Path| {
+            let quit = Arc::new(AtomicBool::new(false));
+            live.lock().unwrap().push(LiveApp { app: app.to_string(), session: session.to_path_buf(), file: file.to_path_buf(), quit: quit.clone() });
+            Ok(Box::new(FakeProcess(quit)) as Box<dyn LiveProcess>)
+        })
+        .with_relay_probe(move |url: &str| !relay_down.load(Ordering::SeqCst) && (url.starts_with("wss://") || url.starts_with("ws://")))
         .with_revealer(move |dir: &Path| {
             revealed.lock().unwrap().push(dir.to_path_buf());
             Ok(())
@@ -1337,4 +1493,412 @@ fn show_kept_files_reveals_the_kept_folder() {
     let revealed = rig.hooks.revealed.lock().unwrap().clone();
     let kept = kept_with(&rig, b"kept edit");
     assert!(revealed.len() == 1 && kept[0].starts_with(&revealed[0]), "{revealed:?} {kept:?}");
+}
+
+// Live editing (`--live-session`): the launcher asks the server for a ticket, hands it to the app
+// in a session file and keeps it fresh; the server saves, so nothing is locked or uploaded.
+
+impl Rig {
+    fn live_apps(&self) -> Vec<LiveApp> {
+        self.hooks.live.lock().unwrap().clone()
+    }
+
+    /// Opens `path` and returns the live app it started.
+    fn open_live(&self, path: &str) -> LiveApp {
+        self.service.open(path, None, false);
+        self.live_apps().last().cloned().unwrap_or_else(|| panic!("nothing started live: {:?}", self.events()))
+    }
+
+    fn last_detail(&self, path: &str) -> Option<String> {
+        last_status(self, path).and_then(|(_, d, _)| d)
+    }
+}
+
+fn session_json(app: &LiveApp) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(&app.session).unwrap()).unwrap()
+}
+
+#[test]
+fn a_live_file_opens_with_a_session_file_and_no_lock() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    assert_eq!(app.app, "wordcraft");
+    assert!(rig.launched.lock().unwrap().is_empty(), "the check-out launcher isn't used");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live));
+    assert!(rig.dav.held_lock(FILE).is_none(), "a live file is never locked");
+    assert!(!rig.dav.seen().iter().any(|s| s.method == Method::Lock));
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"remote v1", "the app gets the file as its first content");
+    assert_eq!(app.file.file_name(), Path::new(FILE).file_name(), "under its real name");
+    assert!(app.session.starts_with(&rig.paths.data) && app.file.starts_with(&rig.paths.data));
+    assert!(!app.file.starts_with(rig.paths.cloud_root()), "outside the check-out cache, so Disconnect's sweep never sees it");
+
+    let json = session_json(&app);
+    assert_eq!(json["v"], 1);
+    assert_eq!(json["server"], SERVER);
+    assert_eq!(json["fileId"], rig.dav.file_id(FILE));
+    assert_eq!(json["path"], FILE);
+    assert_eq!(json["relayUrl"], RELAY);
+    assert!(json["ticket"].as_str().unwrap().starts_with(TICKET_SECRET));
+    assert!(json["room"].as_str().is_some_and(|r| !r.is_empty()));
+    assert_eq!(json["readOnly"], false);
+    assert_eq!(json["displayName"], "Alice A.");
+    let expires: jiff::Timestamp = json["expiresAt"].as_str().unwrap().parse().unwrap();
+    assert!(expires > wall(), "expires after it was issued");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&app.session).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "only this user may read the ticket");
+    }
+
+    // The app saving its working copy is not uploaded: the relay and the server save.
+    rig.save(&app.file, b"local edit");
+    rig.settle();
+    assert!(rig.dav.puts().is_empty(), "{:?}", rig.dav.puts());
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"remote v1");
+
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(TICKET_SECRET) && !shown.contains(PASSWORD), "no secret in an event");
+}
+
+#[test]
+fn the_ticket_is_renewed_in_the_same_file_before_it_runs_out() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    let first = session_json(&app)["ticket"].clone();
+    rig.settle();
+    assert_eq!(session_json(&app)["ticket"], first, "not renewed while it is young");
+    rig.advance(Duration::from_secs(300));
+    rig.service.tick();
+    assert_eq!(session_json(&app)["ticket"], first, "not renewed at half its life either");
+    rig.advance(Duration::from_secs(250));
+    rig.service.tick();
+    let renewed = session_json(&app);
+    assert_ne!(renewed["ticket"], first, "renewed before the 600 s ticket ran out");
+    assert_eq!(renewed["fileId"], rig.dav.file_id(FILE));
+    assert!(rig.dav.live_server().asked.iter().all(|id| *id == rig.dav.file_id(FILE)));
+
+    // A failed renewal keeps the old ticket, tells the user once, and tries again later.
+    rig.dav.edit_live(|l| l.refuse = Some(503));
+    rig.advance(Duration::from_secs(550));
+    rig.service.tick();
+    rig.service.tick();
+    assert_eq!(session_json(&app)["ticket"], renewed["ticket"], "the file is left as it was");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live), "still live");
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Couldn't renew")));
+    let asked = rig.dav.live_server().asked.len();
+    rig.dav.edit_live(|l| l.refuse = None);
+    rig.advance(Duration::from_secs(150));
+    rig.service.tick();
+    assert!(rig.dav.live_server().asked.len() > asked);
+    assert_ne!(session_json(&app)["ticket"], renewed["ticket"], "renewed once the server answers again");
+    assert!(rig.last_detail(FILE).is_some_and(|d| !d.contains("Couldn't renew")), "the warning is cleared");
+}
+
+#[test]
+fn the_session_ends_when_the_app_quits() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.service.disconnect();
+    assert!(!disconnected(&rig), "a live file is still open");
+    rig.service.done(FILE);
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live), "Done doesn't end a live session; closing the app does");
+    assert!(app.session.exists());
+
+    app.quit.store(true, Ordering::SeqCst);
+    rig.service.tick();
+    assert!(!app.session.exists(), "the session file (and its ticket) goes when the app quits");
+    assert!(!app.file.exists(), "an untouched working copy goes too");
+    assert!(last_closed(&rig, FILE).is_some(), "the row closes: {:?}", rig.events());
+    rig.service.disconnect();
+    assert!(disconnected(&rig));
+}
+
+#[test]
+fn a_copy_the_app_saved_locally_is_kept_when_the_session_ends() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.save(&app.file, b"saved while offline");
+    app.quit.store(true, Ordering::SeqCst);
+    rig.service.tick();
+    assert!(!app.session.exists());
+    assert_eq!(kept_with(&rig, b"saved while offline").len(), 1, "never deleted");
+}
+
+#[test]
+fn opening_a_live_file_again_starts_no_second_session() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    rig.open_live(FILE);
+    rig.service.open(FILE, None, false);
+    assert_eq!(rig.live_apps().len(), 1);
+    assert_eq!(rig.dav.live_server().asked.len(), 1);
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live));
+}
+
+#[test]
+fn a_relay_given_as_a_path_on_the_server_reaches_the_app_as_a_full_address() {
+    // workspace.treeo.id answers `relayUrl: "/craft"` (DJ-brief §5).
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live("/craft");
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    let relay = session_json(&app)["relayUrl"].as_str().unwrap().to_string();
+    assert!(relay.starts_with("ws://127.0.0.1:8080") && relay.ends_with("/craft"), "{relay}");
+}
+
+#[test]
+fn a_busy_room_is_asked_for_once_more() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    dav.edit_live(|l| l.busy = 1);
+    let rig = rig(dav);
+    rig.open_live(FILE);
+    assert_eq!(rig.dav.live_server().asked.len(), 2);
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Live));
+}
+
+#[test]
+fn a_refused_sign_in_asks_to_reconnect_instead_of_falling_back() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    dav.edit_live(|l| l.refuse = Some(401));
+    let rig = rig(dav);
+    rig.service.open(FILE, None, false);
+    assert!(rig.live_apps().is_empty() && rig.launched.lock().unwrap().is_empty(), "nothing opened");
+    assert!(rig.dav.held_lock(FILE).is_none(), "and nothing locked");
+    assert!(rig.events().iter().any(|e| matches!(e, Event::CloudError(m) if m.contains("Reconnect"))), "{:?}", rig.events());
+}
+
+#[test]
+fn a_read_only_ticket_opens_live_read_only() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    dav.edit_live(|l| l.permissions = "read".to_string());
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    assert_eq!(session_json(&app)["readOnly"], true);
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("read-only")));
+}
+
+#[test]
+fn without_live_editing_the_check_out_runs_and_says_so() {
+    // No Craft Office app (404), no access (403), no relay (503), or a relay out of reach.
+    for case in ["no app", "403", "503", "relay down", "not wss"] {
+        let dav = Dav::with_file(FILE, b"remote v1");
+        match case {
+            "no app" => {}
+            "403" => {
+                dav.offer_live(RELAY);
+                dav.edit_live(|l| l.refuse = Some(403));
+            }
+            "503" => {
+                dav.offer_live(RELAY);
+                dav.edit_live(|l| l.refuse = Some(503));
+            }
+            _ => dav.offer_live(if case == "not wss" { "http://relay.example.test" } else { RELAY }),
+        }
+        let rig = rig(dav);
+        rig.hooks.relay_down.store(case == "relay down", Ordering::SeqCst);
+        let local = rig.open(FILE);
+        assert!(rig.live_apps().is_empty(), "{case}: nothing started live");
+        assert!(rig.dav.held_lock(FILE).is_some(), "{case}: the check-out locks as before");
+        assert_eq!(rig.status(FILE), Some(SyncStatus::Saved), "{case}");
+        assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Live editing isn't available")), "{case}: {:?}", rig.last_detail(FILE));
+        assert!(std::fs::read_dir(rig.paths.live_root()).map_or(true, |d| d.count() == 0), "{case}: no session left behind");
+        rig.save(&local, b"local edit");
+        rig.settle();
+        assert_eq!(rig.dav.remote(FILE).unwrap(), b"local edit", "{case}: and saves upload");
+    }
+}
+
+#[test]
+fn a_file_no_live_app_opens_never_asks_for_a_ticket() {
+    let pdf = "/Docs/contract.pdf";
+    let dav = Dav::with_file(pdf, b"%PDF-1.7");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    rig.open(pdf);
+    assert!(rig.dav.live_server().asked.is_empty());
+    assert!(rig.last_detail(pdf).is_none_or(|d| !d.contains("Live editing")), "PdfCraft has no live editing to miss");
+}
+
+#[test]
+fn a_restart_clears_the_tickets_of_sessions_it_can_no_longer_follow() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let mut rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.save(&app.file, b"saved while offline");
+    rig.rebuild();
+    rig.service.start();
+    assert!(!app.session.exists(), "no ticket stays on disk");
+    assert_eq!(kept_with(&rig, b"saved while offline").len(), 1, "the copy is kept, not deleted");
+}
+
+// Pinned rooms (GridCraft, DeckCraft): every peer starts from the room's exact bytes.
+
+const SHEET: &str = "/Docs/budget.xlsx";
+
+/// A server offering a GridCraft room for `SHEET` whose starting copy is `base` (the ticket claims
+/// `claim` as its checksum, the real one when `None`).
+fn pinned(base: &[u8], claim: Option<&str>) -> Dav {
+    let dav = Dav::with_file(SHEET, b"webdav bytes");
+    dav.offer_live(RELAY);
+    let sha = claim.map_or_else(|| sha256_hex(base), str::to_string);
+    dav.edit_live(|l| {
+        l.app = "gridcraft".to_string();
+        l.base = Some((base.to_vec(), sha));
+    });
+    dav
+}
+
+#[test]
+fn a_pinned_room_gives_the_app_its_starting_copy_and_says_where_it_came_from() {
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    assert_eq!(app.app, "gridcraft");
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"room base bytes", "the room's bytes, not the WebDAV file's");
+    let json = session_json(&app);
+    assert_eq!(json["app"], "gridcraft");
+    assert_eq!(json["saver"], true);
+    assert_eq!(json["base"]["sha256"], sha256_hex(b"room base bytes"));
+    let url = json["base"]["url"].as_str().unwrap();
+    assert!(url.starts_with(SERVER) && url.contains("/apps/craft_office/live/base/"), "absolute, on the server: {url}");
+    let shown = format!("{:?}", rig.events());
+    assert!(!shown.contains(TICKET_SECRET) && !shown.contains(PASSWORD), "no secret in an event");
+}
+
+#[test]
+fn a_starting_copy_that_doesnt_match_its_checksum_falls_back_and_says_why() {
+    let rig = rig(pinned(b"room base bytes", Some(&sha256_hex(b"something else"))));
+    let local = rig.open(SHEET);
+    assert!(rig.live_apps().is_empty(), "nothing started live");
+    assert_eq!(std::fs::read(&local).unwrap(), b"webdav bytes", "the check-out's copy");
+    assert!(rig.dav.held_lock(SHEET).is_some(), "the check-out locks as before");
+    let detail = rig.last_detail(SHEET).unwrap_or_default();
+    assert!(detail.contains("Live editing isn't available") && detail.contains("checksum"), "{detail}");
+    assert!(std::fs::read_dir(rig.paths.live_root()).map_or(true, |d| d.count() == 0), "no session left behind");
+}
+
+#[test]
+fn a_room_without_a_starting_copy_is_asked_once_more_then_falls_back() {
+    // The server answers 503 while a pinned room has no base yet.
+    let dav = pinned(b"room base bytes", None);
+    dav.edit_live(|l| l.busy = 1);
+    let first = rig(dav);
+    let app = first.open_live(SHEET);
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"room base bytes", "the second answer had it");
+
+    let dav = pinned(b"room base bytes", None);
+    dav.edit_live(|l| l.busy = 2);
+    let second = rig(dav);
+    second.open(SHEET);
+    assert!(second.live_apps().is_empty());
+    assert_eq!(second.dav.live_server().asked.len(), 2, "asked twice, not more");
+    assert!(second.last_detail(SHEET).is_some_and(|d| d.contains("Live editing isn't available")));
+}
+
+#[test]
+fn a_wordcraft_room_has_no_starting_copy_and_uses_the_cloud_file() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    assert_eq!(std::fs::read(&app.file).unwrap(), b"remote v1");
+    let json = session_json(&app);
+    assert!(json.get("base").is_none(), "{json}");
+    assert_eq!(json["app"], "wordcraft");
+    assert_eq!(rig.dav.0.lock().unwrap().base_fetches, 0);
+}
+
+#[test]
+fn a_renewal_that_brings_a_new_room_rewrites_room_and_starting_copy() {
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    let before = session_json(&app);
+    rig.dav.edit_live(|l| {
+        l.generation += 1;
+        l.base = Some((b"new base".to_vec(), sha256_hex(b"new base")));
+    });
+    rig.advance(Duration::from_secs(550));
+    rig.service.tick();
+    let after = session_json(&app);
+    assert_ne!(after["room"], before["room"], "the app sees the new room and restarts on it");
+    assert_eq!(after["base"]["sha256"], sha256_hex(b"new base"));
+    assert_ne!(after["base"]["url"], before["base"]["url"]);
+}
+
+// The app couldn't go live (DJ-brief §2b): it writes `<session file>.fallback` and edits the copy
+// locally, and the launcher turns the row into an ordinary check-out so the edits upload.
+
+fn signal_fallback(app: &LiveApp, body: &str) {
+    let mut name = app.session.as_os_str().to_owned();
+    name.push(".fallback");
+    std::fs::write(PathBuf::from(name), body).unwrap();
+}
+
+#[test]
+fn an_app_that_falls_back_gets_a_check_out_and_its_saves_upload() {
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.settle();
+    assert!(rig.dav.held_lock(FILE).is_none(), "live: no lock yet");
+    signal_fallback(&app, r#"{"v":1,"reason":"the relay refused the ticket"}"#);
+    rig.service.tick();
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Saved));
+    let detail = rig.last_detail(FILE).unwrap_or_default();
+    assert!(detail.contains("the relay refused the ticket") && detail.contains("changes upload when you save"), "{detail}");
+    assert!(rig.dav.held_lock(FILE).is_some(), "checked out: locked as any check-out");
+    assert!(!app.session.exists(), "the ticket doesn't stay on disk");
+
+    let etag = rig.dav.etag(FILE);
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"edited locally", "the local edit reached the cloud");
+    assert_eq!(rig.dav.puts().last().and_then(|p| p.if_match.clone()), Some(etag), "guarded by the version it started from");
+    rig.service.done(FILE);
+    assert!(last_closed(&rig, FILE).is_some(), "Done closes it as any check-out: {:?}", rig.events());
+    assert!(rig.dav.held_lock(FILE).is_none());
+}
+
+#[test]
+fn a_fallback_never_overwrites_changes_others_made_live() {
+    // Others edited live meanwhile: the server's file is no longer what the app started from.
+    let dav = Dav::with_file(FILE, b"remote v1");
+    dav.offer_live(RELAY);
+    let rig = rig(dav);
+    let app = rig.open_live(FILE);
+    rig.dav.change(FILE, b"saved by the relay");
+    signal_fallback(&app, "not json");
+    rig.service.tick();
+    assert!(rig.last_detail(FILE).is_some_and(|d| d.contains("Live editing isn't available")));
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(FILE).unwrap(), b"saved by the relay", "not replaced");
+    assert_eq!(rig.status(FILE), Some(SyncStatus::Conflict), "the user chooses");
+}
+
+#[test]
+fn a_pinned_room_that_falls_back_asks_before_its_first_save() {
+    // The app was given the room's starting bytes, which aren't the WebDAV file's.
+    let rig = rig(pinned(b"room base bytes", None));
+    let app = rig.open_live(SHEET);
+    signal_fallback(&app, r#"{"v":1,"reason":"base checksum mismatch"}"#);
+    rig.service.tick();
+    rig.save(&app.file, b"edited locally");
+    rig.settle();
+    assert_eq!(rig.dav.remote(SHEET).unwrap(), b"webdav bytes", "not replaced");
+    assert_eq!(rig.status(SHEET), Some(SyncStatus::Conflict));
 }

@@ -1886,7 +1886,7 @@ fn a_dismissed_install_prompt_is_not_called_a_cancelled_download() {
 /// Download again.
 fn a_kept_update_installs_on_retry_and_an_up_to_date_app_is_not_downloaded_again() {
     let mut ev = events();
-    for app in ["effectcraft", "wordcraft"] {
+    for app in ["effectcraft", "lightcraft"] {
         ev.push(Event::ReadyToInstall { app: app.into(), ready: true });
     }
     let (mut h, sent) = harness_with(ev, ViewMode::Table, egui::Theme::Dark, true, 1.0);
@@ -1897,8 +1897,8 @@ fn a_kept_update_installs_on_retry_and_an_up_to_date_app_is_not_downloaded_again
     h.get_by_label("Retry update to 0.6.0").click();
     h.run_steps(2);
     assert_eq!(*sent.borrow(), [Command::Install { app: "effectcraft".into() }]);
-    // WordCraft is up to date: its menu offers Reinstall, which uses the kept file.
-    let row = h.get_by_role_and_label(egui::accesskit::Role::Label, "WordCraft").rect().center().y;
+    // LightCraft is up to date: its menu offers Reinstall, which uses the kept file.
+    let row = h.get_by_role_and_label(egui::accesskit::Role::Label, "LightCraft").rect().center().y;
     h.get_all_by_label_contains("More actions").find(|n| (n.rect().center().y - row).abs() < 25.0).unwrap().click();
     h.run_steps(3);
     h.get_by_label("Reinstall");
@@ -2395,11 +2395,12 @@ fn order(h: &Harness<'_, Option<LauncherUi>>) -> Vec<String> {
 fn every_table_column_sorts_both_ways() {
     let (mut h, _) = harness(ViewMode::Table, egui::Theme::Dark, true);
     h.run_steps(6);
-    // Status: apps with an update first (suite order breaks the tie), then the up to date ones.
+    // Status: apps with an update first (suite order breaks the tie), then WordCraft (installed,
+    // its updates come from udinCraft), then the up to date ones.
     h.get_by_label("Status").click();
     h.run_steps(3);
     let o = order(&h);
-    assert_eq!(&o[..4], ["PhotoCraft", "EffectCraft", "LightCraft", "WordCraft"], "{o:?}");
+    assert_eq!(&o[..4], ["PhotoCraft", "EffectCraft", "WordCraft", "LightCraft"], "{o:?}");
     // Reversed: the apps not installed first, then up to date, then the updates last. The table
     // keeps its column's order; only the grid puts installed apps above the rest.
     h.get_by_label("Status").click();
@@ -2625,7 +2626,8 @@ fn hostile_release_asset_urls_never_reach_the_opener() {
     }
     let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, false, 1.0);
     h.run_steps(8);
-    assert!(h.query_all_by_label("Download for macOS").count() >= 8, "the cards must offer their asset downloads");
+    // The udinCraft apps link to their own releases instead.
+    assert!(h.query_all_by_label("Download for macOS").count() >= 6, "the cards must offer their asset downloads");
     let opened = all_opened(&mut h, "Download for macOS");
     assert!(!opened.iter().any(|url| url.as_str() == HOSTILE), "a hostile card asset URL reached the opener: {opened:?}");
 
@@ -3122,7 +3124,9 @@ fn web_build_offers_downloads() {
     let (mut h, _) = harness(ViewMode::Grid, egui::Theme::Dark, false);
     h.run_steps(8);
     snapshot(&mut h, "web-grid-dark");
-    assert!(h.query_all_by_label("Download for macOS").count() >= 8);
+    // The udinCraft apps link to their own releases instead.
+    assert!(h.query_all_by_label("Download for macOS").count() >= 6);
+    assert!(h.query_all_by_label("Updates come from udinCraft").count() >= 1);
     assert!(h.query_by_label("Install").is_none());
     assert!(h.query_by_label_contains("without updating").is_none(), "nothing installed to open on the web");
 }
@@ -4854,6 +4858,7 @@ fn cloud_entry(path: &str, is_dir: bool) -> CloudEntry {
         locked_by: None,
         lock_by_app: false,
         writable: true,
+        file_id: None,
     }
 }
 
@@ -5035,17 +5040,15 @@ fn status_change_is_announced() {
 
 #[test]
 fn missing_app_offers_install() {
+    // DeckCraft is a udinCraft app: the row points to its udinCraft releases instead of
+    // installing upstream's build.
     let (mut h, sent, _) = connected_with(top_folder());
     let deck = h.get_by_role_and_label(Role::Button, "deck.pptx");
     assert!(deck.accesskit_node().is_disabled(), "DeckCraft isn't installed, so the file can't open yet");
-    h.get_by_role_and_label(Role::Button, "Install DeckCraft").click();
+    assert!(h.query_by_role_and_label(Role::Button, "Install DeckCraft").is_none());
+    h.get_by_role_and_label(Role::Button, "Updates come from udinCraft").click();
     h.run_steps(4);
-    // The launcher asks where to install a new app first, as it does from the Apps page.
-    if let Some(confirm) = h.query_all_by_role_and_label(Role::Button, "Install").last() {
-        confirm.click();
-        h.run_steps(3);
-    }
-    assert_eq!(cloud_sent(&sent).last(), Some(&Command::Install { app: "deckcraft".into() }));
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::Install { .. })), "no upstream install");
 }
 
 #[test]
@@ -5438,4 +5441,46 @@ fn search_results_name_the_search_made_and_a_folder_only_fallback() {
     h.run_steps(3);
     assert!(h.query_by_label("Results for “beta”").is_some(), "the label names what was searched");
     assert!(h.query_by_label("Results in this folder only").is_some());
+}
+
+#[test]
+fn a_live_file_shows_live_with_nothing_to_press_until_its_app_closes() {
+    let (mut h, sent, inbox) = connected_with(top_folder());
+    let detail = "Open live in WordCraft: changes are saved to the cloud as you type, and others' changes show as they make them.";
+    inbox.borrow_mut().push(status("/report.docx", SyncStatus::Live, Some(detail)));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("Live").next().is_some(), "the row says it is live");
+    assert!(h.query_all_by_label_contains("saved to the cloud as you type").next().is_some(), "and how it saves");
+    assert!(h.query_by_role_and_label(Role::Button, "Done: report.docx").is_none(), "the server saves: there is nothing to upload or close");
+    inbox.borrow_mut().push(closed("/report.docx", SyncStatus::Live, Some("The live session ended when the app closed.")));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("live session ended").next().is_some(), "the end is said");
+    assert!(!cloud_sent(&sent).iter().any(|c| matches!(c, Command::CloudDone { .. })));
+}
+
+#[test]
+fn udincraft_apps_never_offer_an_upstream_update_or_install() {
+    // Upstream has WordCraft 0.9.0 (installed: 0.3.0) and GridCraft (not installed); PhotoCraft
+    // 0.5.0 (installed: 0.4.1) still updates from upstream.
+    let mut ev = events();
+    ev.push(Event::Latest {
+        app: "wordcraft".into(),
+        latest: LatestRelease::Found(release("wordcraft", "0.9.0", NOW - 3600)),
+        from: Origin::ArtCraftApi,
+    });
+    let (mut h, sent) = harness_with(ev, ViewMode::Table, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    assert!(h.query_all_by_label_contains("Update to 0.9.0").next().is_none(), "no upstream update for WordCraft");
+    assert!(h.query_all_by_label_contains("Update to 0.5.0").next().is_some(), "PhotoCraft still updates from upstream");
+    assert!(h.query_all_by_label_contains("Installed · updates come from udinCraft").next().is_some(), "WordCraft says where its updates come from");
+    let links: Vec<_> = h.query_all_by_role_and_label(Role::Button, "Updates come from udinCraft").collect();
+    assert!(!links.is_empty(), "a missing udinCraft app points to its releases instead of installing");
+    let udin = |id: &str| matches!(id, "wordcraft" | "gridcraft" | "deckcraft" | "pdfcraft");
+    links[0].click();
+    h.run_steps(3);
+    assert!(!sent.borrow().iter().any(|c| match c {
+        Command::Install { app } => udin(app),
+        Command::InstallAll { apps } => apps.iter().any(|a| udin(a)),
+        _ => false,
+    }));
 }

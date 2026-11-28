@@ -122,6 +122,7 @@ pub(crate) fn status_label(status: SyncStatus) -> &'static str {
         SyncStatus::Conflict => tl!("Conflict"),
         SyncStatus::ReadOnly => tl!("Read-only"),
         SyncStatus::CloseInAppFirst => tl!("Close it in the app first"),
+        SyncStatus::Live => tl!("Live"),
     }
 }
 
@@ -866,7 +867,16 @@ impl LauncherUi {
             Some(why) => resp.on_disabled_hover_text(why.as_str()),
             None => resp.on_hover_text(description.as_str()),
         };
-        if show_install && let Some(app) = app {
+        // Fork-only (udinCraft): a missing udinCraft app comes from its releases, not from here.
+        let udincraft = app.and_then(artcraft_launcher_core::catalog::udincraft_releases);
+        if show_install && let Some(url) = &udincraft {
+            let label = tl!("Updates come from udinCraft");
+            let w = widgets::button_width(ui, label, 0.0).min(kind_w);
+            let at = Rect::from_center_size(pos2(kind_x + w / 2.0, y), vec2(w, theme::CONTROL_H));
+            if ui.put(at, |ui: &mut Ui| widgets::button(ui, label, Kind::Secondary, 0.0)).on_hover_text(url.as_str()).clicked() {
+                widgets::open_external_link(ui.ctx(), url);
+            }
+        } else if show_install && let Some(app) = app {
             let label = fmt(tl!("Install {app}"), &[("app", app_name.as_deref().unwrap_or(app))]);
             let w = widgets::button_width(ui, &label, 0.0).min(kind_w);
             let at = Rect::from_center_size(pos2(kind_x + w / 2.0, y), vec2(w, theme::CONTROL_H));
@@ -930,6 +940,7 @@ impl LauncherUi {
                 locked_by: None,
                 lock_by_app: false,
                 writable: true,
+                file_id: None,
             };
             let (icon, _) = ui.allocate_exact_size(vec2(24.0, theme::CONTROL_H), Sense::hover());
             let color = app.and_then(|a| self.entry(a)).map_or(t.muted, |e| t.app_ink(e.app));
@@ -942,7 +953,7 @@ impl LauncherUi {
             }
             ui.add_space(14.0);
             let tone = match file.status {
-                SyncStatus::Saved => t.good,
+                SyncStatus::Saved | SyncStatus::Live => t.good,
                 SyncStatus::Conflict | SyncStatus::ReconnectNeeded => t.bad,
                 SyncStatus::WaitingToUpload | SyncStatus::CloseInAppFirst | SyncStatus::ReadOnly => t.warn,
                 SyncStatus::Opening | SyncStatus::Uploading => t.accent_ink,
@@ -986,7 +997,8 @@ impl LauncherUi {
                     self.reconnect();
                 }
             }
-            SyncStatus::Opening | SyncStatus::Uploading => return,
+            // A live file is saved by the server and closes with its app: nothing to press.
+            SyncStatus::Opening | SyncStatus::Uploading | SyncStatus::Live => return,
             SyncStatus::Saved | SyncStatus::WaitingToUpload | SyncStatus::ReadOnly => {
                 let label = tl!("Done");
                 if widgets::labelled_button(ui, label, &named(label), Kind::Secondary, 0.0)

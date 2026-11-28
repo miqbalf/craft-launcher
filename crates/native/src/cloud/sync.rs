@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use artcraft_launcher_core::cloud::{CLOUD_APPS, CloudAccount, CloudEntry, ConflictChoice, SyncStatus, app_for};
+use artcraft_launcher_core::cloud::{CLOUD_APPS, CloudAccount, CloudEntry, ConflictChoice, LIVE_APPS, SyncStatus, app_for};
 use artcraft_launcher_core::protocol::Event;
 use craft_nextcloud::dav::Files;
 use craft_nextcloud::http::Http;
@@ -19,6 +19,7 @@ use craft_nextcloud::{Account as DavAccount, Error as DavError};
 use craft_suite_account::TokenStore;
 
 use super::checkout::{self, Book, Checkout, HeldLock, Recent, Runtime, Synced, rt_key};
+use super::live::{self, LiveOpen};
 use super::{CloudService, explain_dav};
 
 /// How long a changed file must stay unchanged before it is uploaded: apps save in steps.
@@ -27,11 +28,14 @@ const SETTLE: Duration = Duration::from_secs(2);
 const FIRST_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// The lock asked for. It is refreshed at half what the server granted, which may be less.
-const LOCK_SECS: u32 = 30 * 60;
+pub(super) const LOCK_SECS: u32 = 30 * 60;
 /// How often the backend's watcher looks at the open files.
 const POLL_EVERY: Duration = Duration::from_secs(1);
 /// How many numbered conflict-copy names are tried before giving up.
 const CONFLICT_NAMES: u32 = 9;
+
+/// Why Done and Stop tracking don't apply to a live file.
+const LIVE_CLOSE: &str = "This file is open for live editing: the cloud already has every change. Close it in its app to end the session.";
 
 /// How an upload ended.
 #[derive(PartialEq, Eq)]
@@ -43,12 +47,12 @@ enum Upload {
 }
 
 /// The display name of a server path.
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
 }
 
 /// The folder of a server path, with its trailing slash (`/` for a top-level file).
-fn parent(path: &str) -> &str {
+pub(super) fn parent(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     trimmed.rfind('/').map_or("/", |i| &trimmed[..=i])
 }
@@ -79,7 +83,7 @@ fn name_safe(login: &str) -> String {
 
 impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> CloudService<S, H> {
     /// A file's status. Statuses only the user can settle offer Stop tracking.
-    fn status(&self, path: &str, status: SyncStatus, detail: Option<String>) {
+    pub(super) fn status(&self, path: &str, status: SyncStatus, detail: Option<String>) {
         self.send_status(path, status, detail, needs_the_user(status), false);
     }
 
@@ -91,7 +95,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
 
     /// The last status of a file that is no longer open from the cloud. `detail` says what became
     /// of a copy left on this computer, or why it couldn't be opened.
-    fn closed(&self, path: &str, status: SyncStatus, detail: Option<String>) {
+    pub(super) fn closed(&self, path: &str, status: SyncStatus, detail: Option<String>) {
         self.send_status(path, status, detail, false, true);
     }
 
@@ -111,11 +115,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         Some(guard)
     }
 
-    fn error(&self, message: impl Into<String>) {
+    pub(super) fn error(&self, message: impl Into<String>) {
         self.emit(Event::CloudError(message.into()));
     }
 
-    fn now(&self) -> Instant {
+    pub(super) fn now(&self) -> Instant {
         (self.clock)()
     }
 
@@ -132,7 +136,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     }
 
     /// Saves the book; a failure is told, but the files stay watched for this session.
-    fn save_book(&self, book: &Book) {
+    pub(super) fn save_book(&self, book: &Book) {
         if let Err(e) = book.save() {
             log::warn!("couldn't save the list of open cloud files: {e}");
             self.error(format!("Couldn't record the open cloud files on this computer ({e}). Keep the launcher open until they're saved."));
@@ -159,7 +163,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         }
     }
 
-    fn remember(&self, account: &str, path: &str, app: &str) {
+    pub(super) fn remember(&self, account: &str, path: &str, app: &str) {
         let item = Recent {
             account: account.to_string(),
             path: path.to_string(),
@@ -190,6 +194,7 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
                 locked_by: None,
                 lock_by_app: false,
                 writable: true,
+                file_id: None,
             })
             .collect();
         self.emit(Event::CloudRecentListed(list));
@@ -223,6 +228,25 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             self.remember(&account.id, &key, &app);
             self.status(&key, status, None);
             return self.launch(&app, &local);
+        }
+        if let Some(i) = book.live_index(&account.id, path) {
+            self.remember(&account.id, path, &app);
+            return self.still_live(book, i);
+        }
+        // An app that can join a live session opens live when the server offers one: no lock, no
+        // upload, the server saves. Otherwise the check-out below runs, and the user is told.
+        let mut live_note = None;
+        if LIVE_APPS.contains(&app.as_str()) {
+            match self.open_live(book, &account, &dav, path, &app, read_only) {
+                LiveOpen::Opened | LiveOpen::Failed => return,
+                LiveOpen::Unavailable { why, tell } => {
+                    let note = live::unavailable_note(&why, tell.as_deref());
+                    // A read-only copy uploads nothing, so the note's promise wouldn't hold.
+                    if !read_only {
+                        live_note = Some(note);
+                    }
+                }
+            }
         }
         let local = match self.cache_dir(&account.id).and_then(|cache| checkout::working_copy(&cache, path)) {
             Ok(l) => l,
@@ -318,6 +342,10 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
         } else {
             kept_note.clone()
         };
+        let detail = match (live_note, detail) {
+            (Some(note), Some(d)) => Some(format!("{note} {d}")),
+            (note, d) => note.or(d),
+        };
         self.status(path, status, detail);
     }
 
@@ -393,6 +421,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             self.emit(Event::CloudConnected(account));
         }
         drop(guard);
+        let checked_out: Vec<PathBuf> = {
+            let mut guard = self.lock_book();
+            self.book(&mut guard).map(|b| b.list.iter().map(|c| c.local.clone()).collect()).unwrap_or_default()
+        };
+        self.clear_stale_live(&checked_out);
         self.resume();
     }
 
@@ -410,10 +443,11 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
     pub fn tick(&self) {
         let mut guard = self.lock_book();
         let Ok(book) = self.book(&mut guard) else { return };
-        if book.list.is_empty() {
+        if book.list.is_empty() && book.live.is_empty() {
             return;
         }
         let Some((account, dav)) = self.connected() else { return };
+        self.tick_live(book, &account.id, &dav);
         let keys: Vec<String> = book.list.iter().filter(|c| c.account == account.id).map(|c| c.path.clone()).collect();
         let now = self.now();
         for key in keys {
@@ -607,6 +641,9 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
         };
+        if book.live_index(&account.id, path).is_some() {
+            return self.status(path, SyncStatus::Live, Some(LIVE_CLOSE.to_string()));
+        }
         let Some(i) = book.find(&account.id, path) else { return self.error("That file isn't open from the cloud.") };
         let key = book.list[i].path.clone();
         match book.list[i].status {
@@ -695,6 +732,9 @@ impl<S: TokenStore + Send + Sync + 'static, H: Http + Clone + Send + 'static> Cl
             Ok(b) => b,
             Err(e) => return self.error(format!("Couldn't read the list of open cloud files ({e}).")),
         };
+        if book.live_index(&account.id, path).is_some() {
+            return self.status(path, SyncStatus::Live, Some(LIVE_CLOSE.to_string()));
+        }
         let Some(i) = book.find(&account.id, path) else { return self.error("That file isn't open from the cloud.") };
         // Asked before the copy moves: whatever the server doesn't have is said so.
         let unsaved = self.changed(book, i) != Some(false);
@@ -1008,12 +1048,12 @@ fn read_settled(local: &Path) -> Option<(checkout::Stamp, Vec<u8>)> {
 }
 
 /// `text` ending in a full stop, so more can follow it.
-fn sentence(text: &str) -> String {
+pub(super) fn sentence(text: &str) -> String {
     let text = text.trim_end();
     if text.ends_with(['.', '!', '?']) { text.to_string() } else { format!("{text}.") }
 }
 
-fn open_message(e: &DavError) -> String {
+pub(super) fn open_message(e: &DavError) -> String {
     match e {
         DavError::NotFound => "That file wasn't found in your cloud.".to_string(),
         other => explain_dav(other).0,

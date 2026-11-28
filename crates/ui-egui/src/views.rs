@@ -72,6 +72,8 @@ enum Primary {
     },
     Open,
     Download(String),
+    /// Fork-only (udinCraft): the app comes from its udinCraft releases page, never from here.
+    Udincraft(String),
     Unavailable(&'static str),
 }
 
@@ -680,7 +682,8 @@ impl LauncherUi {
         });
         ui.add_space(14.0);
         // Installed and up to date needs no badge: the strip has the version, and the group says the rest.
-        if !matches!(status, AppStatus::UpToDate | AppStatus::Installed) {
+        // A udinCraft app says where its updates come from (see `UDINCRAFT_APPS`).
+        if !matches!(status, AppStatus::UpToDate | AppStatus::Installed) || artcraft_launcher_core::catalog::from_udincraft(entry.app.id) {
             ui.horizontal(|ui| {
                 let (text, tone) = model::entry_status_text(&entry, &status, self.caps.manage_apps);
                 let r = widgets::badge(ui, &text, widgets::tone_color(&t, tone));
@@ -1028,6 +1031,13 @@ impl LauncherUi {
     }
 
     fn primary_action(&self, entry: &AppEntry, status: &AppStatus) -> Primary {
+        // Fork-only (udinCraft): a missing app is had from its udinCraft releases, never from
+        // upstream's; an installed one just opens, with no update offered.
+        if let Some(releases) = artcraft_launcher_core::catalog::udincraft_releases(entry.app.id)
+            && !matches!(status, AppStatus::Checking)
+        {
+            return if status.is_installed() && self.caps.manage_apps { Primary::Open } else { Primary::Udincraft(releases) };
+        }
         if !self.caps.manage_apps {
             let platform = self.platform;
             let url = entry.release().zip(platform).and_then(|(r, p)| {
@@ -1333,6 +1343,11 @@ impl LauncherUi {
                     widgets::open_external_link(ui.ctx(), &url);
                 }
             }
+            Primary::Udincraft(url) => {
+                if widgets::button(ui, tl!("Updates come from udinCraft"), Kind::Secondary, main_w).on_hover_text(&url).clicked() {
+                    widgets::open_external_link(ui.ctx(), &url);
+                }
+            }
             Primary::Unavailable(label) => {
                 ui.add_enabled_ui(false, |ui| widgets::button(ui, label, Kind::Secondary, main_w));
             }
@@ -1386,8 +1401,15 @@ impl LauncherUi {
         let id = entry.app.id.to_string();
         let manage = self.caps.manage_apps;
         let reveal = self.caps.reveal_label;
+        let udincraft = artcraft_launcher_core::catalog::udincraft_releases(&id);
         widgets::more_menu(ui, entry.app.name, |ui| {
-            if ui.button(tl!("Choose version")).clicked() {
+            // Fork-only (udinCraft): no upstream version to choose or download; its releases instead.
+            if let Some(url) = &udincraft {
+                if ui.button(tl!("Updates come from udinCraft")).on_hover_text(url).clicked() {
+                    widgets::open_external_link(ui.ctx(), url);
+                    ui.close();
+                }
+            } else if ui.button(tl!("Choose version")).clicked() {
                 self.open_versions(&id);
                 ui.close();
             }
@@ -1406,7 +1428,7 @@ impl LauncherUi {
             if manage && status.is_installed() {
                 self.menu_installed(ui, entry, status, reveal);
             }
-            if !manage {
+            if !manage && udincraft.is_none() {
                 self.menu_downloads(ui, entry);
             }
             // The drawer shows the links as buttons, so its menu leaves them out (but keeps Hide).
